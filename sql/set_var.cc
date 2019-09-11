@@ -1033,7 +1033,7 @@ int set_var::check(THD *thd) {
     my_error(ER_WRONG_TYPE_FOR_VAR, MYF(0), var->name.str);
     DBUG_RETURN(-1);
   }
-  int ret = (type != OPT_PERSIST_ONLY && var->check(thd, this)) ? -1 : 0;
+  int ret = (var->check(thd, this) && type != OPT_PERSIST_ONLY) ? -1 : 0;
 
   if (!ret && (is_global_persist())) {
     ret = mysql_audit_notify(thd, AUDIT_EVENT(MYSQL_AUDIT_GLOBAL_VARIABLE_SET),
