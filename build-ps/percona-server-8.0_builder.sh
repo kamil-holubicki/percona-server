@@ -118,6 +118,9 @@ get_sources(){
         return 0
     fi
 
+    echo "REPO: $REPO"
+    echo "BRANCH: $BRANCH"
+
     git clone "$REPO"
     retval=$?
     if [ $retval != 0 ]
@@ -139,7 +142,9 @@ get_sources(){
     #
     cd ${WORKDIR}/percona-server
     ls
-    source VERSION
+    pwd
+    cat VERSION
+    source ./VERSION
     cat VERSION > ../percona-server-8.0.properties
     echo "REVISION=${REVISION}" >> ../percona-server-8.0.properties
     BRANCH_NAME="${BRANCH}"
@@ -318,7 +323,7 @@ install_deps() {
         fi
     else
         apt-get -y install dirmngr || true
-        add_percona_apt_repo
+        # add_percona_apt_repo
         apt-get update
         apt-get -y install dirmngr || true
         apt-get -y install lsb-release wget
@@ -602,7 +607,7 @@ build_source_deb(){
     cd percona-server-${VERSION}-${RELEASE}
     cp -ap build-ps/debian/ .
     dch -D unstable --force-distribution -v "${VERSION}-${RELEASE}-${DEB_RELEASE}" "Update to new upstream release Percona Server ${VERSION}-${RELEASE}-1"
-    dpkg-buildpackage -S
+    dpkg-buildpackage -S --no-sign
 
     cd ${WORKDIR}
 
@@ -681,7 +686,7 @@ build_deb(){
         sed -i 's/export CFLAGS=/export CFLAGS=-Wno-error=deprecated-declarations -Wno-error=unused-function -Wno-error=unused-variable -Wno-error=unused-parameter -Wno-error=date-time -Wno-error=ignored-qualifiers -Wno-error=class-memaccess -Wno-error=shadow /' debian/rules
         sed -i 's/export CXXFLAGS=/export CXXFLAGS=-Wno-error=deprecated-declarations -Wno-error=unused-function -Wno-error=unused-variable -Wno-error=unused-parameter -Wno-error=date-time -Wno-error=ignored-qualifiers -Wno-error=class-memaccess -Wno-error=shadow /' debian/rules
     fi
-    dpkg-buildpackage -rfakeroot -uc -us -b
+    dpkg-buildpackage -rfakeroot -uc -us -b --no-sign
 
     cd ${WORKDIR}
     mkdir -p $CURDIR/deb

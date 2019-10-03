@@ -1076,6 +1076,7 @@ void THD::release_resources() {
     PSI_THREAD_CALL(aggregate_thread_status)(m_psi);
   }
 #endif /* HAVE_PSI_THREAD_INTERFACE */
+  reset_system_status_vars(&status_var);
   /* Ensure that the thread status is not re-aggregated to the global totals. */
   status_var_aggregated = true;
 
