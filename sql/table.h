@@ -823,7 +823,9 @@ struct TABLE_SHARE {
   uint db_options_in_use{0};
   uint rowid_field_offset{0}; /* Field_nr +1 to rowid field */
   /* Primary key index number, used in TABLE::key_info[] */
-  uint primary_key{0};
+  // KH: I think by default, when new object is created
+  // there should be no PK configured. Why default to 0?
+  uint primary_key{MAX_KEY};
   uint next_number_index{0};      /* autoincrement key number */
   uint next_number_key_offset{0}; /* autoinc keypart offset in a key */
   uint next_number_keypart{0};    /* autoinc keypart number in a key */
