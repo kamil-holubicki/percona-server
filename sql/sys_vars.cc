@@ -4139,12 +4139,20 @@ static Sys_var_charptr Sys_ssl_capath(
 
 static Sys_var_charptr Sys_tls_version(
        "tls_version",
+#if (OPENSSL_VERSION_NUMBER < 0x10101000L)
        "TLS version, permitted values are TLSv1, TLSv1.1, TLSv1.2(Only for openssl)",
-       READ_ONLY GLOBAL_VAR(opt_tls_version), SSL_OPT(OPT_TLS_VERSION),
+#else
+       "TLS version, permitted values are TLSv1, TLSv1.1, TLSv1.2, TLSv1.3(Only for openssl)",
+#endif
+	   READ_ONLY GLOBAL_VAR(opt_tls_version), SSL_OPT(OPT_TLS_VERSION),
 #ifdef HAVE_YASSL
        IN_FS_CHARSET, "TLSv1,TLSv1.1");
 #else
-       IN_FS_CHARSET, "TLSv1,TLSv1.1,TLSv1.2");
+#if (OPENSSL_VERSION_NUMBER < 0x10101000L)
+		IN_FS_CHARSET, "TLSv1,TLSv1.1,TLSv1.2");
+#else
+		IN_FS_CHARSET, "TLSv1,TLSv1.1,TLSv1.2,TLSv1.3");
+#endif
 #endif
 
 static Sys_var_charptr Sys_ssl_cert(

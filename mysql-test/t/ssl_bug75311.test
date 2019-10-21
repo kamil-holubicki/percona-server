@@ -8,15 +8,26 @@
 
 --connect(con1,localhost,root,,,,,SSL)
 
-SHOW STATUS LIKE 'Ssl_cipher_list';
+# We enabled DHE-RSA-AES256-SHA ciphersuite in opt file (--ssl-cipher option). 
+# However if we linked with OpenSSL 1.1.1 with TLSv1.3, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256 
+# and TLS_AES_128_GCM_SHA256 ciphersuites are enabled by default. 
+# They can be disabled by passing empty list in --tls-ciphersuites option but only for version >= 8.0.16
+# So just check if what we enabled in opt file is really enabled.
+
+SELECT COUNT(*) FROM performance_schema.session_status WHERE VARIABLE_VALUE REGEXP 'DHE-RSA-AES256-SHA' AND VARIABLE_NAME = 'SSL_CIPHER_LIST';
+
+# Just in case: ensure that AES128-SHA256 is not enabled
+SELECT COUNT(*) FROM performance_schema.session_status WHERE VARIABLE_VALUE REGEXP 'AES128-SHA256' AND VARIABLE_NAME = 'SSL_CIPHER_LIST';
 
 --disconnect con1
 --connection default
 
+# Now try to connect using cipersuite that was not enabled. 
+# Specify TLS protocol version explicitly, because if TLS1.3 is enabled, negotiation will try it first and connect. 
 # The first error string is returned by YaSSL, the second one by OpenSSL < 1.1,
 # the third one by OpenSSL >= 1.1
 --replace_result "Failed to set ciphers to use" ERROR "error:14077410:SSL routines:SSL23_GET_SERVER_HELLO:sslv3 alert handshake failure" ERROR "error:14094410:SSL routines:ssl3_read_bytes:sslv3 alert handshake failure" ERROR
 --error 1
---exec $MYSQL -uroot --ssl-mode=REQUIRED --ssl-cipher='AES128-SHA256' -e "SHOW STATUS LIKE 'Ssl_cipher'" 2>&1
+--exec $MYSQL -uroot --ssl-mode=REQUIRED --tls-version=TLSv1.2 --ssl-cipher='AES128-SHA256' -e "SHOW STATUS LIKE 'Ssl_cipher'" 2>&1
 
 --source include/wait_until_count_sessions.inc

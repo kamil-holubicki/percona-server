@@ -454,11 +454,17 @@ long process_tls_version(const char *tls_version)
   const char *separator= ",";
   char *token, *lasts= NULL;
 #ifndef HAVE_YASSL
+#if (OPENSSL_VERSION_NUMBER < 0x10101000L)
   unsigned int tls_versions_count= 3;
   const char *tls_version_name_list[3]= {"TLSv1", "TLSv1.1", "TLSv1.2"};
   const char ctx_flag_default[]= "TLSv1,TLSv1.1,TLSv1.2";
-  const long tls_ctx_list[3]= {SSL_OP_NO_TLSv1, SSL_OP_NO_TLSv1_1, SSL_OP_NO_TLSv1_2};
-  long tls_ctx_flag= SSL_OP_NO_TLSv1|SSL_OP_NO_TLSv1_1|SSL_OP_NO_TLSv1_2;
+#else
+  unsigned int tls_versions_count= 4;
+  const char *tls_version_name_list[4]= {"TLSv1", "TLSv1.1", "TLSv1.2", "TLSv1.3"};
+  const char ctx_flag_default[]= "TLSv1,TLSv1.1,TLSv1.2,TLSv1.3";
+#endif
+  const long tls_ctx_list[4]= {SSL_OP_NO_TLSv1, SSL_OP_NO_TLSv1_1, SSL_OP_NO_TLSv1_2, SSL_OP_NO_TLSv1_3};
+  long tls_ctx_flag= SSL_OP_NO_TLSv1|SSL_OP_NO_TLSv1_1|SSL_OP_NO_TLSv1_2|SSL_OP_NO_TLSv1_3;
 #else
   unsigned int tls_versions_count= 2;
   const char *tls_version_name_list[2]= {"TLSv1", "TLSv1.1"};
@@ -478,8 +484,10 @@ long process_tls_version(const char *tls_version)
 
   strncpy(tls_version_option, tls_version, sizeof(tls_version_option));
   token= my_strtok_r(tls_version_option, separator, &lasts);
+  fprintf(stderr, "KH: before tls_ctx_flag: x%lX\n", tls_ctx_flag);
   while (token)
   {
+  fprintf(stderr, "KH: token: %s\n", token);
     for (index=0; index < tls_versions_count; index++)
     {
       if (!my_strcasecmp(&my_charset_latin1, tls_version_name_list[index], token))
@@ -491,6 +499,8 @@ long process_tls_version(const char *tls_version)
     }
     token= my_strtok_r(NULL, separator, &lasts);
   }
+
+  fprintf(stderr, "KH: tls_ctx_flag: x%lX\n", tls_ctx_flag);
 
   if (!tls_found)
     return -1;
@@ -542,6 +552,7 @@ new_VioSSLFd(const char *key_file, const char *cert_file,
                     SSL_OP_NO_TLSv1_1
 #ifndef HAVE_YASSL
                     | SSL_OP_NO_TLSv1_2
+                    | SSL_OP_NO_TLSv1_3
                     | SSL_OP_NO_TICKET
 #endif
                    );
@@ -561,6 +572,7 @@ new_VioSSLFd(const char *key_file, const char *cert_file,
     DBUG_RETURN(0);
   }
 
+  fprintf(stderr, "KH: ssl_ctx_options: x%lX\n", ssl_ctx_options);
   SSL_CTX_set_options(ssl_fd->ssl_context, ssl_ctx_options);
 
   /*
