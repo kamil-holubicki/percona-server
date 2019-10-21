@@ -3204,11 +3204,17 @@ static Sys_var_charptr Sys_ssl_crlpath(
 
 static Sys_var_charptr Sys_tls_version(
        "tls_version",
+#ifdef SSL_OP_NO_TLSv1_3
+       "TLS version, permitted values are TLSv1, TLSv1.1, TLSv1.2, and TLSv1.3, "
+#else
        "TLS version, permitted values are TLSv1, TLSv1.1, and TLSv1.2, "
+#endif
        "depending on SSL library support",
        READ_ONLY GLOBAL_VAR(opt_tls_version), SSL_OPT(OPT_TLS_VERSION),
        IN_FS_CHARSET,
-#ifdef SSL_OP_NO_TLSv1_2
+#ifdef SSL_OP_NO_TLSv1_3
+       "TLSv1.1,TLSv1.2,TLSv1.3");
+#elif (SSL_OP_NO_TLSv1_2)
        "TLSv1.1,TLSv1.2");
 #elif defined(SSL_OP_NO_TLSv1_1)
        "TLSv1.1");

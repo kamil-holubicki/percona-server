@@ -255,7 +255,7 @@ void ssl_start()
   }
 }
 
-long process_tls_version(const char *tls_version)
+long  process_tls_version(const char *tls_version)
 {
   const char *separator= ",";
   char *token, *lasts= NULL;
@@ -267,10 +267,15 @@ long process_tls_version(const char *tls_version)
 #ifdef SSL_OP_NO_TLSv1_2
                                         ,"TLSv1.2"
 #endif
+#ifdef SSL_OP_NO_TLSv1_3
+                                        ,"TLSv1.3"
+#endif
                                        };
 
   const char ctx_flag_default[]=
-#ifdef SSL_OP_NO_TLSv1_2
+#ifdef SSL_OP_NO_TLSv1_3
+  "TLSv1.1,TLSv1.2,TLSv1.3";
+#elif defined (SSL_OP_NO_TLSv1_2)
   "TLSv1.1,TLSv1.2";
 #elif defined(SSL_OP_NO_TLSv1_1)
   "TLSv1.1";
@@ -284,6 +289,9 @@ long process_tls_version(const char *tls_version)
 #endif
 #ifdef SSL_OP_NO_TLSv1_2
                               ,SSL_OP_NO_TLSv1_2
+#endif
+#ifdef SSL_OP_NO_TLSv1_3
+                              ,SSL_OP_NO_TLSv1_3
 #endif
                              };
   size_t tls_versions_count= sizeof(tls_ctx_list) / sizeof(tls_ctx_list[0]);
@@ -377,6 +385,9 @@ new_VioSSLFd(const char *key_file, const char *cert_file,
 #endif
 #ifdef SSL_OP_NO_TLSv1_2
      | SSL_OP_NO_TLSv1_2
+#endif
+#ifdef SSL_OP_NO_TLSv1_3
+     | SSL_OP_NO_TLSv1_3
 #endif
      );
 
