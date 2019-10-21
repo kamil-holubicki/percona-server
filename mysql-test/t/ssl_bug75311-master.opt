@@ -1,1 +1,1 @@
---ssl-cipher=DHE-RSA-AES256-SHA
+--ssl-cipher=DHE-RSA-AES256-SHA --tls-version=TLSv1,TLSv1.1,TLSv1.2

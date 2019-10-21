@@ -1,7 +1,10 @@
 #
 # Bug 75311: Error for SSL cipher is unhelpful
 #
-SHOW STATUS LIKE 'Ssl_cipher_list';
-Variable_name	Value
-Ssl_cipher_list	DHE-RSA-AES256-SHA
+SELECT COUNT(*) FROM information_schema.session_status WHERE VARIABLE_VALUE REGEXP 'DHE-RSA-AES256-SHA' AND VARIABLE_NAME = 'SSL_CIPHER_LIST';
+COUNT(*)
+1
+SELECT COUNT(*) FROM information_schema.session_status WHERE VARIABLE_VALUE REGEXP 'AES128-SHA256' AND VARIABLE_NAME = 'SSL_CIPHER_LIST';
+COUNT(*)
+0
 ERROR 2026 (HY000): SSL connection error: ERROR
