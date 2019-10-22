@@ -856,7 +856,6 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
           // continue when IGNORE clause is used.
           continue;
           }
-        found_rows++;
         /*
           Existing rows in table should normally satisfy CHECK constraints. So
           it should be safe to check constraints only for rows that has really
