@@ -22554,7 +22554,7 @@ static int innodb_encryption_threads_validate(
 {
   long long intbuf;
 
-  DBUG_ENTER("innodb_encryption_threads_validate");
+  DBUG_TRACE;
 
   if (value->val_int(value, &intbuf)) {
     /* The value is NULL. That is invalid. */
