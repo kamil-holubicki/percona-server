@@ -3,7 +3,7 @@
 	url = https://github.com/percona/PerconaFT.git
 [submodule "Percona-TokuBackup"]
 	path = plugin/tokudb-backup-plugin/Percona-TokuBackup
-	url = https://github.com/percona/Percona-TokuBackup.git
+	url = https://github.com/kamil-holubicki/Percona-TokuBackup.git
 [submodule "storage/rocksdb/third_party/lz4"]
 	path = storage/rocksdb/third_party/lz4
 	url = https://github.com/lz4/lz4
