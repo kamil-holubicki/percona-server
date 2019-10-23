@@ -833,14 +833,6 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
           error = 1;
           break;
         }
-        if (invoke_table_check_constraints(thd, table)) {
-          if (thd->is_error()) {
-            error = 1;
-            break;
-          }
-          // continue when IGNORE clause is used.
-          continue;
-        }
         found_rows++;
 
         if (is_row_changed) {
@@ -853,8 +845,6 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
               error = 1;
               break;
             }
-          // continue when IGNORE clause is used.
-          continue;
           }
         /*
           Existing rows in table should normally satisfy CHECK constraints. So
@@ -876,13 +866,6 @@ bool Sql_cmd_update::update_single_table(THD *thd) {
           // continue when IGNORE clause is used.
           continue;
         }
-
-          /*
-            In order to keep MySQL legacy behavior, we do this update *after*
-            the CHECK OPTION test. Proper behavior is probably to throw an
-            error, though.
-          */
-          update.set_function_defaults(table);
 
           if (will_batch) {
             /*
