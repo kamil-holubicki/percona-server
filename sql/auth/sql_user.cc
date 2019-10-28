@@ -2320,7 +2320,7 @@ bool mysql_drop_user(THD *thd, List<LEX_USER> &list, bool if_exists,
 
     if (acl_is_utility_user(user->user.str, user->host.str,
                             nullptr)) {
-      log_user(thd, &wrong_users, tmp_user_name, wrong_users.length() > 0);
+      log_user(thd, &wrong_users, user, wrong_users.length() > 0);
       result = true;
       continue;
     }
