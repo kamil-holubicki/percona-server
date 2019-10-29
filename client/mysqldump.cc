@@ -4253,7 +4253,9 @@ static void dump_table(char *table, char *db) {
   if (extended_insert)
     init_dynamic_string_checked(&extended_row, "", 1024, 1024);
 
-  if (opt_order_by_primary) order_by = primary_key_fields(result_table, false);
+  if (opt_order_by_primary || opt_order_by_primary_desc)
+    order_by = primary_key_fields(result_table, opt_order_by_primary_desc);
+
   if (path) {
     char filename[FN_REFLEN], tmp_path[FN_REFLEN];
 
