@@ -5361,6 +5361,21 @@ requesting master dump") ||
         */
         THD_STAGE_INFO(thd, stage_waiting_for_master_to_send_event);
         event_len = read_event(mysql, &rpl, mi, &suppress_warnings);
+
+        DBUG_EXECUTE_IF(
+            "relay_xid_trigger", if (event_len != packet_error) {
+              const uchar *event_buf =
+                  static_cast<const uchar *>(mysql->net.read_pos + 1);
+              Log_event_type event_type =
+                  static_cast<Log_event_type>(event_buf[EVENT_TYPE_OFFSET]);
+              if (event_type == binary_log::XID_EVENT) {
+                static constexpr char act[] =
+                    "now signal relay_xid_reached wait_for resume";
+                DBUG_ASSERT(
+                    !debug_sync_set_action(current_thd, STRING_WITH_LEN(act)));
+              }
+            });
+
         if (check_io_slave_killed(thd, mi,
                                   "Slave I/O thread killed while \
 reading event"))
@@ -5552,7 +5567,7 @@ ignore_log_space_limit=%d",
             "stop_io_after_reading_write_rows_log_event",
             if (event_buf[EVENT_TYPE_OFFSET] == binary_log::WRITE_ROWS_EVENT)
                 thd->killed = THD::KILLED_NO_VALUE;);
-        DBUG_EXECUTE_IF(
+         DBUG_EXECUTE_IF(
              "stop_io_after_reading_unknown_event",
              /*
               * Cast to uchar, because of Percona's events
