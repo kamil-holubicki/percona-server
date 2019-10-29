@@ -5553,8 +5553,13 @@ ignore_log_space_limit=%d",
             if (event_buf[EVENT_TYPE_OFFSET] == binary_log::WRITE_ROWS_EVENT)
                 thd->killed = THD::KILLED_NO_VALUE;);
         DBUG_EXECUTE_IF(
-            "stop_io_after_reading_unknown_event",
-            if (event_buf[EVENT_TYPE_OFFSET] >= binary_log::ENUM_END_EVENT)
+             "stop_io_after_reading_unknown_event",
+             /*
+              * Cast to uchar, because of Percona's events
+              * which have values > 128. This causes ENUM_END_EVENT to be > 128
+              * but event_buf is char, so comparison does not work.
+              */
+              if (static_cast<uchar>(event_buf[EVENT_TYPE_OFFSET]) >= binary_log::ENUM_END_EVENT)
                 thd->killed = THD::KILLED_NO_VALUE;);
         DBUG_EXECUTE_IF("stop_io_after_queuing_event",
                         thd->killed = THD::KILLED_NO_VALUE;);
