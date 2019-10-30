@@ -20,6 +20,9 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 
+# KH: temporary patch for JEN-1167. Just to make it possible to still build with Jenkins
+SET(GMOCK_PACKAGE_NAME "release-1.8.0")
+
 IF(NOT GMOCK_FOUND)
   RETURN()
 ENDIF()
