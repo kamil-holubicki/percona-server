@@ -21,6 +21,9 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 
 ## Subdirectory with common client code.
+
+INCLUDE_DIRECTORIES(SYSTEM ${READLINE_INCLUDE_DIR})
+
 ADD_SUBDIRECTORY(base)
 ## Subdirectory for mysqlpump code.
 ADD_SUBDIRECTORY(dump)
@@ -31,7 +34,7 @@ MYSQL_ADD_EXECUTABLE(mysql
   mysql.cc
   pattern_matcher.cc
   readline.cc
-  LINK_LIBRARIES perconaserverclient client_base ${EDITLINE_LIBRARY}
+  LINK_LIBRARIES perconaserverclient client_base ${MY_READLINE_LIBRARY}
   )
 
 IF(NOT WITHOUT_SERVER)
