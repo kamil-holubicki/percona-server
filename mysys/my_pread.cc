@@ -141,7 +141,7 @@ size_t my_pread(File Filedes, uchar *Buffer, size_t Count, my_off_t offset,
         return MY_FILE_ERROR; /* Return with error */
     }
     if (MyFlags & (MY_NABP | MY_FNABP)) return 0; /* Read went ok; Return 0 */
-    return readbytes;                             /* purecov: inspected */
+    return total_readbytes;                       /* purecov: inspected */
   }
 } /* my_pread */
 
