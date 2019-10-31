@@ -81,6 +81,9 @@
 #include <readline.h>
 #include <syslog.h>
 
+#if defined(HAVE_READLINE_HISTORY_H)
+#include <history.h>
+#endif
 #define HAVE_READLINE
 #define USE_POPEN
 #endif
