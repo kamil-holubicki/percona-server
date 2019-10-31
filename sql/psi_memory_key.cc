@@ -409,7 +409,6 @@ static PSI_memory_info all_server_memory[] = {
     {&key_memory_log_error_stack, "log_error_stack", PSI_FLAG_ONLY_GLOBAL_STAT,
      0, PSI_DOCUMENT_ME},
     {&key_memory_histograms, "histograms", 0, 0, PSI_DOCUMENT_ME},
-    {&key_memory_histograms, "histograms", 0, 0, PSI_DOCUMENT_ME},
     {&key_memory_hash_join, "hash_join", 0, 0, PSI_DOCUMENT_ME},
 
     {&key_memory_userstat_table_stats, "userstat_table_stats",
