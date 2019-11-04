@@ -21,8 +21,8 @@ std::string uuid = generate_uuid();
 namespace testing {
 	namespace internal {
 		template <typename MockType>
-			const MockType* AdjustConstness_noexcept(const MockType* mock) {
-				  return mock;
+			MockType* AdjustConstness_noexcept(const MockType* mock) {
+				return const_cast<MockType*>(mock);
 			}
 	}
 }
