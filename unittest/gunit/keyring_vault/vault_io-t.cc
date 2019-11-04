@@ -18,6 +18,15 @@ extern std::string uuid;
 std::string uuid = generate_uuid();
 #endif
 
+namespace testing {
+	namespace internal {
+		template <typename MockType>
+			const MockType* AdjustConstness_noexcept(const MockType* mock) {
+				  return mock;
+			}
+	}
+}
+
 namespace keyring__vault_io_unittest {
 using namespace keyring;
 
