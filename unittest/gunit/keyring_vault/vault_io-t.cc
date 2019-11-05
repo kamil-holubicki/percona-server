@@ -18,6 +18,15 @@ extern std::string uuid;
 std::string uuid = generate_uuid();
 #endif
 
+namespace testing {
+	namespace internal {
+		template <typename MockType>
+			MockType* AdjustConstness_noexcept(const MockType* mock) {
+				return const_cast<MockType*>(mock);
+			}
+	}
+}
+
 namespace keyring__vault_io_unittest {
 using namespace keyring;
 
@@ -315,6 +324,9 @@ TEST_F(Vault_io_test, FlushKeyRetrieveDeleteInit) {
   ASSERT_TRUE(serialized_keys == nullptr);  // no keys
 }
 
+#define MOCK_NOEXCEPT_METHOD1(m, ...) \
+  GMOCK_METHOD1_(, noexcept, , m, __VA_ARGS__)
+
 class Mock_vault_curl : public IVault_curl {
  public:
   MOCK_METHOD1(init, bool(const Vault_credentials &vault_credentials));
@@ -322,7 +334,7 @@ class Mock_vault_curl : public IVault_curl {
   MOCK_METHOD2(write_key, bool(const Vault_key &key, Secure_string *response));
   MOCK_METHOD2(read_key, bool(const Vault_key &key, Secure_string *response));
   MOCK_METHOD2(delete_key, bool(const Vault_key &key, Secure_string *response));
-  MOCK_METHOD(void, set_timeout, (uint), noexcept);
+  MOCK_NOEXCEPT_METHOD1(set_timeout, void(uint timeout));
 };
 
 TEST_F(Vault_io_test, ErrorFromVaultCurlOnVaultIOInit) {
