@@ -412,7 +412,7 @@ class PT_column_format_column_attr : public PT_column_attr_base {
   bool contextualize(Column_parse_context *pc) override {
     return super::contextualize(pc);
   }
-  virtual void apply_zip_dict(LEX_CSTRING *to) const noexcept {
+  void apply_zip_dict(LEX_CSTRING *to) const noexcept override {
     *to = m_zip_dict_name;
   }
 
