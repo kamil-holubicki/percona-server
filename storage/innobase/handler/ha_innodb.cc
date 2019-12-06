@@ -15568,7 +15568,7 @@ ha_innobase::info_low(
 		ulint	stat_clustered_index_size;
 		ulint	stat_sum_of_other_index_sizes;
 
-		if (!(flag & HA_STATUS_NO_LOCK)) {
+		if (!(flag & (HA_STATUS_NO_LOCK | HA_STATUS_NO_LOCK_VARIABLE_EXTRA))) {
 			dict_table_stats_lock(ib_table, RW_S_LATCH);
 		}
 
@@ -15582,7 +15582,7 @@ ha_innobase::info_low(
 		stat_sum_of_other_index_sizes
 			= ib_table->stat_sum_of_other_index_sizes;
 
-		if (!(flag & HA_STATUS_NO_LOCK)) {
+		if (!(flag & (HA_STATUS_NO_LOCK | HA_STATUS_NO_LOCK_VARIABLE_EXTRA))) {
 			dict_table_stats_unlock(ib_table, RW_S_LATCH);
 		}
 
@@ -15637,8 +15637,9 @@ ha_innobase::info_low(
 		are asked by MySQL to avoid locking. Another reason to
 		avoid the call is that it uses quite a lot of CPU.
 		See Bug#38185. */
-		if (flag & HA_STATUS_NO_LOCK
-		    || !(flag & HA_STATUS_VARIABLE_EXTRA)) {
+		if (!(flag & HA_STATUS_NO_LOCK_VARIABLE_EXTRA) &&
+			(flag & HA_STATUS_NO_LOCK
+		    || !(flag & HA_STATUS_VARIABLE_EXTRA))) {
 			/* We do not update delete_length if no
 			locking is requested so the "old" value can
 			remain. delete_length is initialized to 0 in

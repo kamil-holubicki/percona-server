@@ -2200,6 +2200,8 @@ dict_stats_update_persistent(
 
 	dict_table_stats_lock(table, RW_X_LATCH);
 
+	DEBUG_SYNC_C("innodb_dict0stats_dict_stats_update_persistent");
+
 	/* analyze the clustered index first */
 
 	index = dict_table_get_first_index(table);

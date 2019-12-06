@@ -398,6 +398,16 @@ is the global server default. */
 #define HA_STATUS_VARIABLE_EXTRA 128
 
 /*
+  Get delete_length, but allow execution without locking
+  (as if HA_STATUS_NO_LOCK was specified as well).
+  We introduce this flag instead of using HA_STATUS_NO_LOCK because it is
+  rather hint to not lock and get delete_length than strict requirement.
+  See InnoDB implementation where delete_length is skipped if HA_STATUS_NO_LOCK
+  is specified (and PS-6116 description)
+ */
+#define HA_STATUS_NO_LOCK_VARIABLE_EXTRA (1<<15)
+
+/*
   Errorcodes given by handler functions
 
   opt_sum_query() assumes these codes are > 1

@@ -5697,7 +5697,8 @@ static int get_schema_tables_record(THD *thd, TABLE_LIST *tables,
       if ((info_error= file->info(HA_STATUS_VARIABLE |
                                   HA_STATUS_TIME |
                                   HA_STATUS_VARIABLE_EXTRA |
-                                  HA_STATUS_AUTO)) != 0)
+                                  HA_STATUS_AUTO |
+                                  HA_STATUS_NO_LOCK_VARIABLE_EXTRA)) != 0)
         goto err;
 
       enum row_type row_type = file->get_row_type();
