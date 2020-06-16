@@ -198,6 +198,8 @@ static my_bool	innodb_optimize_fulltext_only		= FALSE;
 
 static char*	innodb_version_str = (char*) INNODB_VERSION_STR;
 
+my_bool  innobase_enable_ibuf_aio_fix = FALSE;
+
 extern uint srv_fil_crypt_rotate_key_age;
 extern uint srv_n_fil_crypt_iops;
 
@@ -22712,6 +22714,11 @@ static MYSQL_SYSVAR_UINT(background_scrub_data_interval,
                          1,
                          UINT_MAX32, 0);
 
+static MYSQL_SYSVAR_BOOL(enable_ibuf_aio_fix, innobase_enable_ibuf_aio_fix,
+  PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_READONLY,
+  "Enable fix for stuck ibuf AIO transfers.",
+  NULL, NULL, false);
+
 static struct st_mysql_sys_var* innobase_system_variables[]= {
   MYSQL_SYSVAR(api_trx_level),
   MYSQL_SYSVAR(api_bk_commit_interval),
@@ -22930,6 +22937,7 @@ static struct st_mysql_sys_var* innobase_system_variables[]= {
   MYSQL_SYSVAR(background_scrub_data_compressed),
   MYSQL_SYSVAR(background_scrub_data_interval),
   MYSQL_SYSVAR(background_scrub_data_check_interval),
+  MYSQL_SYSVAR(enable_ibuf_aio_fix),
   NULL
 };
 

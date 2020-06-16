@@ -678,6 +678,14 @@ private:
 		MY_ATTRIBUTE((warn_unused_result));
 #endif /* LINUX_NATIVE_AIO */
 
+
+	/** Submit buffered AIO requests on the array to the kernel.
+	(low level function).
+	@param[in] acquire_mutex specifies whether to lock array mutex
+	@param[in] array for which to submit IO */
+    static void os_aio_dispatch_read_array_submit_low_for_array(
+		bool acquire_mutex MY_ATTRIBUTE((unused)), AIO* arr);
+
 private:
 	typedef std::vector<Slot> Slots;
 
@@ -3032,17 +3040,63 @@ void
 AIO::os_aio_dispatch_read_array_submit_low(
 	bool acquire_mutex MY_ATTRIBUTE((unused)))
 {
+	os_aio_dispatch_read_array_submit_low_for_array(acquire_mutex, s_reads);
+	if (s_ibuf != NULL) {
+		os_aio_dispatch_read_array_submit_low_for_array(acquire_mutex, s_ibuf);
+	}
+}
+
+extern my_bool  innobase_enable_ibuf_aio_fix;
+
+/** Submit buffered AIO requests on the array to the kernel.
+(low level function).
+@param[in] acquire_mutex specifies whether to lock array mutex
+@param[in] array for which to submit IO */
+void
+AIO::os_aio_dispatch_read_array_submit_low_for_array(
+	bool acquire_mutex MY_ATTRIBUTE((unused)), AIO* arr)
+{
 	if (!srv_use_native_aio) {
 		return;
 	}
 #if defined(LINUX_NATIVE_AIO)
-	AIO* array = AIO::s_reads;
+	AIO* array = arr;
 	ulint total_submitted = 0;
 	if (acquire_mutex)
 		array->acquire();
+
+	ut_ad((array->m_pending && array->m_count) || 
+	      (!array->m_pending && !array->m_count));
+
+	// return immediately if there are no pending AIO requests
+	if (!array->m_pending) {
+		if (acquire_mutex)
+			array->release();
+		return;
+	}
+
+	// >>>>>>>>
+	// This is only for debug purposes to catch the case where transfers stuck
+	// in AIO::s_ibuf. To be removed after tests toghether with innobase_enable_ibuf_aio_fix
+	if (array == s_ibuf) {
+		ib::warn()
+			<< "Requested read dispatch for s_ibuf.";
+		if (!innobase_enable_ibuf_aio_fix) {
+			ib::warn()
+				<< "s_iobuf AIO fix will be not applied. AIO should stuck soon..."
+				<< " Start the server with --innodb-enable-ibuf-aio-fix=1 to enable fix.";
+			if (acquire_mutex)
+				array->release();
+				
+			return;
+		}
+		ib::warn()
+			<< "Applying fix - submitting s_ibuf AIOs.";
+	}
+	// <<<<<<<<
+
+
 	/* Submit aio requests buffered on all segments. */
-	ut_ad(array->m_pending);
-	ut_ad(array->m_count);
 	for (ulint i = 0; i < array->m_n_segments; i++) {
 		const int	count = array->m_count[i];
 		int	offset = 0;
@@ -3142,7 +3196,7 @@ AIO::linux_dispatch(Slot* slot, bool should_buffer)
 		m_pending[n] = iocb;
 		++count;
 		if (count == slots_per_segment) {
-			AIO::os_aio_dispatch_read_array_submit_low(false);
+			AIO::os_aio_dispatch_read_array_submit_low_for_array(false, this);
 		}
 		release();
 		return(true);
