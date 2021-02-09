@@ -306,6 +306,13 @@ class Double_write {
     return false;
   }
 
+bool is_batch_running() noexcept {
+    std::atomic_thread_fence(std::memory_order_acquire);
+
+    auto res = m_batch_running.load(std::memory_order_acquire);
+    return res;
+}
+
   /** Flush buffered pages to disk, clear the buffers.
   @param[in] flush_type           FLUSH LIST or LRU LIST flush.
   @return false if there was a write batch already in progress. */
@@ -712,6 +719,9 @@ class Batch_segment : public Segment {
   @return if batch ended. */
   bool write_complete() noexcept MY_ATTRIBUTE((warn_unused_result)) {
     const auto n = m_written.fetch_add(1, std::memory_order_relaxed);
+    // we cannot have more writes in batch than batch size
+    ut_a(n+1 <= m_batch_size.load(std::memory_order_relaxed));
+
     return n + 1 == m_batch_size.load(std::memory_order_relaxed);
   }
 
@@ -719,12 +729,18 @@ class Batch_segment : public Segment {
   void reset() noexcept {
     m_written.store(0, std::memory_order_relaxed);
     m_batch_size.store(0, std::memory_order_relaxed);
+    ut_a(m_written.load(std::memory_order_relaxed) == 0);
+    ut_a(m_batch_size.load(std::memory_order_relaxed) == 0);
   }
 
   /** Set the batch size.
   @param[in] size               Number of pages to write to disk. */
   void set_batch_size(uint32_t size) noexcept {
+    ut_a(m_dblwr != nullptr);
+    ut_a(m_dblwr->is_batch_running() == true);
+    ut_a(m_batch_size.load(std::memory_order_relaxed) == 0);
     m_batch_size.store(size, std::memory_order_release);
+    ut_a(m_batch_size.load(std::memory_order_relaxed) == (int)size);
   }
 
   /** @return the batch size. */
@@ -735,6 +751,9 @@ class Batch_segment : public Segment {
   /** Note that the batch has started for the double write instance.
   @param[in] dblwr              Instance for which batch has started. */
   void start(Double_write *dblwr) noexcept {
+    ut_a(m_dblwr == nullptr);
+    ut_a(m_batch_size.load(std::memory_order_relaxed) == 0);
+    ut_a(m_written.load(std::memory_order_relaxed) == 0);
     m_dblwr = dblwr;
     m_dblwr->batch_started();
   }
@@ -1416,7 +1435,10 @@ void Double_write::write_pages(buf_flush_t flush_type) noexcept {
     os_thread_yield();
   }
 
+  // Batch cannot be running now. We are starting it right now
+  ut_a(is_batch_running() == false);
   batch_segment->start(this);
+  ut_a(is_batch_running() == true);
 
   batch_segment->write(m_buffer);
 
