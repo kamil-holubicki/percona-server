@@ -40,6 +40,14 @@
 #include "filter.h"
 #include "logger.h"
 
+#include <mysql/components/component_implementation.h>
+#include "mysql/components/services/mysql_query_attributes.h"
+
+static REQUIRES_SERVICE_PLACEHOLDER(mysql_query_attributes_iterator);
+static REQUIRES_SERVICE_PLACEHOLDER(mysql_query_attribute_string);
+static REQUIRES_SERVICE_PLACEHOLDER(mysql_query_attribute_isnull);
+static REQUIRES_SERVICE_PLACEHOLDER(mysql_string_converter);
+
 #define PLUGIN_VERSION 0x0002
 
 enum audit_log_policy_t { ALL, NONE, LOGINS, QUERIES };
@@ -522,6 +530,36 @@ static char *audit_log_general_record(char *buf, size_t buflen,
     full_outlen += query_length;
   }
 
+  {
+    mysqlh_query_attributes_iterator iter = nullptr;
+    my_h_string h_str = nullptr;
+
+    mysql_service_mysql_query_attributes_iterator->create(nullptr, nullptr,
+                                                                &iter);
+
+    while(iter && true) {
+        bool is_null_val = true;
+        if (mysql_service_mysql_query_attribute_isnull->get(iter, &is_null_val))
+            goto end;
+
+        if (mysql_service_mysql_query_attribute_string->get(iter, &h_str)) goto end;
+
+        char outbuf[1024];
+        static const char *query_attribute_return_charset = "utf8mb4";
+        if (mysql_service_mysql_string_converter->convert_to_buffer(
+                h_str, outbuf, 1024,
+                query_attribute_return_charset))
+            goto end;
+        fprintf(stderr, "KH: attr: %s\n", outbuf);
+
+        mysql_service_mysql_query_attributes_iterator->next(iter);
+    }
+end:
+  if (iter) mysql_service_mysql_query_attributes_iterator->release(iter);
+  //if (h_str) mysql_service_mysql_string_factory->destroy(h_str);
+  }
+
+
   user = escape_string(event.general_user.str, event.general_user.length,
                        endptr, endbuf - endptr, &endptr, &full_outlen);
   host = escape_string(event.general_host.str, event.general_host.length,
@@ -784,6 +822,30 @@ static audit_log_thd_local *get_thd_local(MYSQL_THD thd) noexcept;
  */
 static char *get_record_buffer(MYSQL_THD thd, size_t size) noexcept;
 
+static void init_query_attributes_service()
+{
+  SERVICE_TYPE(registry) *reg_srv = mysql_plugin_registry_acquire();
+  static my_h_service qai_service;
+  reg_srv->acquire("mysql_query_attributes_iterator", &qai_service);
+  mysql_service_mysql_query_attributes_iterator =
+    reinterpret_cast<SERVICE_TYPE_NO_CONST(mysql_query_attributes_iterator) *>(qai_service);
+
+  static my_h_service qas_service;
+  reg_srv->acquire("mysql_query_attribute_string", &qas_service);
+  mysql_service_mysql_query_attribute_string =
+    reinterpret_cast<SERVICE_TYPE_NO_CONST(mysql_query_attribute_string) *>(qas_service);
+
+  static my_h_service qain_service;
+  reg_srv->acquire("mysql_query_attribute_isnull", &qain_service);
+  mysql_service_mysql_query_attribute_isnull =
+    reinterpret_cast<SERVICE_TYPE_NO_CONST(mysql_query_attribute_isnull) *>(qain_service);
+
+  static my_h_service sc_service;
+  reg_srv->acquire("mysql_string_converter", &sc_service);
+  mysql_service_mysql_string_converter =
+    reinterpret_cast<SERVICE_TYPE_NO_CONST(mysql_string_converter) *>(sc_service);
+}
+
 /*
  Allocate and return given number of stack frames.
  */
@@ -862,6 +924,10 @@ static int audit_log_plugin_init(MYSQL_PLUGIN plugin_info) {
 
   if (audit_log_audit_record(buf, sizeof(buf), "Audit", time(nullptr), &len))
     audit_log_write(buf, len);
+
+   init_query_attributes_service();
+
+
 
   return 0;
 

@@ -2023,8 +2023,8 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
         thd->set_secondary_engine_optimization(saved_secondary_engine);
       }
 
-      thd->bind_parameter_values = nullptr;
-      thd->bind_parameter_values_count = 0;
+// KH:      thd->bind_parameter_values = nullptr;
+// KH:      thd->bind_parameter_values_count = 0;
 
       /* Need to set error to true for graceful shutdown */
       if ((thd->lex->sql_command == SQLCOM_SHUTDOWN) &&
@@ -2347,6 +2347,10 @@ done:
      execution of the command at thie point. */
   mysql_audit_notify(thd, AUDIT_EVENT(MYSQL_AUDIT_COMMAND_END), command,
                      command_name[command].str);
+
+// KH: 
+        thd->bind_parameter_values = nullptr;
+        thd->bind_parameter_values_count = 0;
 
   log_slow_statement(thd, query_start_status_ptr);
 
