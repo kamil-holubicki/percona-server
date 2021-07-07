@@ -2023,9 +2023,11 @@ bool dispatch_command(THD *thd, const COM_DATA *com_data,
         thd->set_secondary_engine_optimization(saved_secondary_engine);
       }
 
-// KH:      thd->bind_parameter_values = nullptr;
-// KH:      thd->bind_parameter_values_count = 0;
-
+#if 0
+// KH: query attributes cleaned here originally
+      thd->bind_parameter_values = nullptr;
+      thd->bind_parameter_values_count = 0;
+#endif
       /* Need to set error to true for graceful shutdown */
       if ((thd->lex->sql_command == SQLCOM_SHUTDOWN) &&
           (thd->get_stmt_da()->is_ok()))
@@ -2348,10 +2350,11 @@ done:
   mysql_audit_notify(thd, AUDIT_EVENT(MYSQL_AUDIT_COMMAND_END), command,
                      command_name[command].str);
 
-// KH: 
-        thd->bind_parameter_values = nullptr;
-        thd->bind_parameter_values_count = 0;
-
+#if 1
+// KH: needed modification
+  thd->bind_parameter_values = nullptr;
+  thd->bind_parameter_values_count = 0;
+#endif
   log_slow_statement(thd, query_start_status_ptr);
 
   THD_STAGE_INFO(thd, stage_cleaning_up);

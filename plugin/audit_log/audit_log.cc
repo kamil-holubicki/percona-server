@@ -24,6 +24,8 @@
 #include "m_ctype.h"
 #include "my_sys.h"
 #include "mysql/components/services/component_sys_var_service.h"
+#include <include/mysql/components/services/psi_stage.h>
+#include "mysql/psi/mysql_stage.h"
 #include "mysql/plugin.h"
 #include "mysql/plugin_audit.h"
 #include "mysql/psi/mysql_memory.h"
@@ -47,6 +49,7 @@ static REQUIRES_SERVICE_PLACEHOLDER(mysql_query_attributes_iterator);
 static REQUIRES_SERVICE_PLACEHOLDER(mysql_query_attribute_string);
 static REQUIRES_SERVICE_PLACEHOLDER(mysql_query_attribute_isnull);
 static REQUIRES_SERVICE_PLACEHOLDER(mysql_string_converter);
+REQUIRES_SERVICE_PLACEHOLDER(psi_stage_v1);
 
 #define PLUGIN_VERSION 0x0002
 
@@ -86,6 +89,10 @@ static char *audit_log_include_databases = nullptr;
 static char *audit_log_exclude_commands = nullptr;
 static char *audit_log_include_commands = nullptr;
 std::atomic<uint64_t> audit_log_buffer_size_overflow(0);
+
+PSI_stage_info info_AUDIT_qa_parsed = {
+    0, "Query Attributes Parsed",
+    PSI_FLAG_STAGE_PROGRESS, PSI_DOCUMENT_ME};
 
 PSI_memory_key key_memory_audit_log_logger_handle;
 PSI_memory_key key_memory_audit_log_handler;
@@ -536,24 +543,48 @@ static char *audit_log_general_record(char *buf, size_t buflen,
 
     mysql_service_mysql_query_attributes_iterator->create(nullptr, nullptr,
                                                                 &iter);
-
-    while(iter && true) {
+    char buffer[1024];
+    char *ptr = buffer;
+    bool attributes_found = false;
+    while(iter) {
         bool is_null_val = true;
         if (mysql_service_mysql_query_attribute_isnull->get(iter, &is_null_val))
             goto end;
+        if(is_null_val) break;
 
-        if (mysql_service_mysql_query_attribute_string->get(iter, &h_str)) goto end;
+        char key[1024];
+        char value[1024];
+        memset(key, 0, 1024);
+        memset(value, 0, 1024);
 
-        char outbuf[1024];
         static const char *query_attribute_return_charset = "utf8mb4";
+        // parameter name
+        if (mysql_service_mysql_query_attributes_iterator->get_name(iter, &h_str)) goto end;
         if (mysql_service_mysql_string_converter->convert_to_buffer(
-                h_str, outbuf, 1024,
+                h_str, key, 1024,
                 query_attribute_return_charset))
             goto end;
-        fprintf(stderr, "KH: attr: %s\n", outbuf);
+
+        // parameter value
+        if (mysql_service_mysql_query_attribute_string->get(iter, &h_str)) goto end;
+        if (mysql_service_mysql_string_converter->convert_to_buffer(
+                h_str, value, 1024,
+                query_attribute_return_charset))
+            goto end;
+        fprintf(stderr, "KH: attr: %s:%s\n", key, value);
+        sprintf(ptr, "%s:%s ", key, value);
+        ptr = buffer + strlen(ptr);
 
         mysql_service_mysql_query_attributes_iterator->next(iter);
+        attributes_found = true;
     }
+
+    if(attributes_found) {
+        // inform PFS
+        mysql_service_psi_stage_v1->start_stage(
+            info_AUDIT_qa_parsed.m_key, buffer, 0);
+    }
+
 end:
   if (iter) mysql_service_mysql_query_attributes_iterator->release(iter);
   //if (h_str) mysql_service_mysql_string_factory->destroy(h_str);
@@ -822,6 +853,20 @@ static audit_log_thd_local *get_thd_local(MYSQL_THD thd) noexcept;
  */
 static char *get_record_buffer(MYSQL_THD thd, size_t size) noexcept;
 
+static PSI_stage_info *all_audit_log_stages_keys[] = {
+    &info_AUDIT_qa_parsed
+    };
+
+void register_audit_log_stage_psi_keys(
+    PSI_stage_info **keys MY_ATTRIBUTE((unused)),
+    size_t count MY_ATTRIBUTE((unused))) {
+#ifdef HAVE_PSI_STAGE_INTERFACE
+  const char *category = "group_rpl";
+  mysql_stage_register(category, keys, static_cast<int>(count));
+#endif
+}
+
+
 static void init_query_attributes_service()
 {
   SERVICE_TYPE(registry) *reg_srv = mysql_plugin_registry_acquire();
@@ -844,6 +889,12 @@ static void init_query_attributes_service()
   reg_srv->acquire("mysql_string_converter", &sc_service);
   mysql_service_mysql_string_converter =
     reinterpret_cast<SERVICE_TYPE_NO_CONST(mysql_string_converter) *>(sc_service);
+
+  static my_h_service ps_service;
+  reg_srv->acquire("psi_stage_v1.performance_schema", &ps_service);
+  mysql_service_psi_stage_v1 =
+    reinterpret_cast<SERVICE_TYPE_NO_CONST(psi_stage_v1) *>(ps_service);
+
 }
 
 /*
@@ -926,6 +977,9 @@ static int audit_log_plugin_init(MYSQL_PLUGIN plugin_info) {
     audit_log_write(buf, len);
 
    init_query_attributes_service();
+   register_audit_log_stage_psi_keys(
+      all_audit_log_stages_keys,
+      array_elements(all_audit_log_stages_keys));
 
 
 
