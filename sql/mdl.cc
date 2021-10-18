@@ -431,6 +431,7 @@ void Deadlock_detection_visitor::opt_change_victim_to(MDL_context *new_victim) {
 
 class MDL_lock {
  public:
+  unsigned long long m_magic;
   typedef unsigned short bitmap_t;
 
   class Ticket_list {
@@ -1116,11 +1117,13 @@ static void mdl_lock_cons(uchar *arg) {
 
 static void mdl_lock_dtor(uchar *arg) {
   MDL_lock *lock = (MDL_lock *)(arg + LF_HASH_OVERHEAD);
+  lock->m_magic = 0xDEADBEEF;  /* DEADBEEF */
   lock->~MDL_lock();
 }
 
 static void mdl_lock_reinit(uchar *dst_arg, const uchar *src_arg) {
   MDL_lock *dst = (MDL_lock *)dst_arg;
+  dst->m_magic = 0xA110CA7E;  /* ALLOCATE */
   const MDL_key *src = (const MDL_key *)src_arg;
   dst->reinit(src);
 }
@@ -4117,6 +4120,13 @@ void MDL_context::release_lock(enum_mdl_duration duration, MDL_ticket *ticket) {
   */
   if (ticket->m_hton_notified) key_for_hton.mdl_key_init(&lock->key);
 
+// #define KH_FIX
+#ifdef KH_FIX
+  // KH: Doing it before unlocking will fix the problem.
+  // In fact it seems to be "the proper way" as this is the reverse order
+  // of what we do in try_acquire_lock_impl()
+  m_ticket_store.remove(duration, ticket);
+#endif
   if (ticket->m_is_fast_path) {
     /*
       We are releasing ticket which represents lock request which was
@@ -4190,7 +4200,13 @@ void MDL_context::release_lock(enum_mdl_duration duration, MDL_ticket *ticket) {
 
   end_fast_path:
     /* Don't count singleton MDL_lock objects as unused. */
-    if (last_use && !is_singleton) mdl_locks.lock_object_unused(this, m_pins);
+    if (last_use && !is_singleton) {
+      // It was last use. Mark it as dead. Probably not suitable for
+      // multi-threaded production environment,
+      // but definitely OK for single thread unit test.
+      lock->m_magic = 0xDEADBEEF;
+      mdl_locks.lock_object_unused(this, m_pins);
+    }
   } else {
     /*
       Lock request represented by ticket was acquired using "slow path"
@@ -4198,7 +4214,11 @@ void MDL_context::release_lock(enum_mdl_duration duration, MDL_ticket *ticket) {
     */
     lock->remove_ticket(this, m_pins, &MDL_lock::m_granted, ticket);
   }
+#ifndef KH_FIX
+  // KH: It is too late. If we hit m_ticket_store.m_map, we can use deallocated
+  // ticket's m_lock
   m_ticket_store.remove(duration, ticket);
+#endif
   if (ticket->m_hton_notified) {
     mysql_mdl_set_status(ticket->m_psi, MDL_ticket::POST_RELEASE_NOTIFY);
     m_owner->notify_hton_post_release_exclusive(&key_for_hton);
@@ -4771,6 +4791,7 @@ void MDL_ticket_store::remove(enum_mdl_duration dur, MDL_ticket *ticket) {
   auto foundit = std::find_if(
       foundrng.first, foundrng.second, [&](const Ticket_map::value_type &vt) {
         auto &th = vt.second;
+        assert(th.m_ticket->get_lock()->m_magic == 0xA110CA7E);
         assert(th.m_ticket != ticket || th.m_dur == dur);
         return (th.m_ticket == ticket);
       });

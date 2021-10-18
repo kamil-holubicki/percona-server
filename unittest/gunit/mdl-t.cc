@@ -272,6 +272,27 @@ TEST_F(MDLDeathTest, DieWhenMTicketsNonempty) {
  */
 TEST_F(MDLTest, ConstructAndDestruct) {}
 
+
+TEST_F(MDLTest, TicketDestroy) {
+  // force early collection of unused MDL_lock
+  mdl_locks_unused_locks_low_water = 0;
+
+  // force usage of m_map hash in m_ticket_store by creating more than
+  // THRESHOLD (256) MDL tickets
+  std::string fake_table("fake_table_");
+
+  for (int i = 0; i < 300; ++i) {
+    MDL_request request;
+    std::string table = fake_table + std::to_string(i);
+    MDL_REQUEST_INIT(&request, MDL_key::TABLE, db_name, table.c_str(), MDL_SHARED,
+                   MDL_TRANSACTION);
+    EXPECT_FALSE(m_mdl_context.try_acquire_lock(&request));
+  }
+
+  // release all locks. Asserts should do the job
+  m_mdl_context.release_transactional_locks();
+ }
+
 void MDLTest::test_one_simple_shared_lock(enum_mdl_type lock_type) {
   MDL_REQUEST_INIT(&m_request, MDL_key::TABLE, db_name, table_name1, lock_type,
                    MDL_TRANSACTION);
