@@ -423,17 +423,20 @@ class Query_arena {
   */
  private:
   enum_state state;
+  THD* owner_thd;
 
  public:
-  Query_arena(MEM_ROOT *mem_root_arg, enum enum_state state_arg)
-      : m_item_list(nullptr), mem_root(mem_root_arg), state(state_arg) {}
+  Query_arena(MEM_ROOT *mem_root_arg, enum enum_state state_arg, THD *thd = nullptr)
+      : m_item_list(nullptr), mem_root(mem_root_arg), state(state_arg)
+      , owner_thd(thd) {}
 
   /*
     This constructor is used only when Query_arena is created as
     backup storage for another instance of Query_arena.
   */
   Query_arena()
-      : m_item_list(nullptr), mem_root(nullptr), state(STMT_INITIALIZED) {}
+      : m_item_list(nullptr), mem_root(nullptr), state(STMT_INITIALIZED),
+      owner_thd(nullptr) {}
 
   virtual ~Query_arena() = default;
 
@@ -454,14 +457,31 @@ class Query_arena {
   /// @returns true if a regular statement, ie not prepared and not stored proc
   bool is_regular() const { return state == STMT_REGULAR_EXECUTION; }
 
-  void *alloc(size_t size) { return mem_root->Alloc(size); }
+  void *alloc(size_t size) {
+    if(owner_thd && current_thd != owner_thd){
+      fprintf(stderr, "KH: (x%llX) %s, owner_thd: x%llX\n",
+        (unsigned long long)current_thd, __FUNCTION__, (unsigned long long)owner_thd);
+    }
+    assert(owner_thd == nullptr || current_thd == owner_thd);
+    return mem_root->Alloc(size);
+  }
   void *mem_calloc(size_t size) {
     void *ptr;
+    if(owner_thd && current_thd != owner_thd){
+      fprintf(stderr, "KH: (x%llX) %s, owner_thd: x%llX\n",
+        (unsigned long long)current_thd, __FUNCTION__, (unsigned long long)owner_thd);
+    }
+    assert(owner_thd == nullptr || current_thd == owner_thd);
     if ((ptr = mem_root->Alloc(size))) memset(ptr, 0, size);
     return ptr;
   }
   inline void *mem_aligned_calloc(size_t size, size_t alignment) {
     size_t unaligned_size = size + alignment;
+    if(owner_thd && current_thd != owner_thd){
+      fprintf(stderr, "KH: (x%llX) %s, owner_thd: x%llX\n",
+        (unsigned long long)current_thd, __FUNCTION__, (unsigned long long)owner_thd);
+    }
+    assert(owner_thd == nullptr || current_thd == owner_thd);
     void *ptr = mem_root->Alloc(unaligned_size);
     if (!ptr) return nullptr;
     ptr = reinterpret_cast<void *>(

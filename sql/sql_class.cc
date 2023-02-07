@@ -632,7 +632,7 @@ void Open_tables_state::reset_open_tables_state() {
 }
 
 THD::THD(bool enable_plugins)
-    : Query_arena(&main_mem_root, STMT_REGULAR_EXECUTION),
+    : Query_arena(&main_mem_root, STMT_REGULAR_EXECUTION, this),
       mark_used_columns(MARK_COLUMNS_READ),
       want_privilege(0),
       main_lex(new LEX),
