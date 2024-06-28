@@ -212,6 +212,7 @@ void System_tables::add_remaining_dd_tables() {
   register_table("backup_sbt_history", system);
   register_table("columns_priv", system);
   register_table("component", system);
+  register_table("component2", system);
   register_table("compression_dictionary", system);
   register_table("compression_dictionary_cols", system);
   register_table("db", system);

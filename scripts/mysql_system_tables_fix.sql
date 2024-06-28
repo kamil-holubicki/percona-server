@@ -514,6 +514,22 @@ PREPARE stmt FROM @str;
 EXECUTE stmt;
 DROP PREPARE stmt;
 
+
+#
+# Alter mysql.component2 only if it exists already.
+#
+
+SET @have_component2= (select count(*) from information_schema.tables where table_schema='mysql' and table_name='component2');
+
+# Change row format to DYNAMIC
+SET @cmd="ALTER TABLE component2 ROW_FORMAT=DYNAMIC";
+
+SET @str = IF(@have_component2 = 1, @cmd, 'SET @dummy = 0');
+PREPARE stmt FROM @str;
+EXECUTE stmt;
+DROP PREPARE stmt;
+
+
 #
 # Alter mysql.ndb_binlog_index only if it exists already.
 #

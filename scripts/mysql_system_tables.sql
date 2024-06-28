@@ -367,6 +367,12 @@ PREPARE stmt FROM @str;
 EXECUTE stmt;
 DROP PREPARE stmt;
 
+SET @cmd = "CREATE TABLE IF NOT EXISTS component2 ( component_id int unsigned NOT NULL AUTO_INCREMENT, component_group_id int unsigned NOT NULL, component_urn text NOT NULL, PRIMARY KEY (component_id)) engine=INNODB DEFAULT CHARSET=utf8mb3 COMMENT 'Components2' ROW_FORMAT=DYNAMIC TABLESPACE=mysql";
+SET @str = CONCAT(@cmd, " ENCRYPTION='", @is_mysql_encrypted, "'");
+PREPARE stmt FROM @str;
+EXECUTE stmt;
+DROP PREPARE stmt;
+
 
 SET @cmd="CREATE TABLE IF NOT EXISTS slave_relay_log_info (
   Number_of_lines INTEGER UNSIGNED NOT NULL COMMENT 'Number of lines in the file or rows in the table. Used to version table definitions.',
