@@ -1,7 +1,6 @@
 # Test the telemetry file creation and cleanup
 
 --source include/have_percona_telemetry.inc
---source include/force_restart.inc
 
 --let $telemetry_root_dir = $MYSQL_TMP_DIR/telemetry_dir
 --let $grace_interval = 30

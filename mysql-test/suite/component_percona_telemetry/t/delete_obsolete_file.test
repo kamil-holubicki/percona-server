@@ -2,7 +2,6 @@
 # but files with names not conforming to expected pattern are not.
 
 --source include/have_percona_telemetry.inc
---source include/force_restart.inc
 
 CALL mtr.add_suppression("Component percona_telemetry reported: 'Skipping file deletion this_file_should_not_be_removed'");
 
