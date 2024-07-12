@@ -23,11 +23,17 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
 #define RPL_TRX_TRACKING_INCLUDED
+#define KH_FIX
 
 #include <assert.h>
 #include <sys/types.h>
 #include <atomic>
+
+#ifdef KH_FIX
+#include <unordered_map>
+#else
 #include <map>
+#endif
 
 #include "mysql/binlog/event/binlog_event.h"
 
@@ -170,7 +176,11 @@ class Writeset_trx_dependency_tracker {
     Track the last transaction sequence number that changed each row
     in the database, using row hashes from the writeset as the index.
   */
+ #ifdef KH_FIX
+  typedef std::unordered_map<uint64, int64> Writeset_history;
+ #else
   typedef std::map<uint64, int64> Writeset_history;
+#endif
   Writeset_history m_writeset_history;
 };
 

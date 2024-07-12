@@ -254,6 +254,8 @@ void Writeset_trx_dependency_tracker::get_dependency(THD *thd,
      transaction's row hashes to the history.
     */
     int64 last_parent = m_writeset_history_start;
+#ifdef KH_FIX
+    std::vector<uint64> to_add;
     for (std::vector<uint64>::iterator it = writeset->begin();
          it != writeset->end(); ++it) {
       Writeset_history::iterator hst = m_writeset_history.find(*it);
@@ -261,14 +263,42 @@ void Writeset_trx_dependency_tracker::get_dependency(THD *thd,
         if (hst->second > last_parent && hst->second < sequence_number)
           last_parent = hst->second;
 
-        hst->second = sequence_number;
+        /* KH: can hst->second be greater than sequence_number?
+           In the original flow it can be equal, if new item was added in 'else'.
+           Here, we do not modify m_writeset_history in this loop, so hst->second
+           is always smaller (good reasoning?). If that's the case, we can remove
+           the 2nd condition in the above 'if' and 'max' below. */
+        hst->second = std::max(sequence_number, hst->second);
       } else {
+        // KH: here we don't need to insert in loop, we can postpone
+        if (!exceeds_capacity)
+          to_add.push_back(*it);
+      }
+    }
+    if (!to_add.empty()) {
+      for (auto v : to_add) {
+          m_writeset_history.insert(
+              std::pair<uint64, int64>(v, sequence_number));
+      }
+    }
+
+#else
+    for (std::vector<uint64>::iterator it = writeset->begin();
+         it != writeset->end(); ++it) {
+      Writeset_history::iterator hst = m_writeset_history.find(*it);
+      if (hst != m_writeset_history.end()) {
+        if (hst->second > last_parent && hst->second < sequence_number)
+          last_parent = hst->second;
+
+        hst->second = sequence_number;  // KH: not max of them?
+      } else {
+        // KH: here we don't need to insert in loop, we can postpone
         if (!exceeds_capacity)
           m_writeset_history.insert(
               std::pair<uint64, int64>(*it, sequence_number));
       }
     }
-
+#endif // KH_FIX
     /*
       If the transaction references tables with missing primary keys revert to
       COMMIT_ORDER, update and not reset history, as it is unnecessary because
