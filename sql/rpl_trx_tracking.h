@@ -178,6 +178,7 @@ class Writeset_trx_dependency_tracker {
   */
  #ifdef KH_FIX
   typedef std::unordered_map<uint64, int64> Writeset_history;
+  std::vector<uint64> m_to_add_cache;
  #else
   typedef std::map<uint64, int64> Writeset_history;
 #endif

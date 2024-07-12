@@ -255,12 +255,12 @@ void Writeset_trx_dependency_tracker::get_dependency(THD *thd,
     */
     int64 last_parent = m_writeset_history_start;
 #ifdef KH_FIX
-    std::vector<uint64> to_add;
+    // we are under LOCK_log
     for (std::vector<uint64>::iterator it = writeset->begin();
          it != writeset->end(); ++it) {
       Writeset_history::iterator hst = m_writeset_history.find(*it);
       if (hst != m_writeset_history.end()) {
-        if (hst->second > last_parent && hst->second < sequence_number)
+        if (hst->second > last_parent /* && hst->second < sequence_number */)
           last_parent = hst->second;
 
         /* KH: can hst->second be greater than sequence_number?
@@ -268,18 +268,21 @@ void Writeset_trx_dependency_tracker::get_dependency(THD *thd,
            Here, we do not modify m_writeset_history in this loop, so hst->second
            is always smaller (good reasoning?). If that's the case, we can remove
            the 2nd condition in the above 'if' and 'max' below. */
-        hst->second = std::max(sequence_number, hst->second);
+        // hst->second = std::max(sequence_number, hst->second);
+        hst->second = sequence_number;
       } else {
         // KH: here we don't need to insert in loop, we can postpone
         if (!exceeds_capacity)
-          to_add.push_back(*it);
+          m_to_add_cache.push_back(*it);
       }
     }
-    if (!to_add.empty()) {
-      for (auto v : to_add) {
+    if (!m_to_add_cache.empty()) {
+      for (auto v : m_to_add_cache) {
           m_writeset_history.insert(
               std::pair<uint64, int64>(v, sequence_number));
       }
+      // Leaves the capacity() of the vector unchanged
+      m_to_add_cache.clear();
     }
 
 #else
