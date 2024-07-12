@@ -255,6 +255,7 @@ void Writeset_trx_dependency_tracker::get_dependency(THD *thd,
     */
     int64 last_parent = m_writeset_history_start;
 #ifdef KH_FIX
+#pragma message("KH: Building with performance fix")
     // we are under LOCK_log
     for (std::vector<uint64>::iterator it = writeset->begin();
          it != writeset->end(); ++it) {
@@ -286,6 +287,7 @@ void Writeset_trx_dependency_tracker::get_dependency(THD *thd,
     }
 
 #else
+#pragma message("KH: Building without performance fix")
     for (std::vector<uint64>::iterator it = writeset->begin();
          it != writeset->end(); ++it) {
       Writeset_history::iterator hst = m_writeset_history.find(*it);
