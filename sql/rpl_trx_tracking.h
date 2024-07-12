@@ -23,7 +23,7 @@
    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 
 #define RPL_TRX_TRACKING_INCLUDED
-// #define KH_FIX
+#define KH_FIX
 
 #include <assert.h>
 #include <sys/types.h>
