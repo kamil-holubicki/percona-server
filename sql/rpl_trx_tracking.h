@@ -176,10 +176,9 @@ class Writeset_trx_dependency_tracker {
     Track the last transaction sequence number that changed each row
     in the database, using row hashes from the writeset as the index.
   */
- #ifdef KH_FIX
+#ifdef KH_FIX
   typedef std::unordered_map<uint64, int64> Writeset_history;
-  std::vector<uint64> m_to_add_cache;
- #else
+#else
   typedef std::map<uint64, int64> Writeset_history;
 #endif
   Writeset_history m_writeset_history;
