@@ -143,8 +143,14 @@ class Commit_order_trx_dependency_tracker {
 */
 class Writeset_trx_dependency_tracker {
  public:
+#ifdef KH_FIX
+  Writeset_trx_dependency_tracker(ulong max_history_size)
+      : m_opt_max_history_size(max_history_size), m_writeset_history_start(0)
+      , m_writeset_history(m_opt_max_history_size) {}
+#else
   Writeset_trx_dependency_tracker(ulong max_history_size)
       : m_opt_max_history_size(max_history_size), m_writeset_history_start(0) {}
+#endif
   /**
     Main function that gets the dependencies using the WRITESET tracker.
 
