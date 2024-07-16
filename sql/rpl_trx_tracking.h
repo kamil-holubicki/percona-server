@@ -138,12 +138,16 @@ class Commit_order_trx_dependency_tracker {
 */
 class Writeset_trx_dependency_tracker {
  public:
+#if 0
   Writeset_trx_dependency_tracker(ulong max_history_size)
       : m_opt_max_history_size(max_history_size), m_writeset_history_start(0)
       , m_memory_arena(2*m_opt_max_history_size)
       , resource(m_memory_arena.data(), m_memory_arena.size())
       , m_writeset_history(m_opt_max_history_size, &resource) {}
-
+#else
+  Writeset_trx_dependency_tracker(ulong max_history_size)
+      : m_opt_max_history_size(max_history_size), m_writeset_history_start(0) {}
+#endif
   /**
     Main function that gets the dependencies using the WRITESET tracker.
 
@@ -175,7 +179,7 @@ class Writeset_trx_dependency_tracker {
     in the database, using row hashes from the writeset as the index.
   */
 
-#if 1
+#if 0
   std::vector<char> m_memory_arena;
   std::pmr::monotonic_buffer_resource resource;
   typedef std::pmr::unordered_map<uint64, int64> Writeset_history;
