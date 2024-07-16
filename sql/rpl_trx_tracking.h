@@ -146,7 +146,8 @@ class Writeset_trx_dependency_tracker {
       , m_writeset_history(m_opt_max_history_size, &resource) {}
 #else
   Writeset_trx_dependency_tracker(ulong max_history_size)
-      : m_opt_max_history_size(max_history_size), m_writeset_history_start(0) {}
+      : m_opt_max_history_size(max_history_size), m_writeset_history_start(0)
+      , m_writeset_history(m_opt_max_history_size) {}
 #endif
   /**
     Main function that gets the dependencies using the WRITESET tracker.
