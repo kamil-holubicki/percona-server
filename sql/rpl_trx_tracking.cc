@@ -191,12 +191,6 @@ void Commit_order_trx_dependency_tracker::update_max_committed(
   m_max_committed_transaction.set_if_greater(sequence_number);
 }
 
-#ifdef KH_FIX
-#pragma message("KH: Building with performance fix")
-#else
-#pragma message("KH: Building without performance fix")
-#endif
-
 /**
   Get the writeset dependencies of a transaction.
   This takes the commit_parent that must be previously set using
