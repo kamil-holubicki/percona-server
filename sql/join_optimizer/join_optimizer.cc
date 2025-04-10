@@ -5324,6 +5324,25 @@ void EnableFullTextCoveringIndexes(const Query_block *query_block) {
   }
 }
 
+// KH:
+#if 1
+/// Does this path contain an EQ_REF path which has caching enabled?
+bool HasEqRefWithCache(AccessPath *path) {
+  bool found = false;
+  WalkAccessPaths(path, /*join=*/nullptr,
+                  WalkAccessPathPolicy::STOP_AT_MATERIALIZATION,
+                  [&found](const AccessPath *subpath, const JOIN *) {
+                    if (subpath->type == AccessPath::EQ_REF &&
+                        !subpath->eq_ref().ref->disable_cache) {
+                      found = true;
+                    }
+                    return found;
+                  });
+  return found;
+}
+#endif
+
+
 /**
   Creates a ZERO_ROWS access path for an always empty join result, or a
   ZERO_ROWS_AGGREGATED in case of an implicitly grouped query. The zero rows
@@ -5359,7 +5378,7 @@ AccessPath CreateStreamingAggregationPath(THD *thd, AccessPath *path,
   // Create a streaming node, if one is needed. It is needed for aggregation of
   // some full-text queries, because AggregateIterator doesn't preserve the
   // position of the underlying scans.
-  if (join->contains_non_aggregated_fts()) {
+  if (join->contains_non_aggregated_fts() || HasEqRefWithCache(path)) {
     child_path = NewStreamingAccessPath(
         thd, path, join, /*temp_table_param=*/nullptr, /*table=*/nullptr,
         /*ref_slice=*/-1);

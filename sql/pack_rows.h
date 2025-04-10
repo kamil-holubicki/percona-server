@@ -79,12 +79,15 @@ struct Table {
   // Whether to copy the NULL flags or not.
   bool copy_null_flags{false};
 
+// KH:
+#if 0
   // Whether to store the actual contents of NULL-complemented rows.
   // This is needed by AggregateIterator in order to be able to
   // restore the exact contents of the record buffer for a table
   // accessed with EQRefIterator, so that the cache in EQRefIterator
   // is not disturbed.
   bool store_contents_of_null_rows{false};
+#endif
 };
 
 /// A structure that contains a list of input tables for a hash join operation,
@@ -94,10 +97,19 @@ class TableCollection {
  public:
   TableCollection() = default;
 
+// KH:
+#if 0
   TableCollection(const Prealloced_array<TABLE *, 4> &tables, bool store_rowids,
                   table_map tables_to_get_rowid_for,
                   table_map tables_to_store_contents_of_null_rows_for);
-
+#else
+  TableCollection(const Prealloced_array<TABLE *, 4> &tables, bool store_rowids,
+                  table_map tables_to_get_rowid_for);
+#endif
+// KH:
+#if 1
+  explicit TableCollection(TABLE *table) { AddTable(table); }
+#endif
   const Prealloced_array<Table, 4> &tables() const { return m_tables; }
 
   table_map tables_bitmap() const { return m_tables_bitmap; }
@@ -113,7 +125,11 @@ class TableCollection {
   }
 
  private:
+#if 0
   void AddTable(TABLE *tab, bool store_contents_of_null_rows);
+#else
+  void AddTable(TABLE *tab);
+#endif
 
   Prealloced_array<Table, 4> m_tables{PSI_NOT_INSTRUMENTED};
 
@@ -135,6 +151,8 @@ class TableCollection {
   table_map m_tables_to_get_rowid_for = 0;
 };
 
+// KH:
+#if 0
 /// Possible values of the NULL-row flag stored by StoreFromTableBuffers(). It
 /// tells whether or not a row is a NULL-complemented row in which all column
 /// values (including non-nullable columns) are NULL. Additionally, in case it
@@ -154,6 +172,7 @@ enum class NullRowFlag {
   /// be available in the buffer.
   kNullWithData
 };
+#endif
 
 /// Count up how many bytes a single row from the given tables will occupy,
 /// in "packed" format. Note that this is an upper bound, so the length after
@@ -223,7 +242,8 @@ ALWAYS_INLINE uchar *StoreFromTableBuffersRaw(const TableCollection &tables,
                                               uchar *dptr) {
   for (const Table &tbl : tables.tables()) {
     const TABLE *table = tbl.table;
-
+// KH:
+#if 0
     NullRowFlag null_row_flag = NullRowFlag::kNotNull;
     if (table->is_nullable()) {
       if (table->has_null_row()) {
@@ -242,12 +262,29 @@ ALWAYS_INLINE uchar *StoreFromTableBuffersRaw(const TableCollection &tables,
         tbl.table->reset_null_row();
       }
     }
-
+#endif
     // Store the NULL flags.
     if (tbl.copy_null_flags) {
       memcpy(dptr, table->null_flags, table->s->null_bytes);
       dptr += table->s->null_bytes;
     }
+
+// KH:
+#if 1
+    if (tbl.table->is_nullable()) {
+      const size_t null_row_size = sizeof(tbl.table->null_row);
+      memcpy(dptr, pointer_cast<const uchar *>(&tbl.table->null_row),
+             null_row_size);
+      dptr += null_row_size;
+    }
+
+    if (tables.store_rowids() && ShouldCopyRowId(tbl.table)) {
+      // Store the row ID, since it is needed by weedout.
+      memcpy(dptr, table->file->ref, table->file->ref_length);
+      dptr += table->file->ref_length;
+    }
+#endif
+
 
     for (const Column &column : tbl.columns) {
       assert(bitmap_is_set(&column.field->table->read_set_internal,
@@ -259,6 +296,8 @@ ALWAYS_INLINE uchar *StoreFromTableBuffersRaw(const TableCollection &tables,
       }
     }
 
+// KH:
+#if 0
     if (null_row_flag == NullRowFlag::kNullWithData) {
       // The null flags were changed in order to get the actual contents of the
       // null row stored. Restore the original null flags.
@@ -270,6 +309,7 @@ ALWAYS_INLINE uchar *StoreFromTableBuffersRaw(const TableCollection &tables,
       memcpy(dptr, table->file->ref, table->file->ref_length);
       dptr += table->file->ref_length;
     }
+#endif
   }
   return dptr;
 }

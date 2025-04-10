@@ -251,13 +251,15 @@ Mem_root_array<TABLE *> CollectTables(THD *thd, AccessPath *root_path) {
   return tables;
 }
 
+// KH:
+#if 0
 /**
   Get the tables that are accessed by EQ_REF and can be on the inner side of an
   outer join. These need some extra care in AggregateIterator when handling
   NULL-complemented rows, so that the cache in EQRefIterator is not disturbed by
   AggregateIterator's switching between groups.
  */
-static table_map GetNullableEqRefTables(const AccessPath *root_path) {
+static  table_map GetNullableEqRefTables(const AccessPath *root_path) {
   table_map tables = 0;
   WalkAccessPaths(
       root_path, /*join=*/nullptr,
@@ -273,6 +275,7 @@ static table_map GetNullableEqRefTables(const AccessPath *root_path) {
       });
   return tables;
 }
+#endif
 
 // Mirrors QEP_TAB::pfs_batch_update(), with one addition:
 // If there is more than one table, batch mode will be handled by the join
@@ -874,12 +877,21 @@ unique_ptr_destroy_only<RowIterator> CreateIteratorFromAccessPath(
         }
         Prealloced_array<TABLE *, 4> tables =
             GetUsedTables(param.child, /*include_pruned_tables=*/true);
-        iterator = NewIterator<AggregateIterator>(
+// KH:
+#if 0
+            iterator = NewIterator<AggregateIterator>(
             thd, mem_root, std::move(job.children[0]), join,
             TableCollection(tables, /*store_rowids=*/false,
                             /*tables_to_get_rowid_for=*/0,
                             GetNullableEqRefTables(param.child)),
             param.rollup);
+#else
+        iterator = NewIterator<AggregateIterator>(
+            thd, mem_root, std::move(job.children[0]), join,
+            TableCollection(tables, /*store_rowids=*/false,
+                            /*tables_to_get_rowid_for=*/0),
+            param.rollup);
+#endif
         break;
       }
       case AccessPath::TEMPTABLE_AGGREGATE: {

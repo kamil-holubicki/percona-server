@@ -54,16 +54,25 @@ Table::Table(TABLE *table_arg)
 // well include a table with no columns, like t2 in the following query:
 //
 //   SELECT t1.col1 FROM t1, t2;  # t2 will be included without any columns.
+// KH:
+#if 0
 TableCollection::TableCollection(
     const Prealloced_array<TABLE *, 4> &tables, bool store_rowids,
     table_map tables_to_get_rowid_for,
     table_map tables_to_store_contents_of_null_rows_for)
-    : m_tables_bitmap(0),
+#else
+TableCollection::TableCollection(const Prealloced_array<TABLE *, 4> &tables,
+                                 bool store_rowids,
+                                 table_map tables_to_get_rowid_for)
+#endif
+      : m_tables_bitmap(0),
       m_store_rowids(store_rowids),
       m_tables_to_get_rowid_for(tables_to_get_rowid_for) {
   if (!store_rowids) {
     assert(m_tables_to_get_rowid_for == table_map{0});
   }
+// KH:
+#if 0
   for (TABLE *table : tables) {
     const Table_ref *ref = table->pos_in_table_list;
     AddTable(table, ref != nullptr &&
@@ -73,9 +82,22 @@ TableCollection::TableCollection(
       m_tables_bitmap |= ref->map();
     }
   }
+#else
+  for (TABLE *table : tables) {
+    AddTable(table);
+    if (table->pos_in_table_list != nullptr) {
+      m_tables_bitmap |= table->pos_in_table_list->map();
+    }
+  }
+#endif
 }
 
+// KH:
+#if 1
+void TableCollection::AddTable(TABLE *tab) {
+  #else
 void TableCollection::AddTable(TABLE *tab, bool store_contents_of_null_rows) {
+#endif
   // When constructing the iterator tree, we might end up adding a
   // WeedoutIterator _after_ a HashJoinIterator has been constructed.
   // When adding the WeedoutIterator, QEP_TAB::rowid_status will be changed
@@ -88,11 +110,17 @@ void TableCollection::AddTable(TABLE *tab, bool store_contents_of_null_rows) {
   // issue.
   m_ref_and_null_bytes_size += tab->file->ref_length;
 
+// KH:
+#if 0
   // Reserve one byte for the null_row flag, if the table is nullable.
   if (tab->is_nullable()) {
     ++m_ref_and_null_bytes_size;
   }
-
+#else
+  if (tab->is_nullable()) {
+    m_ref_and_null_bytes_size += sizeof(tab->null_row);
+  }
+#endif
   Table table(tab);
   for (const Column &column : table.columns) {
     // Field_typed_array will mask away the BLOB_FLAG for all types. Hence,
@@ -118,9 +146,14 @@ void TableCollection::AddTable(TABLE *tab, bool store_contents_of_null_rows) {
     m_ref_and_null_bytes_size += tab->s->null_bytes;
   }
 
+// KH:
+#if 0
   table.store_contents_of_null_rows = store_contents_of_null_rows;
-
   m_tables.push_back(std::move(table));
+#else
+  m_tables.push_back(table);
+#endif
+
 }
 
 // Calculate how many bytes the data in the column uses. We don't bother
@@ -239,13 +272,15 @@ const uchar *LoadIntoTableBuffers(const TableCollection &tables,
                                   const uchar *ptr) {
   for (const Table &tbl : tables.tables()) {
     TABLE *table = tbl.table;
-
+// KH:
+#if 0
     const NullRowFlag null_row_flag = table->is_nullable()
                                           ? static_cast<NullRowFlag>(*ptr++)
                                           : NullRowFlag::kNotNull;
     assert(null_row_flag == NullRowFlag::kNotNull ||
            null_row_flag == NullRowFlag::kNullWithoutData ||
            null_row_flag == NullRowFlag::kNullWithData);
+#endif
 
     // If the NULL row flag is set, it may override the NULL flags for the
     // columns. This may in turn cause columns not to be restored when they
@@ -257,6 +292,8 @@ const uchar *LoadIntoTableBuffers(const TableCollection &tables,
       ptr += table->s->null_bytes;
     }
 
+// KH:
+#if 0
     // Load all non-null column values.
     if (null_row_flag != NullRowFlag::kNullWithoutData) {
       for (const Column &column : tbl.columns) {
@@ -269,11 +306,32 @@ const uchar *LoadIntoTableBuffers(const TableCollection &tables,
     if (null_row_flag != NullRowFlag::kNotNull) {
       table->set_null_row();
     }
+#else
+    if (tbl.table->is_nullable()) {
+      const size_t null_row_size = sizeof(tbl.table->null_row);
+      memcpy(pointer_cast<uchar *>(&tbl.table->null_row), ptr, null_row_size);
+      ptr += null_row_size;
+    }
+#endif
 
-    if (tables.store_rowids() && ShouldCopyRowId(table)) {
+// KH:
+#if 0
+  if (tables.store_rowids() && ShouldCopyRowId(table)) {
+#else
+    if (tables.store_rowids() && ShouldCopyRowId(tbl.table)) {
+#endif
       memcpy(table->file->ref, ptr, table->file->ref_length);
       ptr += table->file->ref_length;
     }
+// KH
+#if 1
+    for (const Column &column : tbl.columns) {
+      if (!column.field->is_null()) {
+        ptr = column.field->unpack(ptr);
+      }
+    }
+#endif
+
   }
   return ptr;
 }

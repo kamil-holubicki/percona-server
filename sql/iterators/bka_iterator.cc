@@ -82,9 +82,15 @@ BKAIterator::BKAIterator(THD *thd,
       m_inner_input(std::move(inner_input)),
       m_mem_root(key_memory_hash_join, 16384 /* 16 kB */),
       m_rows(&m_mem_root),
+// KH:
+#if 0
       m_outer_input_tables(outer_input_tables, store_rowids,
                            tables_to_get_rowid_for,
                            /*tables_to_store_contents_of_null_rows_for=*/0),
+#else
+      m_outer_input_tables(outer_input_tables, store_rowids,
+                           tables_to_get_rowid_for),
+#endif
       m_max_memory_available(max_memory_available),
       m_mrr_bytes_needed_for_single_inner_row(
           mrr_bytes_needed_for_single_inner_row),
@@ -327,9 +333,15 @@ MultiRangeRowIterator::MultiRangeRowIterator(
       m_file(table->file),
       m_ref(ref),
       m_mrr_flags(mrr_flags),
+// KH:
+#if 0
+    m_outer_input_tables(outer_input_tables, store_rowids,
+      tables_to_get_rowid_for,
+      /*tables_to_store_contents_of_null_rows_for=*/0),
+#else
       m_outer_input_tables(outer_input_tables, store_rowids,
-                           tables_to_get_rowid_for,
-                           /*tables_to_store_contents_of_null_rows_for=*/0),
+                           tables_to_get_rowid_for),
+#endif
       m_join_type(join_type) {}
 
 bool MultiRangeRowIterator::Init() {
