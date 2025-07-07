@@ -458,7 +458,12 @@ ulong srv_buf_pool_instances;
 /** Default number of buffer pool instances */
 const ulong srv_buf_pool_instances_default = 0;
 /** Number of locks to protect buf_pool->page_hash */
+#if 1
+ulong srv_n_page_hash_locks = 256;
+#else
+// KH: original version. What is the impact on reads?
 ulong srv_n_page_hash_locks = 16;
+#endif
 /** Whether to validate InnoDB tablespace paths on startup */
 bool srv_validate_tablespace_paths = true;
 /** Use fdatasync() instead of fsync(). */

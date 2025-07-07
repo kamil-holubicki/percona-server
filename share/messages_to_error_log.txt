@@ -12339,6 +12339,18 @@ ER_GRP_RPL_CERT_BROADCAST_THREAD_STOPPED
 # End of 8.0 error messages intended to be written to the server error log.
 #
 
+ER_GRP_RPL_PRIMARY_ELECTION_MODE_NOT_COMPATIBLE
+  eng "The member is configured with a primary_election_mode option value '%s' not compatible from the group '%s'. The member will now exit the group."
+
+ER_RPL_FIND_LWM_WARNING_LOG
+  eng "The internal value might be inconsistent, start_index:%lu, entry:%lu, avail:%lu"
+
+ER_RPL_MOVE_QUEUE_HEAD_WARNING_LOG
+  eng "The values in move_queue_head could be inconsistent, total:%u, rli_checkpoint_seqno:%u, cnt:%lu"
+
+ER_RPL_GENERAL_INFO
+  eng "%s"
+
 #
 # Start of Percona Server 8.0 server error log messages
 #
