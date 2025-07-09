@@ -21,8 +21,8 @@ CREATE TRIGGER IF NOT EXISTS trg1 BEFORE INSERT ON t1 FOR EACH ROW BEGIN END;
 include/sync_slave_sql_with_master.inc
 SELECT routine_name FROM information_schema.routines WHERE routine_schema = "test";
 ROUTINE_NAME
-sf1
 sp1
+sf1
 SELECT name FROM mysql.func WHERE name = 'metaphon';
 name
 metaphon
@@ -57,8 +57,8 @@ Note	4099	Trigger 'trg1' already exists on the table 'test'.'t1'.
 include/sync_slave_sql_with_master.inc
 SELECT routine_name FROM information_schema.routines WHERE routine_schema = "test";
 ROUTINE_NAME
-sf1
 sp1
+sf1
 SELECT name FROM mysql.func WHERE name = 'metaphon';
 name
 metaphon

@@ -1128,7 +1128,10 @@ void trx_lists_init_at_db_start(void) {
   for (trx_t *trx : trxs) {
     if (trx->state.load(std::memory_order_relaxed) == TRX_STATE_ACTIVE ||
         trx->state.load(std::memory_order_relaxed) == TRX_STATE_PREPARED) {
-      trx_sys->rw_trx_ids.push_back(trx->id);
+      trx_sys->long_rw_trx_ids.push_back(trx->id);
+      if (trx->id >= trx_sys->min_short_valid_id) {
+        trx_sys->min_short_valid_id = trx->id + 1;
+      }
     }
     trx_add_to_rw_trx_list(trx);
   }
@@ -1287,6 +1290,7 @@ void trx_assign_rseg_durable(trx_t *trx) {
   trx->rsegs.m_redo.rseg = srv_read_only_mode ? nullptr : get_next_redo_rseg();
 }
 
+#if 0
 /** Assign an id for this RW transaction and insert it into trx_sys->rw_trx_ids
 @param trx	transaction to assign an id for */
 static void trx_assign_id_for_rw(trx_t *trx) {
@@ -1299,13 +1303,95 @@ static void trx_assign_id_for_rw(trx_t *trx) {
     // preallocated_id might not be received in ascending order,
     // so we need to maintain ordering in rw_trx_ids and update
     // min_active_trx_id
-    auto upper_bound_it = std::upper_bound(trx_sys->rw_trx_ids.begin(),
-                                           trx_sys->rw_trx_ids.end(), trx->id);
-    trx_sys->rw_trx_ids.insert(upper_bound_it, trx->id);
+    auto upper_bound_it = std::upper_bound(trx_sys->long_rw_trx_ids.begin(),
+                                           trx_sys->long_rw_trx_ids.end(), trx->id);
+    trx_sys->long_rw_trx_ids.insert(upper_bound_it, trx->id);
   } else {
     // The id is known to be greatest
-    trx_sys->rw_trx_ids.push_back(trx->id);
+    trx_sys->long_rw_trx_ids.push_back(trx->id);
   }
+}
+#endif
+
+static inline void update_short_bitmamp(unsigned char *short_bitmap,
+                                        trx_id_t id, bool is_set_value) {
+  unsigned int trim_id = id & 0x7FFFF;
+  unsigned int array_index = (trim_id >> 3);
+  unsigned int array_remainder = trim_id & (0x7);
+  if (is_set_value) {
+    short_bitmap[array_index] |= (1 << (7 - array_remainder));
+  } else {
+    short_bitmap[array_index] &= (255 - (1 << (7 - array_remainder)));
+  }
+}
+
+static inline trx_id_t find_smallest_short_active_trx_id(
+    unsigned char *short_bitmap, trx_id_t from, trx_id_t to) {
+  if (from > to) {
+   return to;
+  }
+
+ trx_id_t start = from;
+  do {
+    unsigned int trim_id = start & 0x7FFFF;
+    unsigned int array_index = (trim_id >> 3);
+    unsigned int array_remainder = trim_id & (0x7);
+    int is_value_set = short_bitmap[array_index] & (1 << (7 - array_remainder));
+   if (is_value_set) {
+      return start;
+    } else {
+      start++;
+     if (start > to) {
+        return to;
+      }
+    }
+  } while (true);
+}
+
+static void trx_assign_id_for_rw(trx_t *trx) {
+  trx->id = trx_sys_allocate_trx_id();
+  if (trx->id < trx_sys->min_short_valid_id) {
+    trx_sys->long_rw_trx_ids.push_back(trx->id);
+  } else {
+    if (trx_sys->short_rw_trx_valid_number == 0) {
+      trx_sys->min_short_valid_id = trx->id;
+    }
+    if (trx->id > trx_sys->max_short_valid_id) {
+      trx_sys->max_short_valid_id = trx->id;
+    }
+
+    int64_t diff = trx_sys->max_short_valid_id - trx_sys->min_short_valid_id;
+    if (diff < (MAX_SHORT_ACTIVE_BYTES << 3)) {
+      update_short_bitmamp(trx_sys->short_rw_trx_ids_bitmap, trx->id, true);
+    } else {
+      trx_id_t old_id_start = trx_sys->min_short_valid_id;
+      trx_id_t max_short_valid_id = trx_sys->max_short_valid_id;
+      trx_id_t max_valid_id = max_short_valid_id;
+      max_valid_id = max_valid_id - ((max_valid_id & 0x7));
+      trx_id_t base = max_valid_id - ((MAX_SHORT_ACTIVE_BYTES - 1) << 3);
+
+      unsigned char *short_trx_id_bitmap = trx_sys->short_rw_trx_ids_bitmap;
+      trx_sys->min_short_valid_id = find_smallest_short_active_trx_id(
+         short_trx_id_bitmap, base, max_short_valid_id);
+
+      trx_id_t old_id_end = base - 1;
+
+      for (trx_id_t id = old_id_start; id <= old_id_end; id++) {
+        unsigned int trim_id = id & 0x7FFFF;
+        unsigned int array_index = (trim_id >> 3);
+        unsigned int array_remainder = trim_id & (0x7);
+        int is_value_set =
+            short_trx_id_bitmap[array_index] & (1 << (7 - array_remainder));
+       if (is_value_set) {
+          trx_sys->long_rw_trx_ids.push_back(id);
+          trx_sys->short_rw_trx_valid_number--;
+          short_trx_id_bitmap[array_index] &=
+              (255 - (1 << (7 - array_remainder)));
+        }
+      }
+    }
+    trx_sys->short_rw_trx_valid_number++;
+   }
 }
 
 /** Assign a temp-tablespace bound rollback-segment to a transaction.
@@ -1858,11 +1944,59 @@ static void trx_erase_lists(trx_t *trx) {
   ut_ad(trx->id > 0);
   ut_ad(trx_sys_mutex_own());
 
-  trx_ids_t::iterator it = std::lower_bound(trx_sys->rw_trx_ids.begin(),
-                                            trx_sys->rw_trx_ids.end(), trx->id);
+  trx_id_t min_short_valid_id = trx_sys->min_short_valid_id;
+  trx_id_t max_short_valid_id = trx_sys->max_short_valid_id;
 
-  ut_ad(*it == trx->id);
-  trx_sys->rw_trx_ids.erase(it);
+  if (trx->id < min_short_valid_id) {
+    trx_ids_t::iterator it =
+        std::lower_bound(trx_sys->long_rw_trx_ids.begin(),
+                         trx_sys->long_rw_trx_ids.end(), trx->id);
+
+    ut_ad(*it == trx->id);
+    trx_sys->long_rw_trx_ids.erase(it);
+  } else {
+    trx_sys->short_rw_trx_valid_number--;
+    int short_rw_trx_valid_number = trx_sys->short_rw_trx_valid_number;
+    update_short_bitmamp(trx_sys->short_rw_trx_ids_bitmap, trx->id, false);
+    if (short_rw_trx_valid_number > 0) {
+      if (trx->id == min_short_valid_id) {
+        trx_id_t candidate_min_short_valid_id =
+            find_smallest_short_active_trx_id(trx_sys->short_rw_trx_ids_bitmap,
+                                              min_short_valid_id + 1,
+                                              max_short_valid_id);
+        trx_sys->min_short_valid_id = candidate_min_short_valid_id;
+      } else {
+        int64_t diff = max_short_valid_id - min_short_valid_id;
+        if (diff >= MAX_SHORT_ACTIVE_BYTES) {
+          trx_id_t old_id_start = min_short_valid_id;
+          trx_id_t max_valid_id = max_short_valid_id;
+          max_valid_id = max_valid_id - ((max_valid_id & 0x7));
+          trx_id_t base =
+              max_valid_id - (((MAX_SHORT_ACTIVE_BYTES >> 3) - 1) << 3);
+
+          unsigned char *short_trx_id_bitmap = trx_sys->short_rw_trx_ids_bitmap;
+          trx_sys->min_short_valid_id = find_smallest_short_active_trx_id(
+              short_trx_id_bitmap, base, max_short_valid_id);
+
+          trx_id_t old_id_end = base - 1;
+
+          for (trx_id_t id = old_id_start; id <= old_id_end; id++) {
+            unsigned int trim_id = id & 0x7FFFF;
+            unsigned int array_index = (trim_id >> 3);
+            unsigned int array_remainder = trim_id & (0x7);
+            int is_value_set =
+                short_trx_id_bitmap[array_index] & (1 << (7 - array_remainder));
+            if (is_value_set) {
+              trx_sys->long_rw_trx_ids.push_back(id);
+              trx_sys->short_rw_trx_valid_number--;
+              short_trx_id_bitmap[array_index] &=
+                  (255 - (1 << (7 - array_remainder)));
+            }
+          }
+        }
+      }
+    }
+  }
 
   if (trx->read_only || trx->rsegs.m_redo.rseg == nullptr) {
     ut_ad(!trx->in_rw_trx_list);

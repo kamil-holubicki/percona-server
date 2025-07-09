@@ -833,6 +833,7 @@ THD::THD(bool enable_plugins)
 
   m_internal_handler = nullptr;
   m_binlog_invoker = false;
+  thr_cond_lock_inited = false;
   memset(&m_invoker_user, 0, sizeof(m_invoker_user));
   memset(&m_invoker_host, 0, sizeof(m_invoker_host));
 
@@ -863,9 +864,6 @@ void THD::store_cached_properties(cached_properties prop_mask) {
     return (this->m_protocol != nullptr &&
             static_cast<int>(prop_mask) & static_cast<int>(property));
   };
-
-  if (is_selected(cached_properties::IS_ALIVE))
-    m_cached_is_connection_alive.store(m_protocol->connection_alive());
 
   if (is_selected(cached_properties::RW_STATUS))
     m_cached_rw_status.store(m_protocol->get_rw_status());
@@ -1485,6 +1483,10 @@ THD::~THD() {
 
   mysql_cond_destroy(&COND_thr_lock);
   mysql_cond_destroy(&COND_group_replication_connection_cond_var);
+  if (thr_cond_lock_inited) {
+    mysql_cond_destroy(&thr_cond_lock);
+    thr_cond_lock_inited = false;
+  }
 #ifndef NDEBUG
   dbug_sentry = THD_SENTRY_GONE;
 #endif
@@ -3467,17 +3469,6 @@ bool THD::is_connected(bool use_cached_connection_alive) {
 }
 
 uint THD::get_protocol_rw_status() { return m_cached_rw_status.load(); }
-
-Protocol *THD::get_protocol() {
-  store_cached_properties();
-  return m_protocol;
-}
-
-Protocol_classic *THD::get_protocol_classic() {
-  assert(is_classic_protocol());
-  store_cached_properties();
-  return pointer_cast<Protocol_classic *>(m_protocol);
-}
 
 void THD::push_protocol(Protocol *protocol) {
   assert(m_protocol != nullptr);

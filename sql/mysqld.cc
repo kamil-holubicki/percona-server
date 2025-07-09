@@ -1370,6 +1370,8 @@ ulong opt_mts_replica_parallel_workers;
 ulonglong opt_mts_pending_jobs_size_max;
 ulonglong slave_rows_search_algorithms_options;
 bool opt_replica_preserve_commit_order;
+ulong opt_mts_replica_worker_queue_len_max;
+
 #ifndef NDEBUG
 uint replica_rows_last_search_algorithm_used;
 #endif

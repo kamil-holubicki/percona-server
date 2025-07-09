@@ -257,7 +257,7 @@ class Atomics_array {
 
   friend std::ostream &operator<<(std::ostream &out,
                                   Atomics_array<T, I, A> &in) {
-    out << in.to_string(true) << std::flush;
+    out << in.to_string(/* KH: true */) << std::flush;
     return out;
   }
 

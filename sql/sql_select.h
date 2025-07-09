@@ -567,7 +567,11 @@ struct POSITION {
       prefix_rowcount = rows_fetched;
       prefix_cost = read_cost + cm->row_evaluate_cost(prefix_rowcount);
     } else {
-      prefix_rowcount = (this - 1)->prefix_rowcount * rows_fetched;
+      if (use_join_buffer) {
+        prefix_rowcount = 2 * rows_fetched;
+      } else {
+        prefix_rowcount = (this - 1)->prefix_rowcount * rows_fetched;
+      }
       prefix_cost = (this - 1)->prefix_cost + read_cost +
                     cm->row_evaluate_cost(prefix_rowcount);
     }

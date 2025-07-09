@@ -349,6 +349,13 @@ class Relay_log_info : public Rpl_info {
   /* parent Master_info structure */
   Master_info *mi;
 
+  longlong last_commmitted_seq;
+  longlong sequence_number{0};
+  bool is_wait_last_commited;
+  bool is_until_satisfied{false};
+  bool view_change_until_set{false};
+  bool need_to_wait{false};
+
   /* number of temporary tables open in this channel */
   std::atomic<int32> atomic_channel_open_temp_tables{0};
 

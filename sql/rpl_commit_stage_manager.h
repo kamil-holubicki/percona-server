@@ -32,7 +32,8 @@
 #include "mysql/psi/mysql_mutex.h"
 #include "sql/sql_class.h"
 #include "thr_mutex.h"
-
+// KH:
+#include "sql/binlog/group_commit/bgc_ticket.h"
 class THD;
 
 /**

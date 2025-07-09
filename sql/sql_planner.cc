@@ -1149,18 +1149,24 @@ void Optimize_table_order::best_access_path(JOIN_TAB *tab,
         tab, idx, best_ref, prefix_rowcount, found_condition, disable_jbuf,
         &rows_after_filtering, &trace_access_scan);
 
+    trace_access_scan.add("scan_read_cost", scan_read_cost);
     /*
       We estimate the cost of evaluating WHERE clause for found
       records as row_evaluate_cost(prefix_rowcount * rows_after_filtering).
       This cost plus scan_cost gives us total cost of using
       TABLE/INDEX/RANGE SCAN.
     */
-    const double scan_total_cost =
-        scan_read_cost +
-        cost_model->row_evaluate_cost(prefix_rowcount * rows_after_filtering);
+    double scan_total_cost = scan_read_cost;
 
-    trace_access_scan.add("resulting_rows", rows_after_filtering);
+    if (!disable_jbuf) {
+        scan_total_cost += cost_model->row_evaluate_cost(rows_after_filtering * 2.0);
+    } else {
+        scan_total_cost += cost_model->row_evaluate_cost(prefix_rowcount * rows_after_filtering);
+    }
+
+    trace_access_scan.add("prefix_rowcount", prefix_rowcount);
     trace_access_scan.add("cost", scan_total_cost);
+    trace_access_scan.add("resulting_rows", rows_after_filtering);
 
     if (best_ref == nullptr ||
         (scan_total_cost <
@@ -4606,8 +4612,9 @@ void Optimize_table_order::advance_sj_state(table_map remaining_tables,
     duplicates elimination happens only at the last table in range, so it
     makes sense to correct prefix_costs of that last table.
   */
-  if (sj_strategy != SJ_OPT_NONE)
+  if (sj_strategy != SJ_OPT_NONE) {
     pos->set_prefix_cost(best_cost, best_rowcount);
+  }
 }
 
 /**

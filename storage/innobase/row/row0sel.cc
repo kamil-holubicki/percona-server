@@ -2513,15 +2513,15 @@ void row_sel_field_store_in_mysql_format_func(
   byte *ptr;
 #ifdef UNIV_DEBUG
   const dict_field_t *field =
-      templ->is_virtual ? nullptr : index->get_field(field_no);
+    templ->is_virtual ? nullptr : index->get_field(field_no);
 
   bool clust_templ_for_sec = (sec_field != ULINT_UNDEFINED);
 #endif /* UNIV_DEBUG */
 
   if (templ->is_multi_val) {
     ib::fatal(UT_LOCATION_HERE, ER_CONVERT_MULTI_VALUE)
-        << "Table name: " << index->table->name
-        << " Index name: " << index->name;
+      << "Table name: " << index->table->name
+      << " Index name: " << index->name;
   }
 
   auto const mysql_col_len = templ->mysql_col_len;
@@ -2839,6 +2839,7 @@ void row_sel_field_store_in_mysql_format_func(
     row_sel_field_store_in_mysql_format(mysql_rec + templ->mysql_col_offset,
                                         templ, rec_index, field_no, data, len,
                                         &prebuilt->blob_heap, ULINT_UNDEFINED);
+
 
     if (heap != blob_heap) {
       mem_heap_free(heap);
