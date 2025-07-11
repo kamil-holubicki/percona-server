@@ -1222,11 +1222,12 @@ static void srv_init(void) {
       UT_NEW_THIS_FILE_PSI_KEY,
       ut::Count{srv_threads.m_page_cleaner_workers_n});
 
+#if 0
   srv_threads.m_lru_managers_n = srv_buf_pool_instances;
 
   srv_threads.m_lru_managers = ut::new_arr_withkey<IB_thread>(
       UT_NEW_THIS_FILE_PSI_KEY, ut::Count{srv_threads.m_lru_managers_n});
-
+#endif
   srv_sys = static_cast<srv_sys_t *>(
       ut::zalloc_withkey(UT_NEW_THIS_FILE_PSI_KEY, srv_sys_sz));
 
@@ -1326,7 +1327,7 @@ void srv_free(void) {
   ut::free(srv_sys);
 
   srv_sys = nullptr;
-
+#if 0
   if (srv_threads.m_lru_managers != nullptr) {
     for (size_t i = 0; i < srv_threads.m_lru_managers_n; ++i) {
       srv_threads.m_lru_managers[i] = {};
@@ -1334,7 +1335,7 @@ void srv_free(void) {
     ut::free(srv_threads.m_lru_managers);
     srv_threads.m_lru_managers = nullptr;
   }
-
+#endif
   if (srv_threads.m_page_cleaner_workers != nullptr) {
     for (size_t i = 0; i < srv_threads.m_page_cleaner_workers_n; ++i) {
       srv_threads.m_page_cleaner_workers[i] = {};

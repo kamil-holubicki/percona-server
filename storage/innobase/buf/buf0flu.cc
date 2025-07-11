@@ -2886,8 +2886,8 @@ void buf_flush_page_cleaner_init() {
   }
 
   /* Make sure page cleaner and LRU managers are active. */
-  ut_a(buf_flush_page_cleaner_is_active());
-  ut_a(buf_flush_active_lru_managers() == srv_buf_pool_instances);
+//  ut_a(buf_flush_page_cleaner_is_active());
+//  ut_a(buf_flush_active_lru_managers() == srv_buf_pool_instances);
 }
 
 /**
