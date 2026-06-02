@@ -1,0 +1,204 @@
+# ==== Purpose ====
+#
+# Verify that the replica SQL applier accepts GRANT/REVOKE statements that
+# reference the removed SET_USER_ID dynamic privilege, by rewriting them to
+# SET_ANY_DEFINER + ALLOW_NONEXISTENT_DEFINER -- the same mapping used by
+# the offline upgrade migration (mysql_system_tables_fix.sql).
+#
+# ==== Requirements ====
+#
+# R1. The replica MUST NOT stop with ER_SYNTAX_ERROR when applying a
+#     GRANT/REVOKE statement that references SET_USER_ID coming from an
+#     older source server.
+# R2. The replica MUST grant SET_ANY_DEFINER and ALLOW_NONEXISTENT_DEFINER
+#     in place of SET_USER_ID, with the original WITH GRANT OPTION preserved.
+# R3. A REVOKE SET_USER_ID coming from the source MUST revoke both
+#     SET_ANY_DEFINER and ALLOW_NONEXISTENT_DEFINER on the replica.
+# R4. A free-standing identifier SET_USER_ID inside a quoted DB/table name
+#     (e.g. `set_user_id`) MUST NOT be rewritten -- only the bare privilege
+#     keyword in the privilege list is.
+# R5. The rewrite MUST run only on the replica SQL applier; a user thread
+#     executing GRANT SET_USER_ID directly MUST still fail with the
+#     original ER_SYNTAX_ERROR (the SQL grammar/mysql_grant are unchanged).
+# R6. A warning describing the rewrite MUST be written to the replica's
+#     error log so the operator can see the compatibility translation.
+# R7. The rewrite MUST be gated by the new global system variable
+#     @@global.replica_translate_deprecated_priv (OFF by default; opt-in).
+#     With the default value the SQL applier MUST fail with
+#     ER_SYNTAX_ERROR exactly as on a stock build, proving the gate
+#     defaults to disabled.  Setting the variable to ON MUST enable the
+#     rewrite path tested by R1..R6.
+#
+# ==== Implementation ====
+#
+# The source server is launched with --debug=+d,register_legacy_set_user_id_priv
+# (see rpl_grant_set_user_id_compat-master.opt), which re-registers
+# SET_USER_ID as a dynamic privilege only on the source.
+# This is needed only for test (the other option would be pre-recording
+# the binlog.
+# The replica boots
+# with the default privilege set (no SET_USER_ID), so any binlogged
+# GRANT/REVOKE SET_USER_ID statement from the source would fail to apply
+# without the replica-side rewrite under test.
+
+--source include/have_debug.inc
+--source include/have_binlog_format_row.inc
+--source include/rpl/init_source_replica.inc
+
+--echo #
+--echo # Sanity: SET_USER_ID is (re-)registered on the source, but not on
+--echo # the replica (this is what makes the test cross-version-like).
+--echo #
+--let $assert_privilege_name= SET_USER_ID
+--let $assert_privilege_absent= OFF
+--source include/assert_dynamic_priv.inc
+
+--source include/rpl/connection_replica.inc
+--let $assert_privilege_name= SET_USER_ID
+--let $assert_privilege_absent= ON
+--source include/assert_dynamic_priv.inc
+
+CALL mtr.add_suppression(
+  "Replica applier rewrote removed dynamic privilege 'SET_USER_ID' into ");
+
+--echo #
+--echo # Sanity: the new gate variable exists and defaults to OFF (opt-in).
+--echo # Save the current value so we can restore it before deinit.
+--echo #
+SET @save_translate_deprecated_priv =
+  @@global.replica_translate_deprecated_priv;
+SELECT @@global.replica_translate_deprecated_priv;
+
+--echo #
+--echo # R5. The grammar/parser is not touched by the fix: a user thread
+--echo # executing GRANT SET_USER_ID directly on the replica must still be
+--echo # rejected with ER_SYNTAX_ERROR.  Verified here while the gate is
+--echo # still at its OFF default, on a regular user connection (not the
+--echo # SQL applier thread).
+--echo #
+CREATE USER rpl_psuid@localhost;
+--error ER_SYNTAX_ERROR
+GRANT SET_USER_ID ON *.* TO rpl_psuid@localhost;
+DROP USER rpl_psuid@localhost;
+
+--echo #
+--echo # Opt in to the rewrite for the R1..R6 tests below.  The gate can
+--echo # only be changed while the replication SQL thread is stopped, so
+--echo # stop replication, flip it ON, and start again.
+--echo #
+--source include/rpl/stop_replica.inc
+SET @@global.replica_translate_deprecated_priv = ON;
+--source include/rpl/start_replica.inc
+
+--echo #
+--echo # R1, R2. GRANT SET_USER_ID on the source is binlogged as-is; the
+--echo # replica rewrites it before applying and ends up with the two
+--echo # modern privileges granted.
+--echo #
+--source include/rpl/connection_source.inc
+CREATE USER rpl_psuid@localhost;
+GRANT SET_USER_ID ON *.* TO rpl_psuid@localhost;
+--source include/rpl/sync_to_replica.inc
+
+--source include/rpl/connection_replica.inc
+SHOW GRANTS FOR rpl_psuid@localhost;
+
+--echo #
+--echo # R2 (GRANT OPTION preserved): the WITH GRANT OPTION flag carried by
+--echo # the source statement must apply to both translated privileges.
+--echo #
+--source include/rpl/connection_source.inc
+GRANT SET_USER_ID ON *.* TO rpl_psuid@localhost WITH GRANT OPTION;
+--source include/rpl/sync_to_replica.inc
+
+--source include/rpl/connection_replica.inc
+SHOW GRANTS FOR rpl_psuid@localhost;
+
+--echo #
+--echo # R3. REVOKE SET_USER_ID coming from the source revokes both
+--echo # SET_ANY_DEFINER and ALLOW_NONEXISTENT_DEFINER on the replica.
+--echo #
+--source include/rpl/connection_source.inc
+REVOKE SET_USER_ID ON *.* FROM rpl_psuid@localhost;
+--source include/rpl/sync_to_replica.inc
+
+--source include/rpl/connection_replica.inc
+SHOW GRANTS FOR rpl_psuid@localhost;
+
+--echo #
+--echo # R4. A DB literally named "set_user_id" (backtick-quoted) is not a
+--echo # GRANT of the SET_USER_ID privilege; the table-level GRANT must
+--echo # round-trip unmodified.  Use a static privilege (SELECT) to make
+--echo # this a regular table-scope GRANT, unaffected by the dynamic
+--echo # privilege rewrite.
+--echo #
+--source include/rpl/connection_source.inc
+CREATE DATABASE `set_user_id`;
+CREATE TABLE `set_user_id`.t (i INT);
+GRANT SELECT ON `set_user_id`.* TO rpl_psuid@localhost;
+--source include/rpl/sync_to_replica.inc
+
+--source include/rpl/connection_replica.inc
+SHOW GRANTS FOR rpl_psuid@localhost;
+
+--echo #
+--echo # Cleanup of the ON-mode test artifacts
+--echo #
+--source include/rpl/connection_source.inc
+DROP DATABASE `set_user_id`;
+DROP USER rpl_psuid@localhost;
+--source include/rpl/sync_to_replica.inc
+
+--echo #
+--echo # R7. Turn the gate back OFF.  The same kind of statement that just
+--echo # round-tripped successfully must now stop the SQL applier with
+--echo # ER_SYNTAX_ERROR, proving the rewrite is gated.  The gate can only
+--echo # be changed while the replication SQL thread is stopped.
+--echo #
+--source include/rpl/connection_replica.inc
+--source include/rpl/stop_replica.inc
+SET @@global.replica_translate_deprecated_priv = OFF;
+--source include/rpl/start_replica.inc
+
+CALL mtr.add_suppression(
+  "Worker .* failed executing transaction");
+CALL mtr.add_suppression(
+  "The replica coordinator and worker threads are stopped");
+CALL mtr.add_suppression(
+  "Replica SQL for channel.*Error 'You have an error in your SQL syntax");
+
+--source include/rpl/connection_source.inc
+CREATE USER rpl_psuid_off@localhost;
+GRANT SET_USER_ID ON *.* TO rpl_psuid_off@localhost;
+
+--source include/rpl/connection_replica.inc
+--let $slave_sql_errno= convert_error(ER_SYNTAX_ERROR)
+--source include/rpl/wait_for_applier_error.inc
+
+--echo #
+--echo # Recover: the CREATE USER ran successfully on the replica (it
+--echo # preceded the failing GRANT in the relay log), so the user is
+--echo # still there even after the SQL thread stopped.  Stop replication,
+--echo # drop the user on both sides, wipe the source's binlog so the
+--echo # replica is not asked to re-apply the same failing event, then
+--echo # restart replication.
+--echo #
+--let $rpl_only_running_threads= 1
+--source include/rpl/stop_replica.inc
+RESET REPLICA;
+DROP USER rpl_psuid_off@localhost;
+
+--source include/rpl/connection_source.inc
+DROP USER rpl_psuid_off@localhost;
+RESET BINARY LOGS AND GTIDS;
+
+--echo #
+--echo # Restore the gate to its saved (default) value while the SQL thread
+--echo # is still stopped, then resume replication.
+--echo #
+--source include/rpl/connection_replica.inc
+SET @@global.replica_translate_deprecated_priv =
+  @save_translate_deprecated_priv;
+--source include/rpl/start_replica.inc
+
+--source include/rpl/deinit.inc

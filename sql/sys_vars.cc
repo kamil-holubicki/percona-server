@@ -4249,6 +4249,23 @@ static Sys_var_bool Sys_replica_preserve_commit_order(
 static Sys_var_deprecated_alias Sys_slave_preserve_commit_order(
     "slave_preserve_commit_order", Sys_replica_preserve_commit_order);
 
+static Sys_var_bool Sys_replica_translate_deprecated_priv(
+    "replica_translate_deprecated_priv",
+    "When enabled, the replica SQL applier transparently rewrites "
+    "GRANT/REVOKE statements that reference dynamic privileges removed "
+    "in newer server versions into the equivalent modern privileges "
+    "(currently: SET_USER_ID -> SET_ANY_DEFINER,ALLOW_NONEXISTENT_DEFINER, "
+    "per WL#15875), so a newer replica can apply binary log events emitted "
+    "by an older source without stopping with ER_SYNTAX_ERROR.  Disabled "
+    "by default: opt in only after auditing the affected statements, "
+    "because the translation broadens an account's effective privileges. "
+    "Has no effect on user-issued GRANT/REVOKE statements; only the "
+    "replica applier path is gated by this variable.  The replication "
+    "SQL thread must be stopped before this variable can be changed.",
+    GLOBAL_VAR(opt_replica_translate_deprecated_priv), CMD_LINE(OPT_ARG),
+    DEFAULT(false), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+    ON_CHECK(check_slave_stopped), ON_UPDATE(nullptr));
+
 bool Sys_var_charptr::global_update(THD *, set_var *var) {
   char *new_val, *ptr = var->save_result.string_value.str;
   const size_t len = var->save_result.string_value.length;

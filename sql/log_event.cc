@@ -40,7 +40,10 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <regex>
 #include <string>
+#include <string_view>
+#include <tuple>
 #include <utility>
 
 #include "base64.h"
@@ -4405,10 +4408,144 @@ void Query_log_event::detach_temp_tables_worker(THD *thd_arg,
 }
 
 /*
+  The removed dynamic privilege we recognize, and the modern privileges
+  the rewrite produces in its place (same mapping as the offline upgrade
+  in mysql_system_tables_fix.sql).  Declared once and reused for the
+  match, the replacement text, the warning log message, and to size the
+  output buffer in the rewrite helper below.
+*/
+static constexpr std::string_view kLegacyPriv = "SET_USER_ID";
+static constexpr std::string_view kModernPrivs =
+    "SET_ANY_DEFINER,ALLOW_NONEXISTENT_DEFINER";
+
+/*
+  Total function for the replica applier's legacy-privilege rewrite.
+  Operates on this event's own `query` / `q_len` and allocates on the
+  event's THD mem_root.
+
+  If `query` is a GRANT/REVOKE statement that mentions SET_USER_ID as a
+  free-standing identifier, returns a {pointer, length} pair for a copy
+  with each such occurrence replaced by kModernPrivs, and logs
+  ER_LOG_REPLICA_TRANSLATED_DEPRECATED_PRIVILEGE so the operator can see
+  the compatibility translation.  Match is ASCII-case-insensitive.
+  Backtick / '...' / "..." regions are passed through untouched so a DB
+  or table literally named SET_USER_ID is left alone.
+
+  In every other case (statement is not GRANT/REVOKE, SET_USER_ID is
+  absent, all occurrences are quoted, or the rewrite buffer cannot be
+  allocated) returns {query, q_len} unchanged, so the caller can use the
+  returned (ptr, len) pair unconditionally with no nullptr or "did it
+  change" checks of its own.
+*/
+std::pair<const char *, size_t>
+Query_log_event::rewrite_legacy_set_user_id_priv() const {
+  /*
+    Cheapest possible early-out.  Any query that could mention SET_USER_ID
+    as a privilege must be at least as long as the shortest GRANT form
+    that the parser accepts:
+
+        GRANT SET_USER_ID ON *.* TO a@b      (31 bytes)
+
+    The REVOKE form is at least 34 bytes, so the GRANT template defines
+    the absolute floor.  Computed at compile time from the literal so
+    the constant stays in sync with the template that motivates it.
+  */
+  static constexpr std::string_view kMinRewriteCandidate =
+      "GRANT SET_USER_ID ON *.* TO a@b";
+  if (query == nullptr || q_len < kMinRewriteCandidate.size())
+    return {query, q_len};
+
+  /* Fast prefix check: only GRANT/REVOKE statements are candidates. */
+  static const std::regex prefix(R"(^\s*(?:GRANT|REVOKE)\b)",
+                                 std::regex_constants::icase);
+  if (!std::regex_search(query, query + q_len, prefix)) return {query, q_len};
+
+  /*
+    Cheap second filter: if SET_USER_ID does not appear as a whole word
+    anywhere in the query (quoted or not), no rewrite is possible and we
+    can skip the quote-aware scan below entirely.  This is the common
+    case for replicated GRANT/REVOKE traffic, which usually does not
+    mention the removed privilege at all.
+  */
+  static const std::regex any_set_user_id(R"(\bSET_USER_ID\b)",
+                                          std::regex_constants::icase);
+  if (!std::regex_search(query, query + q_len, any_set_user_id))
+    return {query, q_len};
+
+  /*
+    Scan the query for two kinds of tokens:
+      1. A whole quoted string -- captured in group 1 and copied verbatim,
+         so identifiers / literals like `set_user_id`, 'SET_USER_ID' or
+         "SET_USER_ID" are left untouched.
+      2. The bare word SET_USER_ID -- not captured, replaced with the
+         modern privileges.
+    Listing the quoted forms first lets the engine swallow them whole,
+    so the SET_USER_ID alternative only fires on text that lives outside
+    any quotes.
+  */
+  static const std::regex re(
+      R"((`(?:``|[^`])*`|'(?:''|\\.|[^'])*'|"(?:""|\\.|[^"])*")|)"
+      R"(\bSET_USER_ID\b)",
+      std::regex_constants::icase);
+
+  /*
+    Reserve room for at least one replacement (the common case is exactly
+    one SET_USER_ID per GRANT/REVOKE).  Additional matches still work --
+    std::string will reallocate as needed -- but a single replacement
+    fits without any heap growth beyond this reserve.
+  */
+  static constexpr size_t kReplacementGrowth =
+      kModernPrivs.size() - kLegacyPriv.size();
+  std::string output;
+  output.reserve(q_len + kReplacementGrowth);
+  bool replaced = false;
+  const char *pos = query;
+  for (std::cregex_iterator it(query, query + q_len, re), end; it != end;
+       ++it) {
+    const auto &m = (*it)[0];
+    output.append(pos, m.first);
+    if ((*it)[1].matched) {
+      output.append(m.first, m.second);  // quoted region: keep as-is
+    } else {
+      output.append(kModernPrivs);
+      replaced = true;
+    }
+    pos = m.second;
+  }
+  if (!replaced) return {query, q_len};
+  output.append(pos, query + q_len);
+
+  char *new_query = static_cast<char *>(thd->alloc(output.size() + 1));
+  if (new_query == nullptr) return {query, q_len};
+  memcpy(new_query, output.data(), output.size());
+  new_query[output.size()] = '\0';
+  LogErr(WARNING_LEVEL, ER_LOG_REPLICA_TRANSLATED_DEPRECATED_PRIVILEGE,
+         kLegacyPriv.data(), kModernPrivs.data(), query);
+  return {new_query, output.size()};
+}
+
+/*
   Query_log_event::do_apply_event()
 */
 int Query_log_event::do_apply_event(Relay_log_info const *rli) {
-  return do_apply_event(rli, query, q_len);
+  /*
+    Optionally rewrite the legacy SET_USER_ID dynamic privilege (removed
+    in 8.2 by WL#15875) into its modern replacements before handing the
+    query to the parser, so a GRANT/REVOKE SET_USER_ID emitted by an
+    older source server does not stop the replica SQL applier with
+    ER_SYNTAX_ERROR.  Gated by @@global.replica_translate_deprecated_priv
+    The rewrite runs only here, on the replica applier path; the SQL
+    grammar and mysql_grant() are unchanged, so user-issued and
+    BINLOG '...' statements that reference SET_USER_ID always fail with
+    the same error as before.
+  */
+  const char *effective_query = query;
+  size_t effective_len = q_len;
+  if (unlikely(opt_replica_translate_deprecated_priv)) {
+    std::tie(effective_query, effective_len) =
+        rewrite_legacy_set_user_id_priv();
+  }
+  return do_apply_event(rli, effective_query, effective_len);
 }
 
 /*
