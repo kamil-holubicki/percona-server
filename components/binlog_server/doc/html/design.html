@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Low-level design &middot; Binlog Server documentation</title>
+  <link rel="stylesheet" href="style.css?v=0fde0a3ddd">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", function () {
+      if (window.mermaid) {
+        window.mermaid.initialize({
+          startOnLoad: true,
+          theme: "default",
+          themeVariables: {
+            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, system-ui',
+            primaryColor: "#fff8e1",
+            primaryBorderColor: "#f9a825",
+            primaryTextColor: "#5d4037",
+            lineColor: "#7b8a9b",
+            secondaryColor: "#e3f2fd",
+            tertiaryColor: "#e8f5e9"
+          },
+          flowchart: {
+            htmlLabels: true,
+            curve: "basis",
+            useMaxWidth: false,
+            nodeSpacing: 60,
+            rankSpacing: 70,
+            padding: 14
+          },
+          sequence: {
+            useMaxWidth: false,
+            actorMargin: 70,
+            boxMargin: 12,
+            messageMargin: 36
+          },
+          classDiagram: { useMaxWidth: false },
+          stateDiagram: { useMaxWidth: false },
+          gantt: { useMaxWidth: false }
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+<div class="layout">
+  <aside class="nav">
+    <a href="index.html" class="brand">Binlog Server</a>
+    <div class="tagline">Percona Server 9.6 binlog collector: receive and persist.</div>
+    <div class="navhead">Documentation</div>
+    <ul>
+      <li><a href="index.html">Binlog Server</a></li>
+      <li><a href="overview.html">Overview</a></li>
+      <li><a href="user_guide.html">User guide</a></li>
+      <li><a href="architecture.html">Architecture</a></li>
+      <li><a href="design.html" class="current">Low-level design</a></li>
+    </ul>
+    <div class="navhead">Source</div>
+    <ul>
+      <li><a href="../../">components/binlog_server/</a></li>
+      <li><a href="../md/">markdown sources</a></li>
+    </ul>
+  </aside>
+  <main>
+<h1 id="low-level-design">Low-level design<a class="headerlink" href="#low-level-design" title="Permanent link">&#x00B6;</a></h1>
+<p><a href="index.html">&larr; Back to index</a> &middot;
+<a href="overview.html">Overview</a> &middot;
+<a href="user_guide.html">User guide</a> &middot;
+<a href="architecture.html">Architecture</a> &middot;
+<strong>Low-level design</strong></p>
+<h2 id="contents">Contents<a class="headerlink" href="#contents" title="Permanent link">&#x00B6;</a></h2>
+<ul>
+<li><a href="#source-map">Source map</a></li>
+<li><a href="#locking-discipline">Locking discipline</a></li>
+<li><a href="#channelstate-anatomy">ChannelState anatomy</a></li>
+<li><a href="#on-disk-archive-format">On-disk archive format</a></li>
+<li><a href="#append-path">Append path</a></li>
+<li><a href="#deduplication-watermark">Deduplication watermark</a></li>
+<li><a href="#durability-boundaries">Durability boundaries</a></li>
+<li><a href="#crash-recovery">Crash recovery</a></li>
+<li><a href="#rotate-handling">Rotate handling</a></li>
+<li><a href="#fde-handling">FDE handling</a></li>
+<li><a href="#index-management">Index management</a></li>
+<li><a href="#sanitize-binlog-name">Sanitize binlog name</a></li>
+<li><a href="#observer-plugin-lifecycle">Observer plugin lifecycle</a></li>
+<li><a href="#configure-time-notify-path">Configure-time notify path</a></li>
+<li><a href="#error-code-catalogue">Error code catalogue</a></li>
+<li><a href="#build-wiring">Build wiring</a></li>
+</ul>
+<h2 id="source-map">Source map<a class="headerlink" href="#source-map" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>components/binlog_server/binlog_server_component.cc</code></td>
+<td>Component entry point. Publishes <code>binlog_server_storage</code> service, acquires logging services.</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/binlog_archive.h</code></td>
+<td>Declares <code>BinlogArchive</code> (singleton), <code>ChannelState</code> (per-channel), and all protocol methods.</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/binlog_archive.cc</code></td>
+<td>Implements configure, append, close, crash recovery, rotation, deduplication.</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/storage_backend.h</code></td>
+<td>Abstract <code>StorageBackend</code> interface.</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/file_storage.h</code></td>
+<td><code>FileStorage</code> &mdash; concrete backend for <code>file://</code> URIs.</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/file_storage.cc</code></td>
+<td>Directory creation, path resolution.</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/log_helpers.h</code></td>
+<td><code>bslog()</code>, <code>bslog_code()</code> declarations.</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/log_helpers.cc</code></td>
+<td>Logging implementation using <code>LogComponentErr</code>.</td>
+</tr>
+<tr>
+<td><code>plugin/binlog_server_relay/binlog_server_relay.cc</code></td>
+<td>Plugin: <code>Binlog_relay_IO_observer</code> callbacks, RAII service acquisition.</td>
+</tr>
+<tr>
+<td><code>sql/rpl_binlog_server.h</code></td>
+<td>Notify function declarations + URI shape validator.</td>
+</tr>
+<tr>
+<td><code>sql/rpl_binlog_server.cc</code></td>
+<td>Service acquisition, <code>binlog_server_notify_channel_config()</code>.</td>
+</tr>
+<tr>
+<td><code>include/mysql/components/services/binlog_server_storage.h</code></td>
+<td>Service ABI (<code>configure_channel</code>, <code>append_event</code>, <code>close_channel</code>).</td>
+</tr>
+</tbody>
+</table>
+<h2 id="locking-discipline">Locking discipline<a class="headerlink" href="#locking-discipline" title="Permanent link">&#x00B6;</a></h2>
+<div class="codehilite"><pre><span></span><code>Global:
+  No global lock. BinlogArchive&#39;s channel map is protected by its
+  own mutex (channel_map_mutex_), but only for map
+  insert / lookup / erase operations.
+
+Per-channel:
+  Each ChannelState has its own std::mutex (mtx). All operations on
+  a channel (configure, append, close, rotate) hold this mutex for
+  the duration of the call.
+
+Lock ordering:
+  channel_map_mutex_ → ChannelState::mtx
+
+  Never hold two ChannelState mutexes simultaneously.
+  Never hold ChannelState::mtx while acquiring channel_map_mutex_.
+</code></pre></div>
+
+<p>The single-mutex-per-channel design means channels cannot deadlock
+against each other, and the IO thread (which is per-channel) never
+contends with IO threads of other channels.</p>
+<h2 id="channelstate-anatomy">ChannelState anatomy<a class="headerlink" href="#channelstate-anatomy" title="Permanent link">&#x00B6;</a></h2>
+<div class="codehilite"><pre><span></span><code><span class="k">struct</span><span class="w"> </span><span class="nc">ChannelState</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="w"> </span><span class="n">mtx</span><span class="p">;</span>
+
+<span class="w">  </span><span class="c1">// On-disk I/O</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">ofstream</span><span class="w"> </span><span class="n">out</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">fsync_fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span>
+
+<span class="w">  </span><span class="c1">// Current file tracking</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">current_log_name</span><span class="p">;</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">base_dir</span><span class="p">;</span>
+
+<span class="w">  </span><span class="c1">// Watermark</span>
+<span class="w">  </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">last_source_log_pos</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="w">  </span><span class="c1">// Protocol state</span>
+<span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="n">wrote_fde</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">false</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="n">has_checksum</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">false</span><span class="p">;</span>
+
+<span class="w">  </span><span class="c1">// Counters</span>
+<span class="w">  </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">events_appended</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">bytes_appended</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="w">  </span><span class="c1">// Index state</span>
+<span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="n">index_loaded</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">false</span><span class="p">;</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">set</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&gt;</span><span class="w"> </span><span class="n">indexed_files</span><span class="p">;</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&gt;</span><span class="w"> </span><span class="n">file_order</span><span class="p">;</span>
+<span class="p">};</span>
+</code></pre></div>
+
+<p>Key invariants:</p>
+<ul>
+<li><code>out.is_open()</code> iff we are actively collecting into a file.</li>
+<li><code>fsync_fd</code> is a POSIX fd opened on the same path, used exclusively
+  for <code>fsync(2)</code> calls (the <code>std::ofstream</code> doesn't expose its fd).</li>
+<li><code>current_log_name</code> is the basename (e.g. <code>binlog.000003</code>), not a
+  full path.</li>
+<li><code>last_source_log_pos</code> is always the <code>log_pos</code> of the last
+  fully-written event in the current file. Zero means no events
+  written yet.</li>
+<li><code>wrote_fde</code> is reset on every file rotation. It prevents writing
+  a second FDE if the upstream re-sends one on reconnect within the
+  same file.</li>
+</ul>
+<h2 id="on-disk-archive-format">On-disk archive format<a class="headerlink" href="#on-disk-archive-format" title="Permanent link">&#x00B6;</a></h2>
+<p>Each archived file is a <strong>byte-identical copy</strong> of the source's binlog
+file, starting from the 4-byte magic number (<code>\xfebin</code>) through the
+last event appended:</p>
+<div class="codehilite"><pre><span></span><code>Offset 0:    fe 62 69 6e              (magic: &quot;\xfebin&quot;)
+Offset 4:    [FDE - 119+ bytes]       (Format Description Event)
+Offset ...:  [event] [event] ...      (data events, in source order)
+Offset EOF:  [Rotate event]           (written at file close/rotation)
+</code></pre></div>
+
+<p>Each event has the standard 19-byte common header:</p>
+<div class="codehilite"><pre><span></span><code>Bytes 0-3:   timestamp (4 bytes, little-endian)
+Byte  4:     type_code (1 byte)
+Bytes 5-8:   server_id (4 bytes, little-endian)
+Bytes 9-12:  event_length (4 bytes, little-endian)
+Bytes 13-16: log_pos (4 bytes, little-endian, next event position)
+Bytes 17-18: flags (2 bytes, little-endian)
+</code></pre></div>
+
+<p>If <code>has_checksum</code> is true, each event has a 4-byte CRC32 appended
+after the declared <code>event_length - 4</code> payload bytes.</p>
+<h2 id="append-path">Append path<a class="headerlink" href="#append-path" title="Permanent link">&#x00B6;</a></h2>
+<p>The <code>append_event</code> method is the hot path, called once per event by
+the IO thread:</p>
+<div class="codehilite"><pre><span></span><code>append_event(channel, buf, len):
+  1. Lock ChannelState::mtx
+  2. Parse 19-byte header → type_code, event_length, log_pos
+  3. Deduplication: if log_pos &gt; 0 &amp;&amp; log_pos &lt;= last_source_log_pos → drop
+  4. Switch on type_code:
+     - FORMAT_DESCRIPTION_EVENT → handle_format_description_event()
+     - ROTATE_EVENT → handle_rotate_event()
+     - other → write raw bytes
+  5. Update watermark: last_source_log_pos = log_pos
+  6. Increment counters
+  7. If type_code == XID_EVENT || type_code == XA_PREPARE_LOG_EVENT:
+     → sync_channel_to_disk()
+</code></pre></div>
+
+<h2 id="deduplication-watermark">Deduplication watermark<a class="headerlink" href="#deduplication-watermark" title="Permanent link">&#x00B6;</a></h2>
+<p>The watermark is <code>last_source_log_pos</code> &mdash; the byte offset in the
+source's binlog where the next event would start. Because GTID-based
+auto-position can re-deliver events that were already received before
+a disconnect:</p>
+<ul>
+<li>If <code>log_pos == 0</code>: the event is a pseudo-event (e.g. heartbeat or
+  artificial rotate) and is always processed.</li>
+<li>If <code>log_pos &gt; 0 &amp;&amp; log_pos &lt;= last_source_log_pos</code>: the event is a
+  duplicate. Drop it.</li>
+<li>If <code>log_pos &gt; last_source_log_pos</code>: new event. Append it.</li>
+</ul>
+<p>The watermark is reset to 0 on file rotation (new source file means
+new offset space). It is persisted indirectly: on crash recovery,
+it is re-derived by walking the last file.</p>
+<h2 id="durability-boundaries">Durability boundaries<a class="headerlink" href="#durability-boundaries" title="Permanent link">&#x00B6;</a></h2>
+<div class="codehilite"><pre><span></span><code>Event types that trigger fsync:
+  - XID_EVENT (33)           → committed transaction
+  - XA_PREPARE_LOG_EVENT (38) → XA prepare
+
+Event types that trigger flush + fsync + close:
+  - Rotate (explicit)        → close current file, fsync, open new
+  - close_channel()          → IO thread stopping
+</code></pre></div>
+
+<p>Between transaction boundaries, writes are buffered by the OS page
+cache. This trades a small window of potential data loss (events
+since the last Xid) for significantly better throughput.</p>
+<p>The <code>fsync_fd</code> trick: we open a second POSIX file descriptor on the
+same path (read-only) specifically for <code>fsync(2)</code>, because
+<code>std::ofstream</code> does not expose its internal fd. The <code>ofstream::flush()</code>
+ensures data reaches the kernel buffer; <code>::fsync(fsync_fd)</code> ensures it
+reaches stable storage.</p>
+<h2 id="crash-recovery">Crash recovery<a class="headerlink" href="#crash-recovery" title="Permanent link">&#x00B6;</a></h2>
+<p>Executed in <code>configure_channel</code> → <code>recover_state_from_archive</code>:</p>
+<div class="codehilite"><pre><span></span><code>recover_state_from_archive(ChannelState &amp;cs):
+  1. Read binlog.index line by line → populate indexed_files, file_order
+  2. If file_order is empty → fresh channel, return
+  3. last_file = file_order.back()
+  4. Open last_file for reading
+  5. Skip 4-byte magic
+  6. last_good_offset = 4
+  7. Loop:
+     a. Read 19-byte header
+     b. If &lt; 19 bytes available → partial header → break
+     c. Extract event_length from header
+     d. If offset + event_length &gt; file_size → partial event → break
+     e. If type == FDE → wrote_fde = true, derive has_checksum
+     f. last_source_log_pos = header.log_pos
+     g. last_good_offset = offset + event_length
+     h. Advance offset
+  8. If last_good_offset &lt; file_size:
+     → truncate file to last_good_offset
+     → log warning about truncated partial tail
+  9. Set cs.last_source_log_pos, cs.wrote_fde, cs.has_checksum
+</code></pre></div>
+
+<h2 id="rotate-handling">Rotate handling<a class="headerlink" href="#rotate-handling" title="Permanent link">&#x00B6;</a></h2>
+<p>When a <code>ROTATE_EVENT</code> arrives from the upstream:</p>
+<div class="codehilite"><pre><span></span><code>handle_rotate_event(ChannelState &amp;cs, buf, len):
+  1. Extract new filename from event payload
+  2. sanitize_binlog_name(new_name, has_checksum || !wrote_fde)
+  3. If new_name == current_log_name &amp;&amp; file is open → no-op (same file)
+  4. If new_name == current_log_name &amp;&amp; file is closed → reopen
+  5. Otherwise:
+     a. Write a real Rotate event to current file (marks EOF)
+     b. Flush + fsync + close current file
+     c. Reset: last_source_log_pos = 0, wrote_fde = false
+     d. Open new file, write 4-byte magic
+     e. Add new file to index (if not already present)
+     f. Update current_log_name
+</code></pre></div>
+
+<p>The "write a real Rotate event" step ensures every archived file
+ends with a proper Rotate event pointing to the next file, just like
+the source's original binlog files do.</p>
+<h2 id="fde-handling">FDE handling<a class="headerlink" href="#fde-handling" title="Permanent link">&#x00B6;</a></h2>
+<p>The Format Description Event is special:</p>
+<div class="codehilite"><pre><span></span><code>handle_format_description_event(ChannelState &amp;cs, buf, len):
+  1. If cs.wrote_fde → drop (duplicate, reconnect within same file)
+  2. Derive has_checksum from FDE payload (byte at specific offset)
+  3. Write event bytes to file
+  4. cs.wrote_fde = true
+  5. cs.has_checksum = (derived value)
+</code></pre></div>
+
+<p>The <code>wrote_fde</code> flag prevents writing a second FDE if the IO thread
+reconnects to the upstream within the lifetime of the same archive
+file. Since the FDE is always the first real event after the magic
+number, a duplicate would corrupt the file.</p>
+<h2 id="index-management">Index management<a class="headerlink" href="#index-management" title="Permanent link">&#x00B6;</a></h2>
+<p>The <code>binlog.index</code> file is a simple text file with one filename per
+line, in rotation order:</p>
+<div class="codehilite"><pre><span></span><code>./binlog.000001
+./binlog.000002
+./binlog.000003
+</code></pre></div>
+
+<p>Management rules:</p>
+<ul>
+<li><strong>Load:</strong> On <code>configure_channel</code>, read all lines into <code>indexed_files</code>
+  (set, for O(1) lookup) and <code>file_order</code> (vector, preserves order).</li>
+<li><strong>Add:</strong> On rotate to a new file, append the filename only if it is
+  not already in <code>indexed_files</code>. This makes the operation idempotent
+  across reconnects.</li>
+<li><strong>Never remove:</strong> Phase 1 does not implement purging. Files
+  accumulate until manually deleted.</li>
+</ul>
+<h2 id="sanitize-binlog-name">Sanitize binlog name<a class="headerlink" href="#sanitize-binlog-name" title="Permanent link">&#x00B6;</a></h2>
+<p>The source may send Rotate events with a CRC32 checksum appended to
+the payload. The <code>sanitize_binlog_name</code> function strips those trailing
+4 bytes when appropriate:</p>
+<div class="codehilite"><pre><span></span><code>sanitize_binlog_name(name, assume_checksum):
+  If assume_checksum &amp;&amp; name.size() &gt; 4:
+    Strip last 4 bytes (they are the CRC32, not part of the filename)
+  Also strip any directory prefix (e.g. &quot;./&quot;)
+  Return the clean basename
+</code></pre></div>
+
+<p>The <code>assume_checksum</code> parameter is <code>true</code> when either <code>has_checksum</code>
+is set or <code>wrote_fde</code> is still false (meaning we haven't yet seen the
+FDE that tells us the checksum algorithm, so we assume the worst case).</p>
+<h2 id="observer-plugin-lifecycle">Observer plugin lifecycle<a class="headerlink" href="#observer-plugin-lifecycle" title="Permanent link">&#x00B6;</a></h2>
+<div class="diagram">
+<div class="mermaid">
+stateDiagram-v2
+    [*] --> Loaded : INSTALL PLUGIN
+    Loaded --> Active : thread_start(channel)
+    Active --> Active : after_queue_event(channel, buf, len)
+    Active --> Loaded : thread_stop(channel)
+    Loaded --> [*] : UNINSTALL PLUGIN
+
+    note right of Active
+        Service acquired via my_service RAII.
+        If service unavailable, callbacks
+        log warning and return 0.
+    end note
+</div>
+</div>
+<p>Plugin callbacks and their behaviour:</p>
+<table>
+<thead>
+<tr>
+<th>Callback</th>
+<th>Action</th>
+<th>Return</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>thread_start</code></td>
+<td>Call <code>configure_channel(ch, true, uri)</code></td>
+<td>Always 0</td>
+</tr>
+<tr>
+<td><code>after_queue_event</code></td>
+<td>Call <code>append_event(ch, buf, len)</code></td>
+<td>Always 0</td>
+</tr>
+<tr>
+<td><code>thread_stop</code></td>
+<td>Call <code>close_channel(ch)</code></td>
+<td>Always 0</td>
+</tr>
+<tr>
+<td><code>after_reset_slave</code></td>
+<td>Call <code>close_channel(ch)</code></td>
+<td>Always 0</td>
+</tr>
+</tbody>
+</table>
+<p>All callbacks return 0 regardless of the service call result. This
+prevents binlog-server failures from crashing or stalling the IO
+thread. Errors are logged via the error log with stable error codes.</p>
+<h2 id="configure-time-notify-path">Configure-time notify path<a class="headerlink" href="#configure-time-notify-path" title="Permanent link">&#x00B6;</a></h2>
+<p>When <code>CHANGE REPLICATION SOURCE TO ... BINLOG_SERVER=1</code> is executed:</p>
+<div class="codehilite"><pre><span></span><code>change_receive_options() [sql/rpl_replica.cc]
+  → binlog_server_notify_channel_config() [sql/rpl_binlog_server.cc]
+    → acquire binlog_server_storage service (dynamic, may fail if not loaded)
+    → service-&gt;configure_channel(channel_name, enabled, storage_uri)
+    → release service
+</code></pre></div>
+
+<p>If the component is not loaded, the notify call logs a warning
+(<code>ER_BINLOG_SERVER_SERVICE_UNAVAILABLE</code>) and returns. The channel
+configuration is still persisted to <code>Master_info</code>; when the component
+is loaded later, the next <code>thread_start</code> will trigger
+<code>configure_channel</code> again.</p>
+<h2 id="error-code-catalogue">Error code catalogue<a class="headerlink" href="#error-code-catalogue" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Symbol</th>
+<th>Level</th>
+<th>Message</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>48350</td>
+<td><code>ER_BINLOG_SERVER_CHANNEL_CONFIGURED</code></td>
+<td>Note</td>
+<td>Binlog server channel '%s' configured with storage URI '%s'</td>
+</tr>
+<tr>
+<td>48351</td>
+<td><code>ER_BINLOG_SERVER_IO_ERROR</code></td>
+<td>Error</td>
+<td>Binlog server I/O error on channel '%s': %s</td>
+</tr>
+<tr>
+<td>48352</td>
+<td><code>ER_BINLOG_SERVER_CONFIG_REJECTED</code></td>
+<td>Error</td>
+<td>Binlog server configuration rejected for channel '%s': %s</td>
+</tr>
+<tr>
+<td>48353</td>
+<td><code>ER_BINLOG_SERVER_RECOVERY</code></td>
+<td>Warning</td>
+<td>Binlog server recovery on channel '%s': truncated %lu bytes of partial tail from '%s'</td>
+</tr>
+<tr>
+<td>48354</td>
+<td><code>ER_BINLOG_SERVER_SERVICE_UNAVAILABLE</code></td>
+<td>Warning</td>
+<td>Binlog server storage service unavailable; channel '%s' notification skipped</td>
+</tr>
+<tr>
+<td>48355</td>
+<td><code>ER_BINLOG_SERVER_APPEND_FAILED</code></td>
+<td>Error</td>
+<td>Binlog server append failed on channel '%s': %s</td>
+</tr>
+</tbody>
+</table>
+<p>All messages are emitted through <code>LogComponentErr</code> (component) or
+<code>LogPluginErrMsg</code> (plugin) and appear in the MySQL error log with
+the standard timestamp and subsystem prefix.</p>
+<h2 id="build-wiring">Build wiring<a class="headerlink" href="#build-wiring" title="Permanent link">&#x00B6;</a></h2>
+<h3 id="component-componentsbinlog_servercmakeliststxt">Component (<code>components/binlog_server/CMakeLists.txt</code>)<a class="headerlink" href="#component-componentsbinlog_servercmakeliststxt" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="nb">MYSQL_ADD_COMPONENT</span><span class="p">(</span><span class="s">binlog_server</span>
+<span class="w">  </span><span class="s">binlog_server_component.cc</span>
+<span class="w">  </span><span class="s">binlog_archive.cc</span>
+<span class="w">  </span><span class="s">file_storage.cc</span>
+<span class="w">  </span><span class="s">log_helpers.cc</span>
+<span class="w">  </span><span class="s">MODULE_ONLY</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<h3 id="plugin-pluginbinlog_server_relaycmakeliststxt">Plugin (<code>plugin/binlog_server_relay/CMakeLists.txt</code>)<a class="headerlink" href="#plugin-pluginbinlog_server_relaycmakeliststxt" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="nb">MYSQL_ADD_PLUGIN</span><span class="p">(</span><span class="s">binlog_server_relay</span>
+<span class="w">  </span><span class="s">binlog_server_relay.cc</span>
+<span class="w">  </span><span class="s">MODULE_ONLY</span>
+<span class="w">  </span><span class="s">MODULE_OUTPUT_NAME</span><span class="w"> </span><span class="s2">&quot;binlog_server_relay&quot;</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<h3 id="server-core">Server core<a class="headerlink" href="#server-core" title="Permanent link">&#x00B6;</a></h3>
+<p><code>sql/rpl_binlog_server.cc</code> is added to the <code>sql/CMakeLists.txt</code> source
+list. It compiles into <code>mysqld</code> directly and uses standard component
+service acquisition at runtime.</p>
+<h3 id="system-table-ddl">System table DDL<a class="headerlink" href="#system-table-ddl" title="Permanent link">&#x00B6;</a></h3>
+<p><code>scripts/mysql_system_tables.sql</code> and <code>scripts/mysql_system_tables_fix.sql</code>
+add the <code>Binlog_server</code> (BOOLEAN) and <code>Binlog_server_storage_uri</code> (TEXT)
+columns to <code>mysql.slave_master_info</code>.</p>
+<h3 id="error-messages">Error messages<a class="headerlink" href="#error-messages" title="Permanent link">&#x00B6;</a></h3>
+<p><code>share/messages_to_error_log.txt</code> contains the <code>ER_BINLOG_SERVER_*</code>
+definitions under the "Percona Server 9.6 error log messages" section
+starting at error number 48350.</p>
+<hr>
+<p><a href="index.html">&larr; Back to index</a> &middot;
+<a href="overview.html">Overview</a> &middot;
+<a href="user_guide.html">User guide</a> &middot;
+<a href="architecture.html">Architecture</a> &middot;
+<strong>Low-level design</strong></p>
+    <footer class="docfoot">
+      <span>Binlog Server documentation</span>
+      <span>Percona Server 9.6 &middot; GPL v2</span>
+    </footer>
+  </main>
+</div>
+</body>
+</html>

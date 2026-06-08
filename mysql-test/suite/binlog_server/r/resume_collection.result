@@ -1,0 +1,53 @@
+include/rpl/init_source_replica.inc
+Warnings:
+Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	####	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+[connection master]
+[connection slave]
+[connection master]
+
+*** Setting up binlog server
+[connection slave]
+include/rpl/stop_replica.inc
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL PLUGIN binlog_server_relay SONAME 'binlog_server_relay.so';
+CHANGE REPLICATION SOURCE TO
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORAGE_DIR/',
+SOURCE_AUTO_POSITION = 1;
+START REPLICA IO_THREAD;
+
+*** Phase 1: Write initial data
+[connection master]
+CREATE TABLE t1 (id INT PRIMARY KEY AUTO_INCREMENT, val INT);
+INSERT INTO t1 (val) VALUES (1), (2), (3);
+
+*** Wait for replica to receive phase 1
+[connection slave]
+
+*** Stop IO thread
+STOP REPLICA IO_THREAD;
+
+*** Phase 2: Write more data while IO thread is stopped
+[connection master]
+INSERT INTO t1 (val) VALUES (4), (5), (6);
+FLUSH BINARY LOGS;
+INSERT INTO t1 (val) VALUES (7), (8), (9);
+
+*** Resume IO thread - should catch up
+[connection slave]
+START REPLICA IO_THREAD;
+
+*** Verify archive has entries
+Collection resumed successfully after IO thread restart
+
+*** Cleanup
+STOP REPLICA IO_THREAD;
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 0, SOURCE_AUTO_POSITION = 1;
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+include/rpl/start_replica.inc
+[connection master]
+DROP TABLE t1;
+include/rpl/sync_to_replica.inc
+include/rpl/deinit.inc

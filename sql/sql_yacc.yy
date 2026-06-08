@@ -1510,6 +1510,8 @@ CHARSET_INFO *warn_on_deprecated_user_defined_collation(
 %token<lexer.keyword> EFFECTIVE_SYM 1350
 %token<lexer.keyword> SEQUENCE_TABLE_SYM 1351
 %token PERCONA_SEQUENCE_TABLE_SYM 1352
+%token<lexer.keyword> BINLOG_SERVER_SYM 1353
+%token<lexer.keyword> BINLOG_SERVER_STORAGE_URI_SYM 1354
 
 /*
   Precedence rules used to resolve the ambiguity when using keywords as idents
@@ -3180,6 +3182,27 @@ source_def:
                   "You have an error in your CHANGE REPLICATION SOURCE syntax; GTID_ONLY only accepts values 0 or 1");
                 MYSQL_YYABORT;
             }
+          }
+        | BINLOG_SERVER_SYM EQ real_ulong_num
+          {
+            switch($3) {
+            case 0:
+                Lex->mi.m_binlog_server =
+                  LEX_SOURCE_INFO::LEX_MI_DISABLE;
+                break;
+            case 1:
+                Lex->mi.m_binlog_server =
+                  LEX_SOURCE_INFO::LEX_MI_ENABLE;
+                break;
+            default:
+                YYTHD->syntax_error_at(@3,
+                  "You have an error in your CHANGE REPLICATION SOURCE syntax; BINLOG_SERVER only accepts values 0 or 1");
+                MYSQL_YYABORT;
+            }
+          }
+        | BINLOG_SERVER_STORAGE_URI_SYM EQ TEXT_STRING_sys
+          {
+            Lex->mi.m_binlog_server_storage_uri = $3.str;
           }
         | source_file_def
         ;
@@ -16241,6 +16264,8 @@ ident_keywords_unambiguous:
         | GROUP_REPLICATION
         | GTIDS_SYM
         | GTID_ONLY_SYM
+        | BINLOG_SERVER_SYM
+        | BINLOG_SERVER_STORAGE_URI_SYM
         | GUIDED_SYM
         | HASH_SYM
         | HEADER_SYM

@@ -1133,6 +1133,7 @@ SET (RPL_REPLICA_SRCS
   rpl_info_values.cc
   rpl_io_monitor.cc
   rpl_mi.cc
+  rpl_binlog_server.cc
   rpl_msr.cc
   rpl_mta_submode.cc
   rpl_mysql_connect.cc

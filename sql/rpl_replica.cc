@@ -137,6 +137,7 @@
 #include "sql/rpl_info_handler.h"
 #include "sql/rpl_io_monitor.h"
 #include "sql/rpl_mi.h"
+#include "sql/rpl_binlog_server.h"
 #include "sql/rpl_msr.h"  // Multisource_info
 #include "sql/rpl_mta_submode.h"
 #include "sql/rpl_opt_tracker.h"
@@ -803,6 +804,16 @@ bool start_slave_cmd(THD *thd) {
       const char *command =
           "START REPLICA FOR CHANNEL while Group Replication is running";
       my_error(ER_REPLICA_CHANNEL_OPERATION_NOT_ALLOWED, MYF(0), command,
+               mi->get_channel());
+      goto err;
+    }
+
+    // Reject explicit START REPLICA SQL_THREAD on binlog-server channels.
+    if (mi && mi->is_binlog_server_mode() &&
+        (thd->lex->replica_thd_opt & REPLICA_SQL) &&
+        !(thd->lex->replica_thd_opt & REPLICA_IO)) {
+      my_error(ER_REPLICA_CHANNEL_OPERATION_NOT_ALLOWED, MYF(0),
+               "START REPLICA SQL_THREAD FOR CHANNEL",
                mi->get_channel());
       goto err;
     }
@@ -2064,6 +2075,11 @@ bool start_slave_threads(bool need_lock_slave, bool wait_for_start,
   mysql_cond_t *cond_io{nullptr}, *cond_sql{nullptr};
   bool is_error{false};
   DBUG_TRACE;
+
+  if (mi->is_binlog_server_mode()) {
+    thread_mask &= ~REPLICA_SQL;
+  }
+
   DBUG_EXECUTE_IF("uninitialized_source-info_structure", mi->inited = false;);
 
   if (!mi->inited || !mi->rli->inited) {
@@ -9457,7 +9473,9 @@ static bool have_change_replication_source_receive_option(
       lex_mi->public_key_path ||
       lex_mi->get_public_key != LEX_SOURCE_INFO::LEX_MI_UNCHANGED ||
       lex_mi->zstd_compression_level || lex_mi->compression_algorithm ||
-      lex_mi->require_row_format != LEX_SOURCE_INFO::LEX_MI_UNCHANGED)
+      lex_mi->require_row_format != LEX_SOURCE_INFO::LEX_MI_UNCHANGED ||
+      lex_mi->m_binlog_server != LEX_SOURCE_INFO::LEX_MI_UNCHANGED ||
+      lex_mi->m_binlog_server_storage_uri != nullptr)
     have_receive_option = true;
 
   return have_receive_option;
@@ -9982,6 +10000,26 @@ static bool change_applier_receiver_options(THD *thd, LEX_SOURCE_INFO *lex_mi,
         (lex_mi->m_gtid_only == LEX_SOURCE_INFO::LEX_MI_ENABLE));
   }
 
+  if (lex_mi->m_binlog_server != LEX_SOURCE_INFO::LEX_MI_UNCHANGED) {
+    mi->set_binlog_server_mode(
+        (lex_mi->m_binlog_server == LEX_SOURCE_INFO::LEX_MI_ENABLE));
+  }
+
+  if (lex_mi->m_binlog_server_storage_uri != nullptr) {
+    const size_t uri_len = strlen(lex_mi->m_binlog_server_storage_uri);
+    if (uri_len >= Master_info::kBinlogServerStorageUriBufSize) {
+      my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0), "BINLOG_SERVER_STORAGE_URI",
+               lex_mi->m_binlog_server_storage_uri);
+      return true;
+    }
+    mi->set_binlog_server_storage_uri(lex_mi->m_binlog_server_storage_uri);
+  }
+
+  if (lex_mi->m_binlog_server != LEX_SOURCE_INFO::LEX_MI_UNCHANGED ||
+      lex_mi->m_binlog_server_storage_uri != nullptr) {
+    binlog_server_notify_channel_config(mi);
+  }
+
   return false;
 }
 
@@ -10201,6 +10239,31 @@ int evaluate_inter_option_dependencies(const LEX_SOURCE_INFO *lex_mi,
   }
 
   /*
+    BINLOG_SERVER = 1 requires SOURCE_AUTO_POSITION = 1.
+    Also catch: channel already has BINLOG_SERVER=1 and user tries to
+    disable SOURCE_AUTO_POSITION.
+  */
+  {
+    const bool is_or_will_binlog_server_be_enabled =
+        (lex_mi->m_binlog_server == LEX_SOURCE_INFO::LEX_MI_ENABLE) ||
+        (lex_mi->m_binlog_server == LEX_SOURCE_INFO::LEX_MI_UNCHANGED &&
+         mi->is_binlog_server_mode());
+    if (is_or_will_binlog_server_be_enabled &&
+        !is_or_will_auto_position_be_enabled) {
+      my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0), "BINLOG_SERVER",
+               "1 (requires SOURCE_AUTO_POSITION=1)");
+      return ER_WRONG_VALUE_FOR_VAR;
+    }
+
+    if (is_or_will_binlog_server_be_enabled &&
+        is_or_will_gtid_only_be_enabled) {
+      my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0), "BINLOG_SERVER",
+               "1 (incompatible with GTID_ONLY=1)");
+      return ER_WRONG_VALUE_FOR_VAR;
+    }
+  }
+
+  /*
     CHANGE REPLICATION SOURCE TO SOURCE_CONNECTION_AUTO_FAILOVER = 1 requires
       SOURCE_AUTO_POSITION = 1
   */
@@ -10306,6 +10369,23 @@ int evaluate_inter_option_dependencies(const LEX_SOURCE_INFO *lex_mi,
     my_error(error, MYF(0), mi->get_channel());
     return error;
   }
+
+  /*
+    CHANGE REPLICATION SOURCE TO SOURCE_AUTO_POSITION = 0 cannot be done when
+      BINLOG_SERVER = 1
+  */
+  {
+    const bool is_or_will_bs =
+        (lex_mi->m_binlog_server == LEX_SOURCE_INFO::LEX_MI_ENABLE) ||
+        (lex_mi->m_binlog_server == LEX_SOURCE_INFO::LEX_MI_UNCHANGED &&
+         mi->is_binlog_server_mode());
+    if (will_auto_position_be_disable && is_or_will_bs) {
+      my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0), "BINLOG_SERVER",
+               "1 (requires SOURCE_AUTO_POSITION=1)");
+      return ER_WRONG_VALUE_FOR_VAR;
+    }
+  }
+
   /*
     CHANGE REPLICATION SOURCE TO REQUIRE_ROW_FORMAT = 0 cannot be done when
       GTID_ONLY = 1
@@ -10722,6 +10802,16 @@ int change_master(THD *thd, Master_info *mi, LEX_SOURCE_INFO *lex_mi,
     Changes to variables should be below this comment
     Try to use the update_change_replication_source_options method
    */
+
+  if (lex_mi->m_binlog_server_storage_uri != nullptr &&
+      lex_mi->m_binlog_server_storage_uri[0] != '\0' &&
+      !binlog_server_storage_uri_shape_ok(
+          lex_mi->m_binlog_server_storage_uri)) {
+    my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0), "BINLOG_SERVER_STORAGE_URI",
+             lex_mi->m_binlog_server_storage_uri);
+    error = 1;
+    goto err;
+  }
 
   if (have_receive_option) {
     strmake(saved_host, mi->host, HOSTNAME_LENGTH);

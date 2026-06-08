@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Binlog Server &middot; Binlog Server documentation</title>
+  <link rel="stylesheet" href="style.css?v=0fde0a3ddd">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", function () {
+      if (window.mermaid) {
+        window.mermaid.initialize({
+          startOnLoad: true,
+          theme: "default",
+          themeVariables: {
+            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, system-ui',
+            primaryColor: "#fff8e1",
+            primaryBorderColor: "#f9a825",
+            primaryTextColor: "#5d4037",
+            lineColor: "#7b8a9b",
+            secondaryColor: "#e3f2fd",
+            tertiaryColor: "#e8f5e9"
+          },
+          flowchart: {
+            htmlLabels: true,
+            curve: "basis",
+            useMaxWidth: false,
+            nodeSpacing: 60,
+            rankSpacing: 70,
+            padding: 14
+          },
+          sequence: {
+            useMaxWidth: false,
+            actorMargin: 70,
+            boxMargin: 12,
+            messageMargin: 36
+          },
+          classDiagram: { useMaxWidth: false },
+          stateDiagram: { useMaxWidth: false },
+          gantt: { useMaxWidth: false }
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+<div class="layout">
+  <aside class="nav">
+    <a href="index.html" class="brand">Binlog Server</a>
+    <div class="tagline">Percona Server 9.6 binlog collector: receive and persist.</div>
+    <div class="navhead">Documentation</div>
+    <ul>
+      <li><a href="index.html" class="current">Binlog Server</a></li>
+      <li><a href="overview.html">Overview</a></li>
+      <li><a href="user_guide.html">User guide</a></li>
+      <li><a href="architecture.html">Architecture</a></li>
+      <li><a href="design.html">Low-level design</a></li>
+    </ul>
+    <div class="navhead">Source</div>
+    <ul>
+      <li><a href="../../">components/binlog_server/</a></li>
+      <li><a href="../md/">markdown sources</a></li>
+    </ul>
+  </aside>
+  <main>
+<h1 id="binlog-server-documentation">Binlog Server &mdash; Documentation<a class="headerlink" href="#binlog-server-documentation" title="Permanent link">&#x00B6;</a></h1>
+<p>A Percona Server 9.6 add-on that turns a MySQL instance into a <strong>binlog
+collector</strong>: it connects to one or many upstream MySQL sources as a
+standard asynchronous replica, intercepts the raw binary log stream via
+the IO thread, and materialises it onto local storage as verbatim
+replicas of the source's binlog files.</p>
+<p>It is not a SQL applier. It never opens a transaction, never runs DDL,
+never creates a single row. From the upstream's point of view it is an
+ordinary asynchronous replica that only runs the IO thread.</p>
+<div class="diagram">
+<div class="mermaid">
+flowchart LR
+    classDef src fill:#e3f2fd,stroke:#1976d2,color:#0d47a1
+    classDef hub fill:#fff8e1,stroke:#f9a825,color:#5d4037
+    classDef disk fill:#fafafa,stroke:#9e9e9e,color:#424242
+
+    SRC1["mysqld<br/>source A"]:::src
+    SRC2["mysqld<br/>source B"]:::src
+
+    subgraph Hub["Binlog Server (this Percona Server instance)"]
+        direction TB
+        REL["binlog_server_relay<br/>(plugin)<br/>IO-thread observer"]:::hub
+        STO["component_binlog_server<br/>BinlogArchive"]:::hub
+        DISK[("on-disk archive<br/>file://root/channel/...")]:::disk
+
+        REL -- "append_event" --> STO
+        STO --> DISK
+    end
+
+    SRC1 -- "COM_BINLOG_DUMP_GTID<br/>channel='src_a'" --> REL
+    SRC2 -- "COM_BINLOG_DUMP_GTID<br/>channel='src_b'" --> REL
+</div>
+</div>
+<h2 id="documentation-map">Documentation map<a class="headerlink" href="#documentation-map" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Page</th>
+<th>Audience</th>
+<th>What you'll find</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="overview.html">Overview</a></td>
+<td>Everyone</td>
+<td>The problem, the use cases, the moving parts, the glossary. Read this first.</td>
+</tr>
+<tr>
+<td><a href="user_guide.html">User guide</a></td>
+<td>Operators</td>
+<td>System variables, <code>CHANGE REPLICATION SOURCE</code> syntax, installation, day-2 operations.</td>
+</tr>
+<tr>
+<td><a href="architecture.html">Architecture</a></td>
+<td>Architects, reviewers</td>
+<td>Component / plugin / server split, data-flow diagrams, threading model, failure model.</td>
+</tr>
+<tr>
+<td><a href="design.html">Low-level design</a></td>
+<td>Developers</td>
+<td>Module layout, locking discipline, on-disk file format, deduplication watermark, crash recovery, observer lifecycle, error code catalogue.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="quickstart">Quickstart<a class="headerlink" href="#quickstart" title="Permanent link">&#x00B6;</a></h2>
+<div class="codehilite"><pre><span></span><code><span class="c1">-- 1) Load the moving parts (run on the binlog-server node).</span>
+<span class="n">INSTALL</span><span class="w"> </span><span class="n">COMPONENT</span><span class="w"> </span><span class="s1">&#39;file://component_binlog_server&#39;</span><span class="p">;</span>
+<span class="n">INSTALL</span><span class="w"> </span><span class="n">PLUGIN</span><span class="w"> </span><span class="n">binlog_server_relay</span><span class="w"> </span><span class="n">SONAME</span><span class="w"> </span><span class="s1">&#39;binlog_server_relay.so&#39;</span><span class="p">;</span>
+
+<span class="c1">-- 2) Tell it where to put the archive.</span>
+<span class="k">SET</span><span class="w"> </span><span class="k">GLOBAL</span><span class="w"> </span><span class="n">binlog_server</span><span class="p">.</span><span class="n">default_storage_uri</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;file:///var/binlog-store/&#39;</span><span class="p">;</span>
+
+<span class="c1">-- 3) Point a channel at an upstream and start collecting. GTID_MODE</span>
+<span class="c1">--    must be ON and SOURCE_AUTO_POSITION must be 1 for BINLOG_SERVER.</span>
+<span class="n">CHANGE</span><span class="w"> </span><span class="n">REPLICATION</span><span class="w"> </span><span class="k">SOURCE</span><span class="w"> </span><span class="k">TO</span>
+<span class="w">    </span><span class="n">SOURCE_HOST</span><span class="w">           </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;src-a.example.com&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_PORT</span><span class="w">           </span><span class="o">=</span><span class="w"> </span><span class="mi">3306</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_USER</span><span class="w">           </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;repl&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_PASSWORD</span><span class="w">       </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;...&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_AUTO_POSITION</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="n">BINLOG_SERVER</span><span class="w">         </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+
+<span class="k">START</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="n">IO_THREAD</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+
+<span class="c1">-- 4) Verify collection is active.</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">SERVICE_STATE</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">performance_schema</span><span class="p">.</span><span class="n">replication_connection_status</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">CHANNEL_NAME</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<h2 id="at-a-glance">At a glance<a class="headerlink" href="#at-a-glance" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Aspect</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Single binary, two pieces</strong></td>
+<td><code>component_binlog_server</code> owns storage; <code>binlog_server_relay</code> is the IO-thread observer plugin that ships events into it.</td>
+</tr>
+<tr>
+<td><strong>One channel per upstream</strong></td>
+<td>Each channel has its own on-disk subdirectory, its own mutex, its own watermark. No global serialisation between channels.</td>
+</tr>
+<tr>
+<td><strong>No SQL applier</strong></td>
+<td><code>BINLOG_SERVER=1</code> strips the SQL thread off the channel. The binlog server is a write-back buffer, never an applier.</td>
+</tr>
+<tr>
+<td><strong>GTID auto-position only</strong></td>
+<td><code>BINLOG_SERVER</code> requires <code>SOURCE_AUTO_POSITION=1</code>.</td>
+</tr>
+<tr>
+<td><strong>Crash-safe</strong></td>
+<td>On startup, the archive walks the last file to find the last fully-written event, truncates any partial tail, and restores the watermark.</td>
+</tr>
+<tr>
+<td><strong>Durable at transaction boundaries</strong></td>
+<td>Every <code>Xid</code> / <code>XA_prepare</code> event triggers an <code>fsync(2)</code>, ensuring committed transactions survive a power loss.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="current-status-phase-1">Current status (Phase 1)<a class="headerlink" href="#current-status-phase-1" title="Permanent link">&#x00B6;</a></h2>
+<p>Phase 1 implements the <strong>collection path</strong> only:</p>
+<ul>
+<li>Receive binlogs from upstream sources via the IO thread</li>
+<li>Store them as local files mirroring the source's binlog naming</li>
+<li>Maintain a <code>binlog.index</code> per channel</li>
+<li>Crash recovery with partial-event truncation</li>
+<li>Transaction-boundary fsync for durability</li>
+</ul>
+<p><strong>Not yet implemented</strong> (planned for later phases):
+- Serving collected binlogs to downstream replicas
+- S3-compatible object storage backend
+- Performance Schema observability tables
+- Binlog purging
+- Local rotation / rewriting</p>
+<h2 id="license">License<a class="headerlink" href="#license" title="Permanent link">&#x00B6;</a></h2>
+<p>GPLv2, matching the rest of Percona Server.</p>
+    <footer class="docfoot">
+      <span>Binlog Server documentation</span>
+      <span>Percona Server 9.6 &middot; GPL v2</span>
+    </footer>
+  </main>
+</div>
+</body>
+</html>

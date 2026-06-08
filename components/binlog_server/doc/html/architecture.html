@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Architecture &middot; Binlog Server documentation</title>
+  <link rel="stylesheet" href="style.css?v=0fde0a3ddd">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", function () {
+      if (window.mermaid) {
+        window.mermaid.initialize({
+          startOnLoad: true,
+          theme: "default",
+          themeVariables: {
+            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, system-ui',
+            primaryColor: "#fff8e1",
+            primaryBorderColor: "#f9a825",
+            primaryTextColor: "#5d4037",
+            lineColor: "#7b8a9b",
+            secondaryColor: "#e3f2fd",
+            tertiaryColor: "#e8f5e9"
+          },
+          flowchart: {
+            htmlLabels: true,
+            curve: "basis",
+            useMaxWidth: false,
+            nodeSpacing: 60,
+            rankSpacing: 70,
+            padding: 14
+          },
+          sequence: {
+            useMaxWidth: false,
+            actorMargin: 70,
+            boxMargin: 12,
+            messageMargin: 36
+          },
+          classDiagram: { useMaxWidth: false },
+          stateDiagram: { useMaxWidth: false },
+          gantt: { useMaxWidth: false }
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+<div class="layout">
+  <aside class="nav">
+    <a href="index.html" class="brand">Binlog Server</a>
+    <div class="tagline">Percona Server 9.6 binlog collector: receive and persist.</div>
+    <div class="navhead">Documentation</div>
+    <ul>
+      <li><a href="index.html">Binlog Server</a></li>
+      <li><a href="overview.html">Overview</a></li>
+      <li><a href="user_guide.html">User guide</a></li>
+      <li><a href="architecture.html" class="current">Architecture</a></li>
+      <li><a href="design.html">Low-level design</a></li>
+    </ul>
+    <div class="navhead">Source</div>
+    <ul>
+      <li><a href="../../">components/binlog_server/</a></li>
+      <li><a href="../md/">markdown sources</a></li>
+    </ul>
+  </aside>
+  <main>
+<h1 id="architecture">Architecture<a class="headerlink" href="#architecture" title="Permanent link">&#x00B6;</a></h1>
+<p><a href="index.html">&larr; Back to index</a> &middot;
+<a href="overview.html">Overview</a> &middot;
+<a href="user_guide.html">User guide</a> &middot;
+<strong>Architecture</strong> &middot;
+<a href="design.html">Low-level design</a></p>
+<h2 id="contents">Contents<a class="headerlink" href="#contents" title="Permanent link">&#x00B6;</a></h2>
+<ul>
+<li><a href="#three-pieces-one-binary">Three pieces, one binary</a></li>
+<li><a href="#how-it-plugs-into-mysql">How it plugs into MySQL</a></li>
+<li><a href="#integration-points">Integration points</a></li>
+<li><a href="#source-tree-layout">Source tree layout</a></li>
+<li><a href="#hook-lifetimes">Hook lifetimes</a></li>
+<li><a href="#end-to-end-sequence-configure--collect">End-to-end sequence: configure &rarr; collect</a></li>
+<li><a href="#component-service-abi">Component service ABI</a></li>
+<li><a href="#storage-backend-abstraction">Storage backend abstraction</a></li>
+<li><a href="#module-map">Module map</a></li>
+<li><a href="#lifecycle">Lifecycle</a></li>
+<li><a href="#data-flow">Data flow</a></li>
+<li><a href="#configure-path">Configure path</a></li>
+<li><a href="#collect-path">Collect path</a></li>
+<li><a href="#threading-model">Threading model</a></li>
+<li><a href="#scalability-characteristics">Scalability characteristics</a></li>
+<li><a href="#failure-model">Failure model</a></li>
+<li><a href="#persistence-and-recovery">Persistence and recovery</a></li>
+</ul>
+<h2 id="three-pieces-one-binary">Three pieces, one binary<a class="headerlink" href="#three-pieces-one-binary" title="Permanent link">&#x00B6;</a></h2>
+<div class="diagram">
+<div class="mermaid">
+flowchart TB
+    classDef srv fill:#fff3e0,stroke:#fb8c00,color:#bf360c
+    classDef plg fill:#f3e5f5,stroke:#8e24aa,color:#311b92
+    classDef cmp fill:#fff8e1,stroke:#f9a825,color:#5d4037
+    classDef ext fill:#e0f7fa,stroke:#00838f,color:#006064
+
+    subgraph MYSQLD["mysqld process"]
+        direction TB
+        SRV["Server core<br/>(sql/)"]:::srv
+        PLG["binlog_server_relay plugin<br/>(plugin/binlog_server_relay/)"]:::plg
+        CMP["component_binlog_server<br/>(components/binlog_server/)"]:::cmp
+    end
+
+    SVC[("binlog_server_storage<br/>service")]:::ext
+
+    SRV -- "CHANGE REPLICATION SOURCE<br/>notify" --> SVC
+    PLG -- "after_queue_event<br/>thread_start/stop" --> SVC
+    CMP -- "implements" --> SVC
+</div>
+</div>
+<table>
+<thead>
+<tr>
+<th>Piece</th>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Server core</td>
+<td>Built into <code>mysqld</code></td>
+<td>Grammar extensions, <code>Master_info</code> persistence, channel validation, SQL-thread suppression, notify dispatch.</td>
+</tr>
+<tr>
+<td><code>binlog_server_relay</code></td>
+<td>MySQL plugin (<code>.so</code>)</td>
+<td>IO-thread observer. Intercepts every queued event and feeds bytes into the component via the service.</td>
+</tr>
+<tr>
+<td><code>component_binlog_server</code></td>
+<td>MySQL component (<code>.so</code>)</td>
+<td>Storage engine. Owns the on-disk archive, manages per-channel state, crash recovery. Publishes the <code>binlog_server_storage</code> service.</td>
+</tr>
+</tbody>
+</table>
+<p>The server core is the <strong>thinnest possible shim</strong>: it adds two new
+clauses to <code>CHANGE REPLICATION SOURCE</code>, persists them to
+<code>mysql.slave_master_info</code>, suppresses the SQL thread for
+BINLOG_SERVER channels, and calls <code>binlog_server_storage::configure_channel</code>
+at change-time. It does not know about files, directories, or
+binlog event formats.</p>
+<h2 id="how-it-plugs-into-mysql">How it plugs into MySQL<a class="headerlink" href="#how-it-plugs-into-mysql" title="Permanent link">&#x00B6;</a></h2>
+<h3 id="integration-points">Integration points<a class="headerlink" href="#integration-points" title="Permanent link">&#x00B6;</a></h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Hook</th>
+<th>Where</th>
+<th>What fires it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>CHANGE REPLICATION SOURCE</code> grammar</td>
+<td><code>sql/sql_yacc.yy</code>, <code>sql/lex.h</code></td>
+<td>DBA runs the SQL statement</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>Master_info</code> persistence</td>
+<td><code>sql/rpl_mi.{h,cc}</code></td>
+<td>Write at <code>flush_info</code>, read at restart</td>
+</tr>
+<tr>
+<td>3</td>
+<td>SQL-thread suppression</td>
+<td><code>sql/rpl_replica.cc</code></td>
+<td><code>start_slave_threads()</code> masks the SQL thread</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Notify dispatch</td>
+<td><code>sql/rpl_binlog_server.{h,cc}</code></td>
+<td><code>change_receive_options()</code> calls this</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>Binlog_relay_IO_observer</code></td>
+<td>Plugin API</td>
+<td>Server fires on IO-thread lifecycle and per-event</td>
+</tr>
+</tbody>
+</table>
+<h3 id="source-tree-layout">Source tree layout<a class="headerlink" href="#source-tree-layout" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code>percona-server/
+├── sql/
+│   ├── rpl_binlog_server.h           # notify function declarations
+│   ├── rpl_binlog_server.cc          # acquires binlog_server_storage, calls configure/append
+│   ├── rpl_mi.h / rpl_mi.cc         # Master_info + BINLOG_SERVER fields
+│   ├── rpl_replica.cc               # SQL-thread suppression + validation
+│   ├── sql_yacc.yy / lex.h          # grammar additions
+│   └── sql_lex.h / sql_lex.cc       # LEX_SOURCE_INFO fields
+│
+├── include/mysql/components/services/
+│   └── binlog_server_storage.h       # service ABI definition
+│
+├── plugin/binlog_server_relay/
+│   ├── CMakeLists.txt
+│   └── binlog_server_relay.cc        # Binlog_relay_IO_observer implementation
+│
+├── components/binlog_server/
+│   ├── CMakeLists.txt
+│   ├── binlog_server_component.cc    # component entry point (init/deinit)
+│   ├── binlog_archive.h / .cc       # BinlogArchive + ChannelState
+│   ├── storage_backend.h            # StorageBackend abstract interface
+│   ├── file_storage.h / .cc         # FileStorage (file:// implementation)
+│   ├── log_helpers.h / .cc          # bslog / bslog_code logging wrappers
+│   └── doc/                          # this documentation
+│
+├── scripts/
+│   ├── mysql_system_tables.sql       # DDL for slave_master_info columns
+│   └── mysql_system_tables_fix.sql   # ALTER for upgrades
+│
+├── share/
+│   └── messages_to_error_log.txt     # ER_BINLOG_SERVER_* error codes
+│
+└── mysql-test/suite/binlog_server/   # MTR test suite
+    ├── my.cnf
+    ├── inc/
+    │   ├── have_binlog_server.inc
+    │   └── binlog_server_suppressions.inc
+    ├── t/
+    │   ├── basic_collect.test
+    │   ├── multi_channel.test
+    │   ├── resume_collection.test
+    │   └── syntax.test
+    └── r/
+        ├── basic_collect.result
+        ├── multi_channel.result
+        ├── resume_collection.result
+        └── syntax.result
+</code></pre></div>
+
+<h3 id="hook-lifetimes">Hook lifetimes<a class="headerlink" href="#hook-lifetimes" title="Permanent link">&#x00B6;</a></h3>
+<div class="diagram">
+<div class="mermaid">
+gantt
+    title Hook activation timeline
+    dateFormat X
+    axisFormat %s
+
+    section Server core
+    Grammar available           :done, 0, 100
+    Master_info persistence     :done, 0, 100
+    SQL-thread suppression      :done, 0, 100
+    Notify dispatch             :done, 0, 100
+
+    section Component
+    INSTALL COMPONENT           :crit, 10, 11
+    binlog_server_storage live  :active, 11, 95
+    UNINSTALL COMPONENT         :crit, 95, 96
+
+    section Plugin
+    INSTALL PLUGIN              :crit, 12, 13
+    IO observer registered      :active, 13, 90
+    UNINSTALL PLUGIN            :crit, 90, 91
+</div>
+</div>
+<p>The server-core hooks are always available (compiled in). The
+component and plugin are dynamically loaded and can be loaded/unloaded
+at runtime.</p>
+<h3 id="end-to-end-sequence-configure-collect">End-to-end sequence: configure &rarr; collect<a class="headerlink" href="#end-to-end-sequence-configure-collect" title="Permanent link">&#x00B6;</a></h3>
+<div class="diagram">
+<div class="mermaid">
+sequenceDiagram
+    participant DBA
+    participant Server as mysqld (sql/)
+    participant Plugin as binlog_server_relay
+    participant Component as component_binlog_server
+    participant Disk as filesystem
+
+    Note over DBA,Disk: Phase: Configure
+    DBA->>Server: CHANGE REPLICATION SOURCE TO<br/>BINLOG_SERVER=1, URI='file:///...'<br/>FOR CHANNEL 'ch1'
+    Server->>Server: validate (auto_pos, URI shape, length)
+    Server->>Server: persist to Master_info + flush
+    Server->>Component: configure_channel('ch1', true, 'file:///...')
+    Component->>Disk: mkdir channel_dir
+    Component->>Disk: open/read binlog.index
+    Component->>Disk: walk last file → restore watermark
+    Component-->>Server: OK
+
+    Note over DBA,Disk: Phase: Collect
+    DBA->>Server: START REPLICA IO_THREAD FOR CHANNEL 'ch1'
+    Server->>Server: suppress SQL thread (BINLOG_SERVER mask)
+    Server->>Plugin: thread_start('ch1')
+    Plugin->>Component: configure_channel('ch1', ...)
+
+    loop Every event from upstream
+        Server->>Plugin: after_queue_event(event_buf, event_len)
+        Plugin->>Component: append_event('ch1', buf, len)
+        Component->>Component: parse header, dedup watermark
+        Component->>Disk: write(event_bytes)
+        alt Xid / XA_prepare event
+            Component->>Disk: fsync()
+        end
+    end
+
+    DBA->>Server: STOP REPLICA IO_THREAD FOR CHANNEL 'ch1'
+    Server->>Plugin: thread_stop('ch1')
+    Plugin->>Component: close_channel('ch1')
+    Component->>Disk: flush + fsync + close
+</div>
+</div>
+<h3 id="component-service-abi">Component service ABI<a class="headerlink" href="#component-service-abi" title="Permanent link">&#x00B6;</a></h3>
+<p>The <code>binlog_server_storage</code> service is defined in
+<code>include/mysql/components/services/binlog_server_storage.h</code>:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">BEGIN_SERVICE_DEFINITION</span><span class="p">(</span><span class="n">binlog_server_storage</span><span class="p">)</span>
+<span class="w">  </span><span class="n">DECLARE_METHOD</span><span class="p">(</span><span class="kt">int</span><span class="p">,</span><span class="w"> </span><span class="n">configure_channel</span><span class="p">,</span>
+<span class="w">    </span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="n">enabled</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">storage_uri</span><span class="p">));</span>
+<span class="w">  </span><span class="n">DECLARE_METHOD</span><span class="p">(</span><span class="kt">int</span><span class="p">,</span><span class="w"> </span><span class="n">append_event</span><span class="p">,</span>
+<span class="w">    </span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">len</span><span class="p">));</span>
+<span class="w">  </span><span class="n">DECLARE_METHOD</span><span class="p">(</span><span class="kt">int</span><span class="p">,</span><span class="w"> </span><span class="n">close_channel</span><span class="p">,</span>
+<span class="w">    </span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">channel</span><span class="p">));</span>
+<span class="n">END_SERVICE_DEFINITION</span><span class="p">(</span><span class="n">binlog_server_storage</span><span class="p">)</span>
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Called by</th>
+<th>When</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>configure_channel</code></td>
+<td>Server notify + plugin <code>thread_start</code></td>
+<td><code>CHANGE REPLICATION SOURCE</code> or IO-thread start</td>
+</tr>
+<tr>
+<td><code>append_event</code></td>
+<td>Plugin <code>after_queue_event</code></td>
+<td>Every binlog event received from the upstream</td>
+</tr>
+<tr>
+<td><code>close_channel</code></td>
+<td>Plugin <code>thread_stop</code> / <code>after_reset_slave</code></td>
+<td>IO thread stops or channel is reset</td>
+</tr>
+</tbody>
+</table>
+<h2 id="storage-backend-abstraction">Storage backend abstraction<a class="headerlink" href="#storage-backend-abstraction" title="Permanent link">&#x00B6;</a></h2>
+<div class="diagram">
+<div class="mermaid">
+classDiagram
+    class StorageBackend {
+        <<abstract>>
+        +open_or_create(path) int
+        +close() int
+        +sync() int
+    }
+    class FileStorage {
+        +open_or_create(path) int
+        +close() int
+        +sync() int
+    }
+    class S3Storage {
+        <<future>>
+        +open_or_create(path) int
+        +close() int
+        +sync() int
+    }
+
+    StorageBackend <|-- FileStorage
+    StorageBackend <|-- S3Storage
+</div>
+</div>
+<p>Phase 1 implements <code>FileStorage</code> only. The <code>S3Storage</code> backend is a
+placeholder for future phases. The <code>BinlogArchive</code> dispatches every
+I/O operation through the <code>StorageBackend</code> interface, so adding new
+backends requires no changes to the binlog protocol logic.</p>
+<h2 id="module-map">Module map<a class="headerlink" href="#module-map" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th>Responsibility</th>
+<th>Key state</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>binlog_server_component.cc</code></td>
+<td>Component lifecycle (init/deinit), service registration</td>
+<td><code>log_bi</code>, <code>log_bs</code></td>
+</tr>
+<tr>
+<td><code>binlog_archive.{h,cc}</code></td>
+<td>Per-channel state management, event parsing, rotation, crash recovery, watermark</td>
+<td><code>BinlogArchive</code> singleton, <code>ChannelState</code> map</td>
+</tr>
+<tr>
+<td><code>file_storage.{h,cc}</code></td>
+<td>File I/O abstraction for <code>file://</code> URIs</td>
+<td>Directory creation, path management</td>
+</tr>
+<tr>
+<td><code>storage_backend.h</code></td>
+<td>Abstract interface for storage backends</td>
+<td>&mdash;</td>
+</tr>
+<tr>
+<td><code>log_helpers.{h,cc}</code></td>
+<td>Structured logging helpers (<code>bslog</code>, <code>bslog_code</code>)</td>
+<td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+<h2 id="lifecycle">Lifecycle<a class="headerlink" href="#lifecycle" title="Permanent link">&#x00B6;</a></h2>
+<div class="diagram">
+<div class="mermaid">
+stateDiagram-v2
+    [*] --> Unloaded
+    Unloaded --> ComponentLoaded : INSTALL COMPONENT
+    ComponentLoaded --> FullyActive : INSTALL PLUGIN
+    FullyActive --> Collecting : START REPLICA IO_THREAD<br/>(per channel)
+    Collecting --> FullyActive : STOP REPLICA IO_THREAD
+    FullyActive --> ComponentLoaded : UNINSTALL PLUGIN
+    ComponentLoaded --> Unloaded : UNINSTALL COMPONENT
+    Collecting --> Recovering : crash / kill
+    Recovering --> Collecting : restart + START REPLICA
+</div>
+</div>
+<h2 id="data-flow">Data flow<a class="headerlink" href="#data-flow" title="Permanent link">&#x00B6;</a></h2>
+<h3 id="configure-path">Configure path<a class="headerlink" href="#configure-path" title="Permanent link">&#x00B6;</a></h3>
+<div class="diagram">
+<div class="mermaid">
+flowchart TD
+    classDef sql fill:#e3f2fd,stroke:#1976d2
+    classDef svc fill:#fff8e1,stroke:#f9a825
+    classDef io fill:#e8f5e9,stroke:#43a047
+
+    CRS["CHANGE REPLICATION SOURCE TO<br/>BINLOG_SERVER=1"]:::sql
+    VAL["Validate: auto_pos, URI, length,<br/>GTID_ONLY exclusion"]:::sql
+    PERSIST["Persist to Master_info"]:::sql
+    NOTIFY["rpl_binlog_server::notify_channel_config"]:::sql
+    SVC["binlog_server_storage::configure_channel"]:::svc
+    MKDIR["Create channel directory"]:::io
+    INDEX["Load binlog.index"]:::io
+    RECOVER["Walk last file → restore watermark"]:::io
+
+    CRS --> VAL --> PERSIST --> NOTIFY --> SVC
+    SVC --> MKDIR --> INDEX --> RECOVER
+</div>
+</div>
+<h3 id="collect-path">Collect path<a class="headerlink" href="#collect-path" title="Permanent link">&#x00B6;</a></h3>
+<div class="diagram">
+<div class="mermaid">
+flowchart TD
+    classDef hot fill:#ffebee,stroke:#c62828
+    classDef io fill:#e8f5e9,stroke:#43a047
+
+    EVT["IO thread receives event"]:::hot
+    OBS["after_queue_event fires"]:::hot
+    APPEND["append_event(channel, buf, len)"]:::hot
+    PARSE["Parse event header<br/>(type, log_pos, flags)"]:::hot
+    DEDUP{"log_pos <= watermark?"}
+    DROP["Drop (duplicate)"]
+    FDE["Handle FDE<br/>(write if first)"]:::io
+    ROTATE["Handle Rotate<br/>(write rotate + open new file)"]:::io
+    NORMAL["Write event bytes"]:::io
+    SYNC{"Xid / XA_prepare?"}
+    FSYNC["fsync()"]:::io
+    UPDATE["Update watermark"]
+
+    EVT --> OBS --> APPEND --> PARSE --> DEDUP
+    DEDUP -- yes --> DROP
+    DEDUP -- no --> FDE
+    FDE --> ROTATE --> NORMAL --> SYNC
+    SYNC -- yes --> FSYNC --> UPDATE
+    SYNC -- no --> UPDATE
+</div>
+</div>
+<h2 id="threading-model">Threading model<a class="headerlink" href="#threading-model" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Thread</th>
+<th>What it does</th>
+<th>Concurrency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IO thread (per channel)</td>
+<td>Receives events from upstream, fires observer callbacks</td>
+<td>One per channel; each channel has its own <code>ChannelState</code> mutex</td>
+</tr>
+<tr>
+<td>Client thread (DBA)</td>
+<td><code>CHANGE REPLICATION SOURCE</code> &rarr; <code>configure_channel</code></td>
+<td>Serialised by the channel's mutex</td>
+</tr>
+</tbody>
+</table>
+<p>There is no background thread owned by the component. All work happens
+on the IO thread or the client thread that issues configuration
+statements. This means the component adds zero new threads to the
+server.</p>
+<h2 id="scalability-characteristics">Scalability characteristics<a class="headerlink" href="#scalability-characteristics" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Channels</strong></td>
+<td>Linear scaling. Each channel has its own mutex and file handles. No global lock.</td>
+</tr>
+<tr>
+<td><strong>Throughput per channel</strong></td>
+<td>Bounded by disk I/O. The <code>fsync</code> at transaction boundaries is the bottleneck; between Xid events, writes are buffered by the OS page cache.</td>
+</tr>
+<tr>
+<td><strong>Memory</strong></td>
+<td>O(channels × index-size). The in-memory index set (<code>std::set&lt;std::string&gt;</code>) is proportional to the number of binlog files per channel.</td>
+</tr>
+<tr>
+<td><strong>Disk</strong></td>
+<td>Linear in event volume. One-to-one with the upstream's binlog byte volume.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="failure-model">Failure model<a class="headerlink" href="#failure-model" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Impact</th>
+<th>Recovery</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>IO thread disconnect</strong></td>
+<td>Collection pauses</td>
+<td><code>START REPLICA IO_THREAD</code> reconnects; GTID auto-position skips already-received events; watermark prevents archive duplicates</td>
+</tr>
+<tr>
+<td><strong>Process crash</strong></td>
+<td>Last partial event may be incomplete</td>
+<td>Crash recovery truncates the partial tail and restores the watermark on next <code>configure_channel</code></td>
+</tr>
+<tr>
+<td><strong>Disk full</strong></td>
+<td><code>write()</code> or <code>fsync()</code> fails</td>
+<td>Plugin logs the error; IO thread remains running but events are lost until space is freed. Manual intervention required.</td>
+</tr>
+<tr>
+<td><strong>Component unloaded while collecting</strong></td>
+<td>Plugin's service calls return failure</td>
+<td>Plugin logs the failure and returns 0 (no IO-thread crash). Events are silently dropped until component is reloaded.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="persistence-and-recovery">Persistence and recovery<a class="headerlink" href="#persistence-and-recovery" title="Permanent link">&#x00B6;</a></h2>
+<p>The on-disk state is:</p>
+<div class="codehilite"><pre><span></span><code>&lt;storage_uri&gt;/&lt;channel_name&gt;/
+├── binlog.index          # line-per-file, in rotation order
+├── &lt;source_binlog&gt;.000001
+├── &lt;source_binlog&gt;.000002
+└── ...
+</code></pre></div>
+
+<p>Recovery algorithm (executed in <code>configure_channel</code>):</p>
+<ol>
+<li>Parse <code>binlog.index</code> to populate the in-memory <code>indexed_files</code> set
+   and <code>file_order</code> vector.</li>
+<li>Open the last file in <code>file_order</code>.</li>
+<li>Walk event-by-event from offset 4 (after the magic number):
+   - Read the 19-byte common header.
+   - Validate <code>event_length</code> against remaining file size.
+   - If the event is an FDE, set <code>wrote_fde = true</code> and derive
+     <code>has_checksum</code>.
+   - Track <code>last_source_log_pos</code> from the event's <code>log_pos</code> field.</li>
+<li>If the file ends with a partial event (not enough bytes for the
+   declared <code>event_length</code>), truncate at the last complete event.</li>
+<li>Set <code>last_source_log_pos</code> as the watermark. Subsequent appends
+   with <code>log_pos &lt;= watermark</code> will be dropped as duplicates.</li>
+</ol>
+<p>This ensures the archive is always in a consistent state after any
+crash, and collection resumes without gaps or duplicates.</p>
+    <footer class="docfoot">
+      <span>Binlog Server documentation</span>
+      <span>Percona Server 9.6 &middot; GPL v2</span>
+    </footer>
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,61 @@
+--source include/have_binlog_format_row.inc
+--source suite/binlog_server/inc/have_binlog_server.inc
+--source include/rpl/init_source_replica.inc
+
+--source include/rpl/connection_replica.inc
+--source suite/binlog_server/inc/binlog_server_suppressions.inc
+--source include/rpl/connection_source.inc
+
+# Test: Multi-channel binlog server configuration
+#
+# Verifies that:
+# 1. Multiple channels can be configured with BINLOG_SERVER=1
+# 2. Each channel accepts a separate storage URI
+# 3. RESET REPLICA ALL properly cleans up binlog server channels
+
+--source include/rpl/connection_replica.inc
+--source include/rpl/stop_replica.inc
+CALL mtr.add_suppression("binlog_server.*cannot configure channel");
+
+--echo
+--echo *** Configuring channel_a with BINLOG_SERVER=1
+--let $source_port= query_get_value(SHOW REPLICA STATUS FOR CHANNEL '', Source_Port, 1)
+--replace_result $source_port SOURCE_PORT
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $source_port,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1,
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file:///tmp/chan_a/'
+  FOR CHANNEL 'channel_a';
+
+--echo
+--echo *** Configuring channel_b with BINLOG_SERVER=1
+--replace_result $source_port SOURCE_PORT
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $source_port,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1,
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file:///tmp/chan_b/'
+  FOR CHANNEL 'channel_b';
+
+--echo
+--echo *** Verify both channels have Auto_Position=1
+--let $ch_a_pos = query_get_value(SHOW REPLICA STATUS FOR CHANNEL 'channel_a', Auto_Position, 1)
+--let $ch_b_pos = query_get_value(SHOW REPLICA STATUS FOR CHANNEL 'channel_b', Auto_Position, 1)
+--echo channel_a auto_position: $ch_a_pos
+--echo channel_b auto_position: $ch_b_pos
+
+--echo
+--echo *** Cleanup
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 0 FOR CHANNEL 'channel_a';
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 0 FOR CHANNEL 'channel_b';
+RESET REPLICA ALL FOR CHANNEL 'channel_a';
+RESET REPLICA ALL FOR CHANNEL 'channel_b';
+
+--source include/rpl/start_replica.inc
+
+--source include/rpl/deinit.inc

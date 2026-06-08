@@ -109,8 +109,14 @@ enum {
   /* line for gtid_only */
   LINE_FOR_GTID_ONLY = 33,
 
+  /* line for binlog_server mode */
+  LINE_FOR_BINLOG_SERVER = 34,
+
+  /* line for binlog_server storage URI */
+  LINE_FOR_BINLOG_SERVER_STORAGE_URI = 35,
+
   /* Number of lines currently used when saving master info file */
-  LINES_IN_MASTER_INFO = LINE_FOR_GTID_ONLY
+  LINES_IN_MASTER_INFO = LINE_FOR_BINLOG_SERVER_STORAGE_URI
 
 };
 
@@ -151,7 +157,9 @@ const char *info_mi_fields[] = {"number_of_lines",
                                 "source_zstd_compression_level",
                                 "tls_ciphersuites",
                                 "source_connection_auto_failover",
-                                "gtid_only"};
+                                "gtid_only",
+                                "binlog_server",
+                                "binlog_server_storage_uri"};
 
 const uint info_mi_table_pk_field_indexes[] = {
     LINE_FOR_CHANNEL - 1,
@@ -202,9 +210,11 @@ Master_info::Master_info(
                              TRX_BOUNDARY_PARSER_RECEIVER),
       reset(false),
       m_gtid_only_mode(false),
+      m_binlog_server_mode(false),
       m_is_receiver_position_info_invalid(false) {
   host[0] = 0;
   user[0] = 0;
+  m_binlog_server_storage_uri[0] = '\0';
   bind_addr[0] = 0;
   network_namespace[0] = 0;
   password[0] = 0;
@@ -672,6 +682,19 @@ bool Master_info::read_info(Rpl_info_handler *from) {
       temp_gtid_only = 1;
   }
   m_gtid_only_mode = temp_gtid_only;
+
+  if (lines >= LINE_FOR_BINLOG_SERVER) {
+    auto temp_binlog_server{0};
+    if (!!from->get_info(&temp_binlog_server, 0)) return true;
+    m_binlog_server_mode = (temp_binlog_server != 0);
+  }
+
+  if (lines >= LINE_FOR_BINLOG_SERVER_STORAGE_URI) {
+    if (!!from->get_info(m_binlog_server_storage_uri,
+                         sizeof(m_binlog_server_storage_uri), ""))
+      return true;
+  }
+
   return false;
 }
 
@@ -712,7 +735,9 @@ bool Master_info::write_info(Rpl_info_handler *to) {
       to->set_info(tls_ciphersuites.first ? nullptr
                                           : tls_ciphersuites.second.c_str()) ||
       to->set_info((int)m_source_connection_auto_failover) ||
-      to->set_info((int)m_gtid_only_mode))
+      to->set_info((int)m_gtid_only_mode) ||
+      to->set_info((int)m_binlog_server_mode) ||
+      to->set_info(m_binlog_server_storage_uri))
     return true;
 
   return false;
@@ -814,3 +839,24 @@ void Master_info::set_gtid_only_mode(bool gtid_only_mode) {
 }
 
 bool Master_info::is_gtid_only_mode() const { return m_gtid_only_mode; }
+
+void Master_info::set_binlog_server_mode(bool binlog_server_mode) {
+  m_binlog_server_mode = binlog_server_mode;
+}
+
+bool Master_info::is_binlog_server_mode() const {
+  return m_binlog_server_mode;
+}
+
+void Master_info::set_binlog_server_storage_uri(const char *storage_uri) {
+  if (storage_uri == nullptr || storage_uri[0] == '\0') {
+    m_binlog_server_storage_uri[0] = '\0';
+  } else {
+    strmake(m_binlog_server_storage_uri, storage_uri,
+            kBinlogServerStorageUriBufSize - 1);
+  }
+}
+
+const char *Master_info::get_binlog_server_storage_uri() const {
+  return m_binlog_server_storage_uri;
+}

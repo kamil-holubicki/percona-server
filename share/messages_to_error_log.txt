@@ -13951,6 +13951,34 @@ start-error-number 48300
 
 
 #
+# Start of Percona Server 9.6 error log messages
+#
+start-error-number 48350
+
+ER_BINLOG_SERVER_IO_FAILURE
+  eng "binlog_server I/O failure: %s"
+
+ER_BINLOG_SERVER_CONFIG_REJECTED
+  eng "binlog_server configuration rejected: %s"
+
+ER_BINLOG_SERVER_SERVICE_UNAVAILABLE
+  eng "binlog_server service unavailable: %s"
+
+ER_BINLOG_SERVER_INVARIANT_VIOLATED
+  eng "binlog_server internal invariant violated: %s"
+
+ER_BINLOG_SERVER_DUPLICATE_DROPPED
+  eng "binlog_server dropped duplicate event: %s"
+
+ER_BINLOG_SERVER_UNCONFIGURED_APPEND
+  eng "binlog_server append for unconfigured channel: %s"
+
+#
+# End of Percona Server 9.6 error log messages
+#
+
+
+#
 # Start of Percona Server 9.7 error log messages
 #
 start-error-number 48400

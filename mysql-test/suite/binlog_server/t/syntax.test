@@ -1,0 +1,53 @@
+--source include/have_binlog_format_row.inc
+--source include/rpl/init_source_replica.inc
+
+# Test: BINLOG_SERVER grammar syntax validation
+
+--source include/rpl/connection_replica.inc
+--source suite/binlog_server/inc/binlog_server_suppressions.inc
+--source include/rpl/stop_replica.inc
+
+--echo
+--echo *** Test: BINLOG_SERVER = 1 accepted
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 1, SOURCE_AUTO_POSITION = 1;
+
+--echo
+--echo *** Test: BINLOG_SERVER = 0 accepted
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 0;
+
+--echo
+--echo *** Test: BINLOG_SERVER = 2 rejected
+--error ER_PARSE_ERROR
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 2;
+
+--echo
+--echo *** Test: BINLOG_SERVER_STORAGE_URI with valid file:// URI
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER_STORAGE_URI = 'file:///tmp/test/';
+
+--echo
+--echo *** Test: BINLOG_SERVER_STORAGE_URI with empty string (clear)
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER_STORAGE_URI = '';
+
+--echo
+--echo *** Test: BINLOG_SERVER_STORAGE_URI with invalid URI (no scheme)
+--error ER_WRONG_VALUE_FOR_VAR
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER_STORAGE_URI = '/no/scheme/here';
+
+--echo
+--echo *** Test: BINLOG_SERVER_STORAGE_URI with invalid URI (scheme only)
+--error ER_WRONG_VALUE_FOR_VAR
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER_STORAGE_URI = 'file://';
+
+--echo
+--echo *** Test: BINLOG_SERVER = 1 requires SOURCE_AUTO_POSITION = 1
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 0, SOURCE_AUTO_POSITION = 0;
+--error ER_WRONG_VALUE_FOR_VAR
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 1;
+
+--echo
+--echo *** Cleanup: restore to normal replica state
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 0, BINLOG_SERVER_STORAGE_URI = '', SOURCE_AUTO_POSITION = 1;
+
+--source include/rpl/start_replica.inc
+
+--source include/rpl/deinit.inc

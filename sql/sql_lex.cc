@@ -5067,7 +5067,9 @@ void LEX_SOURCE_INFO::initialize() {
   until_after_gaps = false;
   ssl = ssl_verify_server_cert = heartbeat_opt = repl_ignore_server_ids_opt =
       retry_count_opt = auto_position = port_opt = get_public_key =
-          m_source_connection_auto_failover = m_gtid_only = LEX_MI_UNCHANGED;
+          m_source_connection_auto_failover = m_gtid_only = m_binlog_server =
+              LEX_MI_UNCHANGED;
+  m_binlog_server_storage_uri = nullptr;
   ssl_key = ssl_cert = ssl_ca = ssl_capath = ssl_cipher = nullptr;
   ssl_crl = ssl_crlpath = nullptr;
   public_key_path = nullptr;

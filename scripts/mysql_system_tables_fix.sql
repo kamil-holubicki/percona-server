@@ -885,6 +885,10 @@ ALTER TABLE slave_master_info ADD Source_connection_auto_failover BOOLEAN NOT NU
 
 ALTER TABLE slave_master_info ADD Gtid_only BOOLEAN NOT NULL DEFAULT FALSE COMMENT 'Indicates if this channel only uses GTIDs and does not persist positions.';
 
+ALTER TABLE slave_master_info ADD Binlog_server BOOLEAN NOT NULL DEFAULT FALSE COMMENT 'Indicates if this channel is in binlog server mode.';
+
+ALTER TABLE slave_master_info ADD Binlog_server_storage_uri TEXT CHARACTER SET utf8mb3 COLLATE utf8mb3_bin DEFAULT NULL COMMENT 'Storage URI for binlog server archives.';
+
 -- This would add the Managed_name column to
 -- replication_asynchronous_connection_failover table on upgrade from older
 -- mysql version.

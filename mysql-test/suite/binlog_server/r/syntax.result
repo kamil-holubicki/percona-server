@@ -1,0 +1,41 @@
+include/rpl/init_source_replica.inc
+Warnings:
+Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	####	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+[connection master]
+[connection slave]
+include/rpl/stop_replica.inc
+
+*** Test: BINLOG_SERVER = 1 accepted
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 1, SOURCE_AUTO_POSITION = 1;
+
+*** Test: BINLOG_SERVER = 0 accepted
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 0;
+
+*** Test: BINLOG_SERVER = 2 rejected
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 2;
+ERROR 42000: You have an error in your CHANGE REPLICATION SOURCE syntax; BINLOG_SERVER only accepts values 0 or 1 near '2' at line 1
+
+*** Test: BINLOG_SERVER_STORAGE_URI with valid file:// URI
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER_STORAGE_URI = 'file:///tmp/test/';
+
+*** Test: BINLOG_SERVER_STORAGE_URI with empty string (clear)
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER_STORAGE_URI = '';
+
+*** Test: BINLOG_SERVER_STORAGE_URI with invalid URI (no scheme)
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER_STORAGE_URI = '/no/scheme/here';
+ERROR 42000: Variable 'BINLOG_SERVER_STORAGE_URI' can't be set to the value of '/no/scheme/here'
+
+*** Test: BINLOG_SERVER_STORAGE_URI with invalid URI (scheme only)
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER_STORAGE_URI = 'file://';
+ERROR 42000: Variable 'BINLOG_SERVER_STORAGE_URI' can't be set to the value of 'file://'
+
+*** Test: BINLOG_SERVER = 1 requires SOURCE_AUTO_POSITION = 1
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 0, SOURCE_AUTO_POSITION = 0;
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 1;
+ERROR 42000: Variable 'BINLOG_SERVER' can't be set to the value of '1 (requires SOURCE_AUTO_POSITION=1)'
+
+*** Cleanup: restore to normal replica state
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 0, BINLOG_SERVER_STORAGE_URI = '', SOURCE_AUTO_POSITION = 1;
+include/rpl/start_replica.inc
+include/rpl/deinit.inc

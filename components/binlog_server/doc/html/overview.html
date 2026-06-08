@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Overview &middot; Binlog Server documentation</title>
+  <link rel="stylesheet" href="style.css?v=0fde0a3ddd">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", function () {
+      if (window.mermaid) {
+        window.mermaid.initialize({
+          startOnLoad: true,
+          theme: "default",
+          themeVariables: {
+            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, system-ui',
+            primaryColor: "#fff8e1",
+            primaryBorderColor: "#f9a825",
+            primaryTextColor: "#5d4037",
+            lineColor: "#7b8a9b",
+            secondaryColor: "#e3f2fd",
+            tertiaryColor: "#e8f5e9"
+          },
+          flowchart: {
+            htmlLabels: true,
+            curve: "basis",
+            useMaxWidth: false,
+            nodeSpacing: 60,
+            rankSpacing: 70,
+            padding: 14
+          },
+          sequence: {
+            useMaxWidth: false,
+            actorMargin: 70,
+            boxMargin: 12,
+            messageMargin: 36
+          },
+          classDiagram: { useMaxWidth: false },
+          stateDiagram: { useMaxWidth: false },
+          gantt: { useMaxWidth: false }
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+<div class="layout">
+  <aside class="nav">
+    <a href="index.html" class="brand">Binlog Server</a>
+    <div class="tagline">Percona Server 9.6 binlog collector: receive and persist.</div>
+    <div class="navhead">Documentation</div>
+    <ul>
+      <li><a href="index.html">Binlog Server</a></li>
+      <li><a href="overview.html" class="current">Overview</a></li>
+      <li><a href="user_guide.html">User guide</a></li>
+      <li><a href="architecture.html">Architecture</a></li>
+      <li><a href="design.html">Low-level design</a></li>
+    </ul>
+    <div class="navhead">Source</div>
+    <ul>
+      <li><a href="../../">components/binlog_server/</a></li>
+      <li><a href="../md/">markdown sources</a></li>
+    </ul>
+  </aside>
+  <main>
+<h1 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&#x00B6;</a></h1>
+<p><a href="index.html">&larr; Back to index</a> &middot; <strong>Overview</strong> &middot;
+<a href="user_guide.html">User guide</a> &middot;
+<a href="architecture.html">Architecture</a> &middot;
+<a href="design.html">Low-level design</a></p>
+<h2 id="what-it-is">What it is<a class="headerlink" href="#what-it-is" title="Permanent link">&#x00B6;</a></h2>
+<p>A <strong>binlog server</strong> is a Percona Server 9.6 instance that has been
+configured to do one thing:</p>
+<ol>
+<li><strong>Collect</strong> the raw binary log of one or more upstream MySQL sources
+   into local on-disk files.</li>
+</ol>
+<p>Crucially, it does <strong>not</strong> apply anything. Connecting an IO thread to
+an upstream and disabling the SQL thread is not a new idea (the
+<code>BINLOG_SERVER</code> clause on <code>CHANGE REPLICATION SOURCE</code> is exactly that
+switch); the rest of the work &mdash; persistent on-disk archives with a
+deduplication watermark, crash recovery, idempotent index management,
+and transaction-boundary durability &mdash; is what makes the result an
+actual <em>server</em> rather than just a stalled replica.</p>
+<h2 id="why-it-exists">Why it exists<a class="headerlink" href="#why-it-exists" title="Permanent link">&#x00B6;</a></h2>
+<p>The classic MySQL replication topology pushes a lot of moving parts to
+the edge:</p>
+<ul>
+<li>Every downstream replica opens a long-lived dump thread against the
+  source. Two hundred replicas means two hundred concurrent dump
+  threads competing for the source's binlog page cache.</li>
+<li>The source's binlog retention dictates downstream recovery. Lose your
+  retention window and a backed-up replica has to be rebuilt.</li>
+<li>Cross-WAN replicas pay the WAN cost on every fanout.</li>
+</ul>
+<p>A binlog server inverts that: the source ships one stream to one node
+that <strong>persists</strong> it.</p>
+<div class="diagram">
+<div class="mermaid">
+flowchart LR
+    classDef src fill:#e3f2fd,stroke:#1976d2,color:#0d47a1
+    classDef hub fill:#fff8e1,stroke:#f9a825,color:#5d4037
+    classDef rep fill:#e8f5e9,stroke:#43a047,color:#1b5e20
+
+    subgraph BEFORE["Without a binlog server"]
+        direction LR
+        S1["source"]:::src
+        R1A["replica"]:::rep
+        R1B["replica"]:::rep
+        R1C["replica"]:::rep
+        S1 --> R1A & R1B & R1C
+    end
+
+    subgraph AFTER["With a binlog server"]
+        direction LR
+        S2["source"]:::src
+        H["binlog server<br/>(persistent buffer)"]:::hub
+        S2 --> H
+    end
+</div>
+</div>
+<h2 id="use-cases">Use cases<a class="headerlink" href="#use-cases" title="Permanent link">&#x00B6;</a></h2>
+<h3 id="1-replica-fan-out-at-scale">1. Replica fan-out at scale<a class="headerlink" href="#1-replica-fan-out-at-scale" title="Permanent link">&#x00B6;</a></h3>
+<p>One source, many replicas. Without a binlog server the source pays for
+every reader. With a binlog server the source pays for one TCP
+connection.</p>
+<h3 id="2-cross-region-buffer">2. Cross-region buffer<a class="headerlink" href="#2-cross-region-buffer" title="Permanent link">&#x00B6;</a></h3>
+<p>Keep an in-region binlog server warm with a single WAN-bound dump
+thread; replicas in the remote region will later talk to the local
+binlog server over the LAN.</p>
+<h3 id="3-fan-in-multi-source-archiver">3. Fan-in (multi-source archiver)<a class="headerlink" href="#3-fan-in-multi-source-archiver" title="Permanent link">&#x00B6;</a></h3>
+<p>A single binlog server collects multiple unrelated sources into
+side-by-side archives, each on its own channel.</p>
+<h3 id="4-offline-replica-catch-up-buffer">4. Offline replica catch-up buffer<a class="headerlink" href="#4-offline-replica-catch-up-buffer" title="Permanent link">&#x00B6;</a></h3>
+<p>A replica that has been offline for hours can resume from the binlog
+server's on-disk archive even after the upstream has rotated out the
+binlogs it needed.</p>
+<h2 id="whats-in-the-box">What's in the box<a class="headerlink" href="#whats-in-the-box" title="Permanent link">&#x00B6;</a></h2>
+<p>Two artifacts ship with this feature, both built from the same source
+tree:</p>
+<div class="diagram">
+<div class="mermaid">
+flowchart TB
+    classDef srv fill:#fff3e0,stroke:#fb8c00,color:#bf360c
+    classDef plg fill:#f3e5f5,stroke:#8e24aa,color:#311b92
+    classDef cmp fill:#fff8e1,stroke:#f9a825,color:#5d4037
+    classDef ext fill:#e0f7fa,stroke:#00838f,color:#006064
+
+    subgraph BIN["mysqld (binlog-server node)"]
+        direction TB
+        SRV["server core<br/>sql/rpl_binlog_server.{h,cc}<br/>+ CHANGE REPLICATION SOURCE<br/>BINLOG_SERVER clause"]:::srv
+        PLG["binlog_server_relay<br/>(MySQL plugin)<br/>Binlog_relay_IO_observer hooks"]:::plg
+        CMP["component_binlog_server<br/>(MySQL component)<br/>BinlogArchive + FileStorage"]:::cmp
+    end
+
+    SVC1[("binlog_server_storage<br/>component service")]:::ext
+
+    PLG -- "acquires" --> SVC1
+    CMP -- "publishes" --> SVC1
+    SRV -- "notify on<br/>CHANGE REPLICATION SOURCE" --> SVC1
+</div>
+</div>
+<ul>
+<li><strong>Server core</strong> (in <code>sql/</code>). The <code>BINLOG_SERVER</code> and
+  <code>BINLOG_SERVER_STORAGE_URI</code> clauses for <code>CHANGE REPLICATION SOURCE</code>,
+  the persistence in <code>mysql.slave_master_info</code>, the SQL-thread
+  suppression mask, and the notify layer
+  (<code>sql/rpl_binlog_server.{h,cc}</code>) that calls the storage service when
+  an operator runs <code>CHANGE REPLICATION SOURCE</code>.</li>
+<li><strong><code>binlog_server_relay</code> plugin</strong> (in
+  <code>plugin/binlog_server_relay/</code>). Registers itself as a
+  <code>Binlog_relay_IO_observer</code>. Its <code>after_queue_event</code> callback fires
+  for every event the IO thread queues, and that's what feeds raw
+  bytes into the component. Also handles <code>thread_start</code> /
+  <code>thread_stop</code> / <code>after_reset_slave</code> so a stop/start cycle does the
+  right thing.</li>
+<li><strong><code>component_binlog_server</code> component</strong> (in
+  <code>components/binlog_server/</code>). The actual storage engine. Owns the
+  on-disk archive, the per-channel state, and the <code>binlog_server_storage</code>
+  service implementation.</li>
+</ul>
+<p>The split is intentional. The relay plugin handles the IO-thread
+event-rate hot path (registered observer callbacks; cannot fail to
+load lightly). The component owns persistent state and configuration.
+The server-core hooks are the smallest interfaces that let both live
+as out-of-tree-ish loadables.</p>
+<h2 id="glossary">Glossary<a class="headerlink" href="#glossary" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Channel</strong></td>
+<td>A named replication relationship on the binlog server. Each channel collects one upstream source into its own subdirectory under the storage root. Created with <code>CHANGE REPLICATION SOURCE ... FOR CHANNEL '&lt;name&gt;'</code>.</td>
+</tr>
+<tr>
+<td><strong>Archive</strong></td>
+<td>The on-disk materialisation of a channel's collected binlog files. Lives at <code>&lt;storage-uri&gt;/&lt;channel-name&gt;/&lt;source-binlog-name&gt;</code> and is byte-identical to the upstream's binlog.</td>
+</tr>
+<tr>
+<td><strong><code>binlog.index</code></strong></td>
+<td>A line-per-filename index file the archive maintains under each channel directory, matching what MySQL itself maintains for its own binary log.</td>
+</tr>
+<tr>
+<td><strong>FDE</strong></td>
+<td>The Format Description Event (event type 15). The first event in every binlog file; declares format version, server version, checksum algorithm. The binlog server re-uses the FDE the source sends so the on-disk file is a valid standalone binlog.</td>
+</tr>
+<tr>
+<td><strong>Watermark / <code>last_source_log_pos</code></strong></td>
+<td>The largest <code>log_pos</code> value (byte offset within the current upstream binlog file) that the binlog server has durably appended to its archive. Events that arrive with <code>log_pos &lt;= watermark</code> on the same file are treated as duplicates and dropped.</td>
+</tr>
+<tr>
+<td><strong><code>default_storage_uri</code></strong></td>
+<td>The fallback URI used when a channel is created with <code>BINLOG_SERVER=1</code> but no <code>BINLOG_SERVER_STORAGE_URI</code> of its own. Typically <code>file:///var/binlog-store/</code>.</td>
+</tr>
+<tr>
+<td><strong><code>ChannelState</code></strong></td>
+<td>The per-channel I/O bookkeeping struct inside <code>BinlogArchive</code> &mdash; mutex, current file, watermark, checksum flag, indexed-file set, event counters, fsync fd. Held in <code>shared_ptr</code> inside a registry map; per-channel mutex isolates appends on different channels.</td>
+</tr>
+<tr>
+<td><strong><code>BinlogArchive</code></strong></td>
+<td>The top-level archive object inside the component. Owns the per-channel registry and the binlog protocol logic (event parsing, FDE caching, source-rotate handling, deduplication, crash recovery).</td>
+</tr>
+</tbody>
+</table>
+<h2 id="what-it-explicitly-is-not">What it explicitly is NOT<a class="headerlink" href="#what-it-explicitly-is-not" title="Permanent link">&#x00B6;</a></h2>
+<ul>
+<li><strong>Not a replication group member.</strong> No group-replication semantics,
+  no certification, no conflict detection. The binlog server is a
+  pure pipe.</li>
+<li><strong>Not a backup product.</strong> The archive is a verbatim copy of the
+  source's binlog files; no backup verification, retention policy, or
+  restore tooling is bundled.</li>
+<li><strong>Not a transform engine.</strong> Events are forwarded byte-for-byte,
+  modulo the deduplication watermark and the FDE handling that makes
+  each archive file a valid standalone binlog.</li>
+<li><strong>Not serving binlogs yet.</strong> Phase 1 is collection only. Serving
+  collected binlogs to downstream replicas is planned for Phase 2.</li>
+</ul>
+<h2 id="continue-reading">Continue reading<a class="headerlink" href="#continue-reading" title="Permanent link">&#x00B6;</a></h2>
+<ul>
+<li>Operating it day to day: <a href="user_guide.html">User guide</a>.</li>
+<li>How the pieces fit together: <a href="architecture.html">Architecture</a>.</li>
+<li>Implementation details, including the locking model and the on-disk
+  format: <a href="design.html">Low-level design</a>.</li>
+</ul>
+    <footer class="docfoot">
+      <span>Binlog Server documentation</span>
+      <span>Percona Server 9.6 &middot; GPL v2</span>
+    </footer>
+  </main>
+</div>
+</body>
+</html>

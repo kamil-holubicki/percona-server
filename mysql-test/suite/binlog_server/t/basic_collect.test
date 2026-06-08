@@ -1,0 +1,93 @@
+--source include/have_binlog_format_row.inc
+--source suite/binlog_server/inc/have_binlog_server.inc
+--source include/rpl/init_source_replica.inc
+
+--source include/rpl/connection_replica.inc
+--source suite/binlog_server/inc/binlog_server_suppressions.inc
+--source include/rpl/connection_source.inc
+
+# Test: Basic binlog collection via binlog server mode
+#
+# Verifies that:
+# 1. CHANGE REPLICATION SOURCE TO BINLOG_SERVER=1 syntax works
+# 2. The component can be installed and the plugin loaded
+# 3. Events written on source are collected into the binlog server storage
+# 4. The archive contains correct binlog files with proper content
+
+--echo
+--echo *** Setting up binlog server storage directory
+--let $storage_dir = $MYSQL_TMP_DIR/binlog_server_storage
+--mkdir $storage_dir
+
+--echo
+--echo *** Installing binlog server component and plugin on replica
+--source include/rpl/connection_replica.inc
+--source include/rpl/stop_replica.inc
+
+INSTALL COMPONENT 'file://component_binlog_server';
+
+INSTALL PLUGIN binlog_server_relay SONAME 'binlog_server_relay.so';
+
+--echo
+--echo *** Configuring replication channel with BINLOG_SERVER=1
+--replace_result $storage_dir STORAGE_DIR
+eval CHANGE REPLICATION SOURCE TO
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file://$storage_dir/',
+  SOURCE_AUTO_POSITION = 1;
+
+START REPLICA IO_THREAD;
+
+--echo
+--echo *** Waiting for IO thread to connect
+--let $wait_condition = SELECT COUNT(*) = 1 FROM performance_schema.replication_connection_status WHERE SERVICE_STATE = 'ON'
+--source include/wait_condition.inc
+
+--echo
+--echo *** Writing data on source
+--source include/rpl/connection_source.inc
+CREATE TABLE t1 (id INT PRIMARY KEY AUTO_INCREMENT, data VARCHAR(100));
+INSERT INTO t1 (data) VALUES ('row1'), ('row2'), ('row3');
+
+--echo
+--echo *** Waiting for replica to receive events
+--source include/rpl/connection_replica.inc
+--let $wait_condition = SELECT COUNT(*) = 1 FROM performance_schema.replication_connection_status WHERE RECEIVED_TRANSACTION_SET != ''
+--source include/wait_condition.inc
+
+--echo
+--echo *** Checking that archive files exist in storage
+--let $channel_dir = $storage_dir/_default
+--file_exists $channel_dir/binlog.index
+
+--echo
+--echo *** Verifying binlog.index has entries
+--let $index_content = `SELECT LOAD_FILE('$channel_dir/binlog.index')`
+if ($index_content == '') {
+  --die binlog.index is empty - no files were archived
+}
+
+--echo binlog.index contains entries - collection is working
+
+--echo
+--echo *** Cleanup
+--source include/rpl/connection_replica.inc
+STOP REPLICA IO_THREAD;
+
+--let $wait_condition = SELECT COUNT(*) = 1 FROM performance_schema.replication_connection_status WHERE SERVICE_STATE = 'OFF'
+--source include/wait_condition.inc
+
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 0, SOURCE_AUTO_POSITION = 1;
+
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+
+--source include/rpl/start_replica.inc
+
+--source include/rpl/connection_source.inc
+DROP TABLE t1;
+--source include/rpl/sync_to_replica.inc
+
+--force-rmdir $storage_dir
+
+--source include/rpl/deinit.inc

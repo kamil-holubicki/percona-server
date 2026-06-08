@@ -820,6 +820,14 @@ class Master_info : public Rpl_info {
   */
   bool is_gtid_only_mode() const;
 
+  void set_binlog_server_mode(bool binlog_server_mode);
+  bool is_binlog_server_mode() const;
+
+  void set_binlog_server_storage_uri(const char *storage_uri);
+  const char *get_binlog_server_storage_uri() const;
+
+  static constexpr size_t kBinlogServerStorageUriBufSize = 1024;
+
  private:
   /*
     Holds the relay log coordinates (file name and position) of the last master
@@ -833,6 +841,9 @@ class Master_info : public Rpl_info {
     transactions.
   */
   bool m_gtid_only_mode;
+
+  bool m_binlog_server_mode;
+  char m_binlog_server_storage_uri[kBinlogServerStorageUriBufSize];
 
   /**
     Are positions invalid. When true this means the values for

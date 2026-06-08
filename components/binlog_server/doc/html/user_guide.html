@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>User guide &middot; Binlog Server documentation</title>
+  <link rel="stylesheet" href="style.css?v=0fde0a3ddd">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>
+    document.addEventListener("DOMContentLoaded", function () {
+      if (window.mermaid) {
+        window.mermaid.initialize({
+          startOnLoad: true,
+          theme: "default",
+          themeVariables: {
+            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, system-ui',
+            primaryColor: "#fff8e1",
+            primaryBorderColor: "#f9a825",
+            primaryTextColor: "#5d4037",
+            lineColor: "#7b8a9b",
+            secondaryColor: "#e3f2fd",
+            tertiaryColor: "#e8f5e9"
+          },
+          flowchart: {
+            htmlLabels: true,
+            curve: "basis",
+            useMaxWidth: false,
+            nodeSpacing: 60,
+            rankSpacing: 70,
+            padding: 14
+          },
+          sequence: {
+            useMaxWidth: false,
+            actorMargin: 70,
+            boxMargin: 12,
+            messageMargin: 36
+          },
+          classDiagram: { useMaxWidth: false },
+          stateDiagram: { useMaxWidth: false },
+          gantt: { useMaxWidth: false }
+        });
+      }
+    });
+  </script>
+</head>
+<body>
+<div class="layout">
+  <aside class="nav">
+    <a href="index.html" class="brand">Binlog Server</a>
+    <div class="tagline">Percona Server 9.6 binlog collector: receive and persist.</div>
+    <div class="navhead">Documentation</div>
+    <ul>
+      <li><a href="index.html">Binlog Server</a></li>
+      <li><a href="overview.html">Overview</a></li>
+      <li><a href="user_guide.html" class="current">User guide</a></li>
+      <li><a href="architecture.html">Architecture</a></li>
+      <li><a href="design.html">Low-level design</a></li>
+    </ul>
+    <div class="navhead">Source</div>
+    <ul>
+      <li><a href="../../">components/binlog_server/</a></li>
+      <li><a href="../md/">markdown sources</a></li>
+    </ul>
+  </aside>
+  <main>
+<h1 id="user-guide">User guide<a class="headerlink" href="#user-guide" title="Permanent link">&#x00B6;</a></h1>
+<p><a href="index.html">&larr; Back to index</a> &middot;
+<a href="overview.html">Overview</a> &middot;
+<strong>User guide</strong> &middot;
+<a href="architecture.html">Architecture</a> &middot;
+<a href="design.html">Low-level design</a></p>
+<h2 id="contents">Contents<a class="headerlink" href="#contents" title="Permanent link">&#x00B6;</a></h2>
+<ul>
+<li><a href="#prerequisites">Prerequisites</a></li>
+<li><a href="#installation">Installation</a></li>
+<li><a href="#change-replication-source-additions">CHANGE REPLICATION SOURCE additions</a></li>
+<li><a href="#configuring-a-channel">Configuring a channel</a></li>
+<li><a href="#multi-channel-collection">Multi-channel collection</a></li>
+<li><a href="#stopping-and-restarting">Stopping and restarting</a></li>
+<li><a href="#resume-after-crash">Resume after crash</a></li>
+<li><a href="#day-2-operations">Day-2 operations</a></li>
+<li><a href="#uninstalling">Uninstalling</a></li>
+<li><a href="#troubleshooting">Troubleshooting</a></li>
+</ul>
+<h2 id="prerequisites">Prerequisites<a class="headerlink" href="#prerequisites" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Requirement</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Percona Server 9.6+</td>
+<td>Required for BINLOG_SERVER syntax support</td>
+</tr>
+<tr>
+<td><code>GTID_MODE = ON</code> on both source and binlog-server node</td>
+<td>GTID-based positioning is mandatory</td>
+</tr>
+<tr>
+<td><code>SOURCE_AUTO_POSITION = 1</code></td>
+<td>The only positioning mode supported by <code>BINLOG_SERVER=1</code></td>
+</tr>
+<tr>
+<td>Replication user on the upstream</td>
+<td>Standard <code>REPLICATION SLAVE</code> privilege</td>
+</tr>
+<tr>
+<td>Writeable directory for archive storage</td>
+<td>The component must be able to create subdirectories and files</td>
+</tr>
+</tbody>
+</table>
+<h2 id="installation">Installation<a class="headerlink" href="#installation" title="Permanent link">&#x00B6;</a></h2>
+<p>Load the component first (it provides the storage service), then the
+plugin (it acquires the service):</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">-- Load the component.</span>
+<span class="n">INSTALL</span><span class="w"> </span><span class="n">COMPONENT</span><span class="w"> </span><span class="s1">&#39;file://component_binlog_server&#39;</span><span class="p">;</span>
+
+<span class="c1">-- Load the plugin.</span>
+<span class="n">INSTALL</span><span class="w"> </span><span class="n">PLUGIN</span><span class="w"> </span><span class="n">binlog_server_relay</span><span class="w"> </span><span class="n">SONAME</span><span class="w"> </span><span class="s1">&#39;binlog_server_relay.so&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<div class="diagram">
+<div class="mermaid">
+sequenceDiagram
+    participant DBA
+    participant Server
+    participant Component as component_binlog_server
+    participant Plugin as binlog_server_relay
+
+    DBA->>Server: INSTALL COMPONENT
+    Server->>Component: init()
+    Component-->>Server: publishes binlog_server_storage service
+    DBA->>Server: INSTALL PLUGIN
+    Server->>Plugin: init()
+    Plugin-->>Server: acquires binlog_server_storage service
+    Plugin-->>Server: registers Binlog_relay_IO_observer
+</div>
+</div>
+<p><strong>Order matters.</strong> Installing the plugin before the component will
+succeed (the plugin gracefully handles a missing service), but events
+will not be stored until the component is loaded.</p>
+<h2 id="change-replication-source-additions">CHANGE REPLICATION SOURCE additions<a class="headerlink" href="#change-replication-source-additions" title="Permanent link">&#x00B6;</a></h2>
+<p>Two new clauses are available in <code>CHANGE REPLICATION SOURCE TO</code>:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">CHANGE</span><span class="w"> </span><span class="n">REPLICATION</span><span class="w"> </span><span class="k">SOURCE</span><span class="w"> </span><span class="k">TO</span>
+<span class="w">    </span><span class="p">...</span>
+<span class="w">    </span><span class="n">BINLOG_SERVER</span><span class="w">         </span><span class="o">=</span><span class="w"> </span><span class="err">{</span><span class="mi">0</span><span class="o">|</span><span class="mi">1</span><span class="err">}</span><span class="p">,</span>
+<span class="w">    </span><span class="n">BINLOG_SERVER_STORAGE_URI</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;&lt;uri&gt;&#39;</span>
+<span class="w">    </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;&lt;channel_name&gt;&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>Clause</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>BINLOG_SERVER</code></td>
+<td>Boolean (0/1)</td>
+<td>Enables binlog-server mode for the channel. When 1, the SQL thread is suppressed and events are routed to the storage component instead of the relay log.</td>
+</tr>
+<tr>
+<td><code>BINLOG_SERVER_STORAGE_URI</code></td>
+<td>String</td>
+<td>The storage URI for this channel. Currently only <code>file://</code> is supported. When empty or omitted, the component's <code>default_storage_uri</code> is used.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="validation-rules">Validation rules<a class="headerlink" href="#validation-rules" title="Permanent link">&#x00B6;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Rule</th>
+<th>Error</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>BINLOG_SERVER=1</code> requires <code>SOURCE_AUTO_POSITION=1</code></td>
+<td><code>ER_WRONG_VALUE_FOR_VAR</code></td>
+</tr>
+<tr>
+<td>Cannot disable <code>SOURCE_AUTO_POSITION</code> on an active BINLOG_SERVER channel</td>
+<td><code>ER_WRONG_VALUE_FOR_VAR</code></td>
+</tr>
+<tr>
+<td><code>BINLOG_SERVER=1</code> and <code>GTID_ONLY=1</code> are mutually exclusive</td>
+<td><code>ER_WRONG_VALUE_FOR_VAR</code></td>
+</tr>
+<tr>
+<td>URI must start with <code>file://</code></td>
+<td><code>ER_WRONG_VALUE_FOR_VAR</code></td>
+</tr>
+<tr>
+<td>URI length must be under 1024 bytes</td>
+<td><code>ER_WRONG_VALUE_FOR_VAR</code></td>
+</tr>
+<tr>
+<td><code>START REPLICA SQL_THREAD</code> is rejected on BINLOG_SERVER channels</td>
+<td><code>ER_SLAVE_CHANNEL_OPERATION_NOT_ALLOWED</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="configuring-a-channel">Configuring a channel<a class="headerlink" href="#configuring-a-channel" title="Permanent link">&#x00B6;</a></h2>
+<p>A minimal example connecting to an upstream:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">CHANGE</span><span class="w"> </span><span class="n">REPLICATION</span><span class="w"> </span><span class="k">SOURCE</span><span class="w"> </span><span class="k">TO</span>
+<span class="w">    </span><span class="n">SOURCE_HOST</span><span class="w">          </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;10.0.0.1&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_PORT</span><span class="w">          </span><span class="o">=</span><span class="w"> </span><span class="mi">3306</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_USER</span><span class="w">          </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;repl_user&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_PASSWORD</span><span class="w">      </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;secret&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_AUTO_POSITION</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="n">BINLOG_SERVER</span><span class="w">        </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="n">BINLOG_SERVER_STORAGE_URI</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;file:///data/binlog-archive/&#39;</span>
+<span class="w">    </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;prod_primary&#39;</span><span class="p">;</span>
+
+<span class="k">START</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="n">IO_THREAD</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;prod_primary&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>The component creates the directory structure:</p>
+<div class="codehilite"><pre><span></span><code>/data/binlog-archive/
+└── prod_primary/
+    ├── binlog.index
+    ├── binlog.000001
+    ├── binlog.000002
+    └── ...
+</code></pre></div>
+
+<p>File names mirror the source's binlog file names exactly.</p>
+<h2 id="multi-channel-collection">Multi-channel collection<a class="headerlink" href="#multi-channel-collection" title="Permanent link">&#x00B6;</a></h2>
+<p>Multiple channels can collect from different sources simultaneously:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">CHANGE</span><span class="w"> </span><span class="n">REPLICATION</span><span class="w"> </span><span class="k">SOURCE</span><span class="w"> </span><span class="k">TO</span>
+<span class="w">    </span><span class="n">SOURCE_HOST</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;src-a.example.com&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">SOURCE_PORT</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3306</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_USER</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;repl&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">SOURCE_PASSWORD</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;...&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_AUTO_POSITION</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">BINLOG_SERVER</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="n">BINLOG_SERVER_STORAGE_URI</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;file:///data/archive/&#39;</span>
+<span class="w">    </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+
+<span class="n">CHANGE</span><span class="w"> </span><span class="n">REPLICATION</span><span class="w"> </span><span class="k">SOURCE</span><span class="w"> </span><span class="k">TO</span>
+<span class="w">    </span><span class="n">SOURCE_HOST</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;src-b.example.com&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">SOURCE_PORT</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3306</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_USER</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;repl&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">SOURCE_PASSWORD</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;...&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_AUTO_POSITION</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">BINLOG_SERVER</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="n">BINLOG_SERVER_STORAGE_URI</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;file:///data/archive/&#39;</span>
+<span class="w">    </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_b&#39;</span><span class="p">;</span>
+
+<span class="k">START</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="n">IO_THREAD</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+<span class="k">START</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="n">IO_THREAD</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_b&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>Each channel gets its own subdirectory under the URI:</p>
+<div class="codehilite"><pre><span></span><code>/data/archive/
+├── src_a/
+│   ├── binlog.index
+│   └── binlog.000001
+└── src_b/
+    ├── binlog.index
+    └── binlog.000001
+</code></pre></div>
+
+<p>Channels are fully independent: they have separate mutexes, separate
+watermarks, and can be started/stopped independently.</p>
+<h2 id="stopping-and-restarting">Stopping and restarting<a class="headerlink" href="#stopping-and-restarting" title="Permanent link">&#x00B6;</a></h2>
+<div class="codehilite"><pre><span></span><code><span class="c1">-- Stop collection for a specific channel.</span>
+<span class="n">STOP</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="n">IO_THREAD</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+
+<span class="c1">-- Restart. Collection resumes from where it left off (GTID auto-pos).</span>
+<span class="k">START</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="n">IO_THREAD</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>On restart, the IO thread reconnects to the source using
+<code>SOURCE_AUTO_POSITION</code>. The watermark ensures no duplicate events are
+written to the archive.</p>
+<h2 id="resume-after-crash">Resume after crash<a class="headerlink" href="#resume-after-crash" title="Permanent link">&#x00B6;</a></h2>
+<p>If the server crashes or is killed, the archive is automatically
+recovered on the next <code>configure_channel</code> call (triggered by
+<code>CHANGE REPLICATION SOURCE</code> or server restart with persisted channels):</p>
+<ol>
+<li>The index file (<code>binlog.index</code>) is read to discover existing files.</li>
+<li>The last file is opened and walked event-by-event to find the last
+   fully-written event.</li>
+<li>Any partial tail (incomplete event) is truncated.</li>
+<li>The watermark (<code>last_source_log_pos</code>) is restored from the last
+   complete event's <code>log_pos</code>.</li>
+<li>The FDE flag and checksum flag are re-derived from the file header.</li>
+</ol>
+<p>This guarantees that collection can resume seamlessly after any crash.</p>
+<h2 id="day-2-operations">Day-2 operations<a class="headerlink" href="#day-2-operations" title="Permanent link">&#x00B6;</a></h2>
+<h3 id="checking-channel-status">Checking channel status<a class="headerlink" href="#checking-channel-status" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1">-- Standard replication status.</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">performance_schema</span><span class="p">.</span><span class="n">replication_connection_status</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">CHANNEL_NAME</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+
+<span class="c1">-- Archive directory listing (from the shell).</span>
+<span class="n">ls</span><span class="w"> </span><span class="o">-</span><span class="n">la</span><span class="w"> </span><span class="o">/</span><span class="k">data</span><span class="o">/</span><span class="n">archive</span><span class="o">/</span><span class="n">src_a</span><span class="o">/</span>
+<span class="n">cat</span><span class="w"> </span><span class="o">/</span><span class="k">data</span><span class="o">/</span><span class="n">archive</span><span class="o">/</span><span class="n">src_a</span><span class="o">/</span><span class="n">binlog</span><span class="p">.</span><span class="k">index</span>
+</code></pre></div>
+
+<h3 id="removing-a-channel">Removing a channel<a class="headerlink" href="#removing-a-channel" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="n">STOP</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="n">IO_THREAD</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+<span class="k">RESET</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="k">ALL</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p><code>RESET REPLICA ALL</code> removes the channel's configuration from
+<code>mysql.slave_master_info</code>. The on-disk archive files are <strong>not</strong>
+automatically deleted; remove them manually if no longer needed.</p>
+<h3 id="disabling-binlog-server-mode">Disabling binlog-server mode<a class="headerlink" href="#disabling-binlog-server-mode" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="n">STOP</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="n">IO_THREAD</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+<span class="n">CHANGE</span><span class="w"> </span><span class="n">REPLICATION</span><span class="w"> </span><span class="k">SOURCE</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="n">BINLOG_SERVER</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>The channel reverts to a normal replication channel.</p>
+<h2 id="uninstalling">Uninstalling<a class="headerlink" href="#uninstalling" title="Permanent link">&#x00B6;</a></h2>
+<p>Remove in reverse order (plugin first, component second):</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">-- 1) Stop all binlog-server channels.</span>
+<span class="n">STOP</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="n">IO_THREAD</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+
+<span class="c1">-- 2) Remove channel configuration.</span>
+<span class="k">RESET</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="k">ALL</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+
+<span class="c1">-- 3) Unload in reverse order.</span>
+<span class="n">UNINSTALL</span><span class="w"> </span><span class="n">PLUGIN</span><span class="w"> </span><span class="n">binlog_server_relay</span><span class="p">;</span>
+<span class="n">UNINSTALL</span><span class="w"> </span><span class="n">COMPONENT</span><span class="w"> </span><span class="s1">&#39;file://component_binlog_server&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<div class="diagram">
+<div class="mermaid">
+sequenceDiagram
+    participant DBA
+    participant Server
+    participant Plugin as binlog_server_relay
+    participant Component as component_binlog_server
+
+    DBA->>Server: STOP REPLICA / RESET REPLICA ALL
+    DBA->>Server: UNINSTALL PLUGIN
+    Server->>Plugin: deinit()
+    Plugin-->>Server: releases binlog_server_storage service
+    Plugin-->>Server: unregisters observer
+    DBA->>Server: UNINSTALL COMPONENT
+    Server->>Component: deinit()
+    Component-->>Server: unpublishes binlog_server_storage service
+</div>
+</div>
+<h2 id="troubleshooting">Troubleshooting<a class="headerlink" href="#troubleshooting" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Probable cause</th>
+<th>Resolution</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>INSTALL PLUGIN</code> succeeds but no events stored</td>
+<td>Component not loaded, or loaded after plugin</td>
+<td>Load component first: <code>INSTALL COMPONENT 'file://component_binlog_server'</code></td>
+</tr>
+<tr>
+<td><code>ER_WRONG_VALUE_FOR_VAR</code> on <code>CHANGE REPLICATION SOURCE</code></td>
+<td>Missing <code>SOURCE_AUTO_POSITION=1</code>, or bad URI format</td>
+<td>Ensure auto-position is enabled; URI must start with <code>file://</code></td>
+</tr>
+<tr>
+<td>Archive directory empty after <code>START REPLICA</code></td>
+<td>Channel configured with <code>BINLOG_SERVER=0</code> or URI path not writable</td>
+<td>Check <code>BINLOG_SERVER=1</code> and directory permissions</td>
+</tr>
+<tr>
+<td>Events appear duplicated</td>
+<td>Should not happen &mdash; watermark deduplication is automatic</td>
+<td>Check error log for crash-recovery messages; file a bug if duplicates persist</td>
+</tr>
+<tr>
+<td><code>cannot configure channel</code> in error log</td>
+<td>Component loaded but URI invalid or empty</td>
+<td>Set a valid <code>BINLOG_SERVER_STORAGE_URI</code> or ensure <code>default_storage_uri</code> is configured</td>
+</tr>
+<tr>
+<td><code>START REPLICA SQL_THREAD</code> rejected</td>
+<td>Expected: SQL thread is suppressed on BINLOG_SERVER channels</td>
+<td>Use <code>START REPLICA IO_THREAD</code> only</td>
+</tr>
+</tbody>
+</table>
+    <footer class="docfoot">
+      <span>Binlog Server documentation</span>
+      <span>Percona Server 9.6 &middot; GPL v2</span>
+    </footer>
+  </main>
+</div>
+</body>
+</html>
