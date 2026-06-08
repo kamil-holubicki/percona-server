@@ -13,6 +13,8 @@
 - [CHANGE REPLICATION SOURCE additions](#change-replication-source-additions)
 - [Configuring a channel](#configuring-a-channel)
 - [Multi-channel collection](#multi-channel-collection)
+- [Serving to downstream replicas](#serving-to-downstream-replicas)
+- [System variables](#system-variables)
 - [Stopping and restarting](#stopping-and-restarting)
 - [Resume after crash](#resume-after-crash)
 - [Day-2 operations](#day-2-operations)
@@ -159,6 +161,109 @@ Each channel gets its own subdirectory under the URI:
 Channels are fully independent: they have separate mutexes, separate
 watermarks, and can be started/stopped independently.
 
+## Serving to downstream replicas
+
+Once the binlog server is collecting from an upstream source, you can
+configure downstream replicas to replicate from the binlog server node
+instead of directly from the source.
+
+### Setting the serve channel
+
+Tell the component which channel's archive to serve:
+
+```sql
+-- On the binlog-server node:
+SET GLOBAL binlog_server.default_serve_channel = 'src_a';
+```
+
+All downstream replicas connecting to this node will be served events
+from the `src_a` channel archive.
+
+### Configuring a downstream replica
+
+On each downstream replica, point at the binlog-server node using
+standard replication commands:
+
+```sql
+-- On the downstream replica:
+CHANGE REPLICATION SOURCE TO
+    SOURCE_HOST          = 'binlog-server.example.com',
+    SOURCE_PORT          = 3306,
+    SOURCE_USER          = 'repl_user',
+    SOURCE_PASSWORD      = 'secret',
+    SOURCE_AUTO_POSITION = 1;
+
+START REPLICA;
+```
+
+The downstream replica sees the binlog server as an ordinary MySQL
+source. `SOURCE_AUTO_POSITION=1` is required so that GTID-based
+positioning works correctly.
+
+### How it works
+
+```mermaid
+sequenceDiagram
+    participant Replica as downstream replica
+    participant Server as binlog-server mysqld
+    participant Component as component_binlog_server<br/>(ArchiveSender)
+    participant Disk as archive on disk
+
+    Replica->>Server: COM_BINLOG_DUMP_GTID<br/>(replica_executed_gtids)
+    Server->>Server: dispatch slot check
+    Server->>Component: archive_sender_dispatch(thd, ...)
+    Component->>Component: resolve channel from<br/>default_serve_channel
+    Component->>Disk: reverse-walk binlog.index<br/>to find GTID start file
+    loop Stream events
+        Component->>Disk: read event from archive file
+        Component->>Component: GTID filter:<br/>skip if already in replica's set
+        Component->>Replica: send_event(event_bytes)
+    end
+    Note over Component,Replica: When caught up to the active file,<br/>tail-follow with heartbeat every 5s
+```
+
+### Multiple downstream replicas
+
+The binlog server supports multiple concurrent downstream replicas.
+Each dump connection gets its own `ArchiveDumpSession` with
+independent file handles and GTID state. There is no shared lock
+between dump sessions, so they do not block each other.
+
+```sql
+-- Replica A:
+CHANGE REPLICATION SOURCE TO
+    SOURCE_HOST = 'binlog-server.example.com', SOURCE_PORT = 3306,
+    SOURCE_USER = 'repl', SOURCE_AUTO_POSITION = 1;
+START REPLICA;
+
+-- Replica B (same binlog server, independent session):
+CHANGE REPLICATION SOURCE TO
+    SOURCE_HOST = 'binlog-server.example.com', SOURCE_PORT = 3306,
+    SOURCE_USER = 'repl', SOURCE_AUTO_POSITION = 1;
+START REPLICA;
+```
+
+### GTID AUTO_POSITION behaviour
+
+When a downstream replica connects with `SOURCE_AUTO_POSITION=1`:
+
+1. The replica sends its `Executed_Gtid_Set` (all GTIDs it has already
+   applied).
+2. The `ArchiveSender` reverse-walks the archive's `binlog.index`,
+   reading `Previous_gtids_log_event` from each file to find the
+   earliest file that contains transactions not in the replica's set.
+3. Events belonging to transactions already in the replica's set are
+   filtered (not sent).
+4. Once all historical events are sent, the session tail-follows the
+   active file, polling for new data and sending heartbeats.
+
+## System variables
+
+| Variable | Scope | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `binlog_server.default_storage_uri` | GLOBAL | String | `''` | Default `file://` URI for new BINLOG_SERVER channels |
+| `binlog_server.default_serve_channel` | GLOBAL | String | `''` | Channel name whose archive is served to downstream replicas |
+
 ## Stopping and restarting
 
 ```sql
@@ -266,3 +371,6 @@ sequenceDiagram
 | Events appear duplicated | Should not happen &mdash; watermark deduplication is automatic | Check error log for crash-recovery messages; file a bug if duplicates persist |
 | `cannot configure channel` in error log | Component loaded but URI invalid or empty | Set a valid `BINLOG_SERVER_STORAGE_URI` or ensure `default_storage_uri` is configured |
 | `START REPLICA SQL_THREAD` rejected | Expected: SQL thread is suppressed on BINLOG_SERVER channels | Use `START REPLICA IO_THREAD` only |
+| Downstream replica connects but gets no events | `default_serve_channel` not set or set to wrong channel | `SET GLOBAL binlog_server.default_serve_channel = '<channel>'` |
+| Downstream replica falls behind | Archive on disk may not have caught up yet | Verify the upstream IO thread is running and the channel is actively collecting |
+| Downstream shows `Got fatal error 1236` | Archive files may have been manually deleted or purged | Rebuild the replica or ensure the archive contains the required GTID range |

@@ -14,6 +14,7 @@
   - [Source tree layout](#source-tree-layout)
   - [Hook lifetimes](#hook-lifetimes)
   - [End-to-end sequence: configure &rarr; collect](#end-to-end-sequence-configure--collect)
+  - [End-to-end sequence: serve to downstream](#end-to-end-sequence-serve-to-downstream)
   - [Component service ABI](#component-service-abi)
 - [Storage backend abstraction](#storage-backend-abstraction)
 - [Module map](#module-map)
@@ -21,6 +22,7 @@
 - [Data flow](#data-flow)
   - [Configure path](#configure-path)
   - [Collect path](#collect-path)
+  - [Serve path](#serve-path)
 - [Threading model](#threading-model)
 - [Scalability characteristics](#scalability-characteristics)
 - [Failure model](#failure-model)
@@ -51,16 +53,17 @@ flowchart TB
 
 | Piece | Type | Role |
 | --- | --- | --- |
-| Server core | Built into `mysqld` | Grammar extensions, `Master_info` persistence, channel validation, SQL-thread suppression, notify dispatch. |
+| Server core | Built into `mysqld` | Grammar extensions, `Master_info` persistence, channel validation, SQL-thread suppression, notify dispatch, dump handler dispatch slot. |
 | `binlog_server_relay` | MySQL plugin (`.so`) | IO-thread observer. Intercepts every queued event and feeds bytes into the component via the service. |
-| `component_binlog_server` | MySQL component (`.so`) | Storage engine. Owns the on-disk archive, manages per-channel state, crash recovery. Publishes the `binlog_server_storage` service. |
+| `component_binlog_server` | MySQL component (`.so`) | Storage and serving engine. Owns the on-disk archive, manages per-channel state, crash recovery, and serves archived events to downstream replicas. Publishes `binlog_server_storage` and acquires `mysql_binlog_dump_handler_register` + `mysql_binlog_dump_handler_io`. |
 
 The server core is the **thinnest possible shim**: it adds two new
 clauses to `CHANGE REPLICATION SOURCE`, persists them to
 `mysql.slave_master_info`, suppresses the SQL thread for
-BINLOG_SERVER channels, and calls `binlog_server_storage::configure_channel`
-at change-time. It does not know about files, directories, or
-binlog event formats.
+BINLOG_SERVER channels, calls `binlog_server_storage::configure_channel`
+at change-time, and provides the **dump handler dispatch slot** that
+lets the component intercept `COM_BINLOG_DUMP_GTID` requests. It does
+not know about files, directories, or binlog event formats.
 
 ## How it plugs into MySQL
 
@@ -73,6 +76,9 @@ binlog event formats.
 | 3 | SQL-thread suppression | `sql/rpl_replica.cc` | `start_slave_threads()` masks the SQL thread |
 | 4 | Notify dispatch | `sql/rpl_binlog_server.{h,cc}` | `change_receive_options()` calls this |
 | 5 | `Binlog_relay_IO_observer` | Plugin API | Server fires on IO-thread lifecycle and per-event |
+| 6 | Dump handler dispatch slot | `sql/binlog_dump_handler.{h,cc}` | `mysql_binlog_send()` in `sql/rpl_source.cc` checks slot before `Binlog_sender` |
+| 7 | `mysql_binlog_dump_handler_register` service | `sql/server_component/` | Component calls `install`/`uninstall` at init/deinit |
+| 8 | `mysql_binlog_dump_handler_io` service | `sql/server_component/` | Component calls `send_event`/`flush` to push data to the dump connection |
 
 ### Source tree layout
 
@@ -83,11 +89,21 @@ percona-server/
 │   ├── rpl_binlog_server.cc          # acquires binlog_server_storage, calls configure/append
 │   ├── rpl_mi.h / rpl_mi.cc         # Master_info + BINLOG_SERVER fields
 │   ├── rpl_replica.cc               # SQL-thread suppression + validation
+│   ├── rpl_source.cc                # dispatch check in mysql_binlog_send()
+│   ├── binlog_dump_handler.h         # dispatch slot declaration
+│   ├── binlog_dump_handler.cc        # atomic function pointer slot implementation
 │   ├── sql_yacc.yy / lex.h          # grammar additions
 │   └── sql_lex.h / sql_lex.cc       # LEX_SOURCE_INFO fields
 │
+├── sql/server_component/
+│   ├── mysql_binlog_dump_handler_imp.h   # service bridge declarations
+│   └── mysql_binlog_dump_handler_imp.cc  # install/uninstall + send_event/flush bridge
+│
 ├── include/mysql/components/services/
-│   └── binlog_server_storage.h       # service ABI definition
+│   ├── binlog_server_storage.h                       # collection service ABI
+│   ├── mysql_binlog_dump_handler_register.h          # dump handler registration service ABI
+│   ├── mysql_binlog_dump_handler_io.h                # dump handler I/O service ABI
+│   └── bits/mysql_binlog_dump_handler_bits.h         # shared types (fn ptr, checksum enum)
 │
 ├── plugin/binlog_server_relay/
 │   ├── CMakeLists.txt
@@ -96,7 +112,10 @@ percona-server/
 ├── components/binlog_server/
 │   ├── CMakeLists.txt
 │   ├── binlog_server_component.cc    # component entry point (init/deinit)
-│   ├── binlog_archive.h / .cc       # BinlogArchive + ChannelState
+│   ├── binlog_archive.h / .cc       # BinlogArchive + ChannelState (collection)
+│   ├── archive_sender.h / .cc       # ArchiveSender + ArchiveDumpSession (serving)
+│   ├── gtid_set.h / .cc             # component-local GTID set implementation
+│   ├── server_services.h            # thin aliases for acquired server services
 │   ├── storage_backend.h            # StorageBackend abstract interface
 │   ├── file_storage.h / .cc         # FileStorage (file:// implementation)
 │   ├── log_helpers.h / .cc          # bslog / bslog_code logging wrappers
@@ -118,12 +137,21 @@ percona-server/
     │   ├── basic_collect.test
     │   ├── multi_channel.test
     │   ├── resume_collection.test
-    │   └── syntax.test
+    │   ├── syntax.test
+    │   ├── binlog_server_chained.test         # Phase 2: 3-server chain
+    │   ├── binlog_server_chained.cnf
+    │   ├── binlog_server_multi_replica.test   # Phase 2: multi-downstream
+    │   ├── binlog_server_multi_replica.cnf
+    │   ├── binlog_server_xa_rotation.test     # Phase 2: XA + rotation + STOP suppression
+    │   └── binlog_server_xa_rotation.cnf
     └── r/
         ├── basic_collect.result
         ├── multi_channel.result
         ├── resume_collection.result
-        └── syntax.result
+        ├── syntax.result
+        ├── binlog_server_chained.result
+        ├── binlog_server_multi_replica.result
+        └── binlog_server_xa_rotation.result
 ```
 
 ### Hook lifetimes
@@ -197,6 +225,54 @@ sequenceDiagram
     Component->>Disk: flush + fsync + close
 ```
 
+### End-to-end sequence: serve to downstream
+
+```mermaid
+sequenceDiagram
+    participant Replica as downstream replica
+    participant Server as mysqld (sql/)
+    participant Bridge as mysql_binlog_dump_handler_imp
+    participant Component as component_binlog_server
+    participant Disk as filesystem
+
+    Note over Replica,Disk: Phase: Dump request arrives
+    Replica->>Server: COM_BINLOG_DUMP_GTID<br/>(executed_gtids, flags)
+    Server->>Server: mysql_binlog_send()
+    Server->>Server: get_binlog_dump_handler() → non-null
+    Server->>Bridge: handler(thd, log_ident, pos, gtid_set, flags)
+    Bridge->>Bridge: snapshot user, checksum, replica_executed
+    Bridge->>Component: archive_sender_dispatch(user_data, thd, ...)
+
+    Note over Component,Disk: Phase: Resolve start position
+    Component->>Component: resolve channel (default_serve_channel)
+    Component->>Disk: read binlog.index
+    loop Reverse walk index files
+        Component->>Disk: open file, read Previous_gtids_log_event
+        Component->>Component: is subset of replica_executed?
+    end
+    Component->>Component: found start file + offset
+
+    Note over Component,Disk: Phase: Stream events
+    loop For each archived event
+        Component->>Disk: read event
+        Component->>Component: GTID filter (skip if in replica set)
+        Component->>Bridge: send_event(thd, buf, len)
+        Bridge->>Replica: NET write
+    end
+
+    Note over Component,Replica: Phase: Tail-follow
+    loop While not killed
+        Component->>Disk: poll for new data (100ms sleep)
+        alt New data available
+            Component->>Bridge: send_event(thd, buf, len)
+            Bridge->>Replica: NET write
+        else No new data
+            Component->>Bridge: send_event(heartbeat)
+            Bridge->>Replica: heartbeat (every 5s)
+        end
+    end
+```
+
 ### Component service ABI
 
 The `binlog_server_storage` service is defined in
@@ -218,6 +294,31 @@ END_SERVICE_DEFINITION(binlog_server_storage)
 | `configure_channel` | Server notify + plugin `thread_start` | `CHANGE REPLICATION SOURCE` or IO-thread start |
 | `append_event` | Plugin `after_queue_event` | Every binlog event received from the upstream |
 | `close_channel` | Plugin `thread_stop` / `after_reset_slave` | IO thread stops or channel is reset |
+
+The **dump handler services** are defined in
+`include/mysql/components/services/mysql_binlog_dump_handler_register.h`
+and `mysql_binlog_dump_handler_io.h`:
+
+```c
+BEGIN_SERVICE_DEFINITION(mysql_binlog_dump_handler_register)
+  DECLARE_METHOD(int, install,
+    (mysql_binlog_dump_handler_fn callback, void *user_data));
+  DECLARE_METHOD(int, uninstall, ());
+END_SERVICE_DEFINITION(mysql_binlog_dump_handler_register)
+
+BEGIN_SERVICE_DEFINITION(mysql_binlog_dump_handler_io)
+  DECLARE_METHOD(int, send_event,
+    (MYSQL_THD thd, const unsigned char *buf, unsigned long len));
+  DECLARE_METHOD(int, flush, (MYSQL_THD thd));
+END_SERVICE_DEFINITION(mysql_binlog_dump_handler_io)
+```
+
+| Service | Method | Called by | When |
+| --- | --- | --- | --- |
+| `_register` | `install` | Component `init()` | Component loads; installs the dispatch callback |
+| `_register` | `uninstall` | Component `deinit()` | Component unloads; clears the dispatch slot |
+| `_io` | `send_event` | `ArchiveDumpSession` | Sends an event buffer to the dump connection's NET |
+| `_io` | `flush` | `ArchiveDumpSession` | Flushes the NET write buffer |
 
 ## Storage backend abstraction
 
@@ -254,8 +355,11 @@ backends requires no changes to the binlog protocol logic.
 
 | Module | Responsibility | Key state |
 | --- | --- | --- |
-| `binlog_server_component.cc` | Component lifecycle (init/deinit), service registration | `log_bi`, `log_bs` |
+| `binlog_server_component.cc` | Component lifecycle (init/deinit), service registration, sysvar management | `log_bi`, `log_bs`, `sysvar_default_serve_channel` |
 | `binlog_archive.{h,cc}` | Per-channel state management, event parsing, rotation, crash recovery, watermark | `BinlogArchive` singleton, `ChannelState` map |
+| `archive_sender.{h,cc}` | Dump handler dispatch, dump session lifecycle, GTID-based serving | `ArchiveSender` singleton, `ArchiveDumpSession` per connection |
+| `gtid_set.{h,cc}` | Component-local GTID set: parsing, binary decode, interval management, subset checks | `binlog_server::gtid::Gtid_set` |
+| `server_services.h` | Thin C++ aliases for acquired server services (`dump_handler_register`, `_io`, `thd_kill_handler`) | Service placeholders |
 | `file_storage.{h,cc}` | File I/O abstraction for `file://` URIs | Directory creation, path management |
 | `storage_backend.h` | Abstract interface for storage backends | &mdash; |
 | `log_helpers.{h,cc}` | Structured logging helpers (`bslog`, `bslog_code`) | &mdash; |
@@ -273,6 +377,18 @@ stateDiagram-v2
     ComponentLoaded --> Unloaded : UNINSTALL COMPONENT
     Collecting --> Recovering : crash / kill
     Recovering --> Collecting : restart + START REPLICA
+
+    note right of ComponentLoaded
+        Dump handler dispatch slot is active
+        as soon as component is loaded.
+        Downstream replicas can connect even
+        without the relay plugin.
+    end note
+
+    ComponentLoaded --> Serving : downstream connects<br/>(COM_BINLOG_DUMP_GTID)
+    Serving --> ComponentLoaded : downstream disconnects
+    Collecting --> CollectingAndServing : downstream connects
+    CollectingAndServing --> Collecting : downstream disconnects
 ```
 
 ## Data flow
@@ -326,17 +442,60 @@ flowchart TD
     SYNC -- no --> UPDATE
 ```
 
+### Serve path
+
+```mermaid
+flowchart TD
+    classDef hot fill:#ffebee,stroke:#c62828
+    classDef io fill:#e8f5e9,stroke:#43a047
+    classDef decision fill:#fff8e1,stroke:#f9a825
+
+    DUMP["COM_BINLOG_DUMP_GTID arrives"]:::hot
+    SLOT{"dispatch slot set?"}:::decision
+    BUILTIN["Binlog_sender (standard path)"]
+    BRIDGE["service_handler_bridge"]:::hot
+    RESOLVE["Resolve channel from<br/>default_serve_channel"]:::hot
+    WALK["Reverse-walk binlog.index<br/>read Previous_gtids_log_event"]:::io
+    START["Found start file + offset"]:::io
+    LOOP["Read next event from archive"]:::io
+    FILTER{"GTID in replica<br/>executed set?"}:::decision
+    SKIP["Skip event"]
+    SEND["send_event(thd, buf, len)"]:::hot
+    EOF{"End of file?"}:::decision
+    NEXT["Open next file from index"]:::io
+    TAIL{"Active file?"}:::decision
+    POLL["Sleep 100ms, poll for new data"]
+    HEARTBEAT["Heartbeat (every 5s)"]
+    KILL{"THD killed?"}:::decision
+    DONE["Session ends"]
+
+    DUMP --> SLOT
+    SLOT -- no --> BUILTIN
+    SLOT -- yes --> BRIDGE --> RESOLVE --> WALK --> START --> LOOP
+    LOOP --> FILTER
+    FILTER -- yes --> SKIP --> LOOP
+    FILTER -- no --> SEND --> EOF
+    EOF -- no --> LOOP
+    EOF -- yes --> NEXT
+    NEXT --> TAIL
+    TAIL -- no --> LOOP
+    TAIL -- yes --> POLL --> KILL
+    KILL -- yes --> DONE
+    KILL -- no --> HEARTBEAT --> LOOP
+```
+
 ## Threading model
 
 | Thread | What it does | Concurrency |
 | --- | --- | --- |
 | IO thread (per channel) | Receives events from upstream, fires observer callbacks | One per channel; each channel has its own `ChannelState` mutex |
 | Client thread (DBA) | `CHANGE REPLICATION SOURCE` &rarr; `configure_channel` | Serialised by the channel's mutex |
+| Dump thread (per downstream) | Handles a `COM_BINLOG_DUMP_GTID` connection; runs `ArchiveDumpSession` | One per connected downstream replica; independent file handles, no shared lock |
 
-There is no background thread owned by the component. All work happens
-on the IO thread or the client thread that issues configuration
-statements. This means the component adds zero new threads to the
-server.
+The component does not spawn its own background threads. Collection
+work happens on the IO thread. Serving work happens on the dump thread
+that MySQL creates for each replica connection. Configuration work
+happens on the client thread.
 
 ## Scalability characteristics
 
@@ -344,8 +503,9 @@ server.
 | --- | --- |
 | **Channels** | Linear scaling. Each channel has its own mutex and file handles. No global lock. |
 | **Throughput per channel** | Bounded by disk I/O. The `fsync` at transaction boundaries is the bottleneck; between Xid events, writes are buffered by the OS page cache. |
-| **Memory** | O(channels × index-size). The in-memory index set (`std::set<std::string>`) is proportional to the number of binlog files per channel. |
-| **Disk** | Linear in event volume. One-to-one with the upstream's binlog byte volume. |
+| **Downstream replicas** | Linear scaling. Each dump session has independent file handles. No shared lock between sessions. Disk reads are sequential within each session. |
+| **Memory** | O(channels × index-size + dump-sessions × gtid-set-size). The in-memory index set is proportional to the number of binlog files per channel; each dump session holds a copy of the replica's GTID set for filtering. |
+| **Disk** | Linear in event volume. One-to-one with the upstream's binlog byte volume. Serving is read-only on the archive. |
 
 ## Failure model
 
@@ -355,6 +515,10 @@ server.
 | **Process crash** | Last partial event may be incomplete | Crash recovery truncates the partial tail and restores the watermark on next `configure_channel` |
 | **Disk full** | `write()` or `fsync()` fails | Plugin logs the error; IO thread remains running but events are lost until space is freed. Manual intervention required. |
 | **Component unloaded while collecting** | Plugin's service calls return failure | Plugin logs the failure and returns 0 (no IO-thread crash). Events are silently dropped until component is reloaded. |
+| **Component unloaded while serving** | Dispatch slot is cleared (`uninstall`) | New dump requests fall through to the built-in `Binlog_sender`. In-flight dump sessions terminate gracefully (send_event returns error). |
+| **Downstream replica disconnects** | Dump session thread detects NET error | Session ends cleanly; no impact on other sessions or collection. |
+| **Downstream connects before archive exists** | `ArchiveSender` cannot resolve the channel directory | Returns `false` from dispatch; falls through to built-in `Binlog_sender` (which may also fail, producing a standard error). |
+| **KILL on dump thread** | THD kill handler fires | `ArchiveDumpSession` detects killed state via `mysql_thd_kill_handler` service and exits the tail-follow loop. |
 
 ## Persistence and recovery
 

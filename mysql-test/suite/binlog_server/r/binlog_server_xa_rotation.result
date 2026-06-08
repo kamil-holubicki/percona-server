@@ -1,0 +1,132 @@
+include/rpl/init.inc [topology=1->2->3]
+
+# ============================================================
+# Configure server_2 as the binlog server
+# ============================================================
+[connection server_2]
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL PLUGIN binlog_server_relay SONAME 'BINLOG_SERVER_RELAY';
+SET GLOBAL binlog_server.default_serve_channel = 'upstream';
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = SOURCE_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1,
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORE/'
+  FOR CHANNEL 'upstream';
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA IO_THREAD FOR CHANNEL 'upstream';
+include/rpl/wait_for_receiver_to_start.inc [FOR CHANNEL 'upstream']
+
+# ============================================================
+# Configure server_3 as a plain replica of server_2
+# ============================================================
+[connection server_3]
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = COLLECTOR_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1;
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA;
+include/rpl/wait_for_replica_to_start.inc
+
+# ============================================================
+# Phase 1: Regular DML on source
+# ============================================================
+[connection server_1]
+CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(50)) ENGINE = InnoDB;
+INSERT INTO t1 VALUES (1, 'before_xa');
+
+# ============================================================
+# Phase 2: XA transaction on source
+# ============================================================
+XA START 'xa_test_1';
+INSERT INTO t1 VALUES (2, 'xa_row_a');
+INSERT INTO t1 VALUES (3, 'xa_row_b');
+XA END 'xa_test_1';
+XA PREPARE 'xa_test_1';
+XA COMMIT 'xa_test_1';
+
+# ============================================================
+# Phase 3: Force binlog rotation (writes STOP + new file)
+# ============================================================
+FLUSH BINARY LOGS;
+
+# ============================================================
+# Phase 4: More DML after rotation
+# ============================================================
+INSERT INTO t1 VALUES (4, 'after_rotation_1');
+INSERT INTO t1 VALUES (5, 'after_rotation_2');
+
+# ============================================================
+# Phase 5: Another XA transaction after rotation
+# ============================================================
+XA START 'xa_test_2';
+INSERT INTO t1 VALUES (6, 'xa2_row');
+XA END 'xa_test_2';
+XA PREPARE 'xa_test_2';
+XA COMMIT 'xa_test_2';
+INSERT INTO t1 VALUES (7, 'final_row');
+
+# ---- Sync binlog server IO thread
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'upstream']
+
+# ---- Sync downstream replica
+[connection server_1]
+include/rpl/sync_to_replica.inc
+
+# ============================================================
+# Verify: downstream has all 7 rows
+# ============================================================
+[connection server_3]
+SELECT COUNT(*) AS expected_7 FROM t1;
+expected_7
+7
+SELECT id, val FROM t1 ORDER BY id;
+id	val
+1	before_xa
+2	xa_row_a
+3	xa_row_b
+4	after_rotation_1
+5	after_rotation_2
+6	xa2_row
+7	final_row
+
+# ============================================================
+# Verify: GTID sets match (source == replica)
+# ============================================================
+[connection server_1]
+[connection server_3]
+include/assert.inc [Replica GTID set should match source]
+
+# ============================================================
+# Verify: replication survived the rotation (implies STOP was suppressed)
+# ============================================================
+[connection server_3]
+include/assert.inc [Replica IO thread should still be running (STOP did not disconnect)]
+
+# ============================================================
+# Tear down
+# ============================================================
+[connection server_3]
+STOP REPLICA;
+include/rpl/wait_for_replica_to_stop.inc
+RESET REPLICA ALL;
+[connection server_2]
+STOP REPLICA IO_THREAD FOR CHANNEL 'upstream';
+include/rpl/wait_for_receiver_to_stop.inc [FOR CHANNEL 'upstream']
+RESET REPLICA ALL FOR CHANNEL 'upstream';
+SET GLOBAL binlog_server.default_serve_channel = '';
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+[connection server_1]
+DROP TABLE t1;
+[connection server_3]
+DROP TABLE t1;
+include/rpl/deinit.inc

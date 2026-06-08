@@ -110,6 +110,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 #include "mysql_string_service_imp.h"
 #include "mysql_system_variable_reader_imp.h"
 #include "mysql_system_variable_update_imp.h"
+#include "mysql_binlog_dump_handler_imp.h"
 #include "mysql_thd_attributes_imp.h"
 #include "mysql_thd_kill_handler_imp.h"
 #include "mysql_thd_store_imp.h"
@@ -534,6 +535,16 @@ mysql_system_variable_reader_imp::get END_SERVICE_IMPLEMENTATION();
 BEGIN_SERVICE_IMPLEMENTATION(mysql_server, mysql_thd_attributes)
 mysql_thd_attributes_imp::get,
     mysql_thd_attributes_imp::set END_SERVICE_IMPLEMENTATION();
+
+BEGIN_SERVICE_IMPLEMENTATION(mysql_server, mysql_binlog_dump_handler_register)
+mysql_binlog_dump_handler_register_imp::install,
+    mysql_binlog_dump_handler_register_imp::uninstall
+END_SERVICE_IMPLEMENTATION();
+
+BEGIN_SERVICE_IMPLEMENTATION(mysql_server, mysql_binlog_dump_handler_io)
+mysql_binlog_dump_handler_io_imp::send_event,
+    mysql_binlog_dump_handler_io_imp::flush
+END_SERVICE_IMPLEMENTATION();
 
 BEGIN_SERVICE_IMPLEMENTATION(mysql_server,
                              mysql_audit_print_service_longlong_data_source)
@@ -1136,6 +1147,8 @@ PROVIDES_SERVICE(mysql_server_path_filter, dynamic_loader_scheme_file),
     PROVIDES_SERVICE(mysql_server, field_varchar_access_v1),
     PROVIDES_SERVICE(mysql_server, field_any_access_v1),
     PROVIDES_SERVICE(mysql_server, mysql_thd_attributes),
+    PROVIDES_SERVICE(mysql_server, mysql_binlog_dump_handler_register),
+    PROVIDES_SERVICE(mysql_server, mysql_binlog_dump_handler_io),
     PROVIDES_SERVICE(mysql_server,
                      mysql_audit_print_service_longlong_data_source),
     PROVIDES_SERVICE(mysql_server,

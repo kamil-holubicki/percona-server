@@ -85,6 +85,12 @@
 <li><a href="#sanitize-binlog-name">Sanitize binlog name</a></li>
 <li><a href="#observer-plugin-lifecycle">Observer plugin lifecycle</a></li>
 <li><a href="#configure-time-notify-path">Configure-time notify path</a></li>
+<li><a href="#dump-handler-dispatch-slot">Dump handler dispatch slot</a></li>
+<li><a href="#archivesender-and-archivedumpsession">ArchiveSender and ArchiveDumpSession</a></li>
+<li><a href="#component-local-gtid-set">Component-local GTID set</a></li>
+<li><a href="#serve-path-gtid-position-resolution">Serve path: GTID position resolution</a></li>
+<li><a href="#serve-path-event-streaming-and-filtering">Serve path: event streaming and filtering</a></li>
+<li><a href="#serve-path-tail-follow-and-heartbeat">Serve path: tail-follow and heartbeat</a></li>
 <li><a href="#error-code-catalogue">Error code catalogue</a></li>
 <li><a href="#build-wiring">Build wiring</a></li>
 </ul>
@@ -99,7 +105,7 @@
 <tbody>
 <tr>
 <td><code>components/binlog_server/binlog_server_component.cc</code></td>
-<td>Component entry point. Publishes <code>binlog_server_storage</code> service, acquires logging services.</td>
+<td>Component entry point. Publishes <code>binlog_server_storage</code> service, acquires logging + dump handler services, registers sysvars.</td>
 </tr>
 <tr>
 <td><code>components/binlog_server/binlog_archive.h</code></td>
@@ -108,6 +114,26 @@
 <tr>
 <td><code>components/binlog_server/binlog_archive.cc</code></td>
 <td>Implements configure, append, close, crash recovery, rotation, deduplication.</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/archive_sender.h</code></td>
+<td>Declares <code>ArchiveSender</code> singleton, <code>UserChannelMap</code>, dispatch callback.</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/archive_sender.cc</code></td>
+<td>Implements <code>ArchiveSender</code>, <code>ArchiveDumpSession</code> (GTID resolution, event streaming, tail-follow).</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/gtid_set.h</code></td>
+<td>Declares <code>binlog_server::gtid::Gtid_set</code> (component-local GTID implementation).</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/gtid_set.cc</code></td>
+<td>Implements GTID text parsing, binary decoding, interval management, subset checks.</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/server_services.h</code></td>
+<td>Thin C++ aliases for <code>mysql_binlog_dump_handler_register</code>, <code>_io</code>, <code>mysql_thd_kill_handler</code>.</td>
 </tr>
 <tr>
 <td><code>components/binlog_server/storage_backend.h</code></td>
@@ -142,8 +168,36 @@
 <td>Service acquisition, <code>binlog_server_notify_channel_config()</code>.</td>
 </tr>
 <tr>
+<td><code>sql/binlog_dump_handler.h</code></td>
+<td>Declares <code>set_binlog_dump_handler()</code>, <code>get_binlog_dump_handler()</code>, typedef.</td>
+</tr>
+<tr>
+<td><code>sql/binlog_dump_handler.cc</code></td>
+<td>Atomic function pointer slot implementation.</td>
+</tr>
+<tr>
+<td><code>sql/server_component/mysql_binlog_dump_handler_imp.h</code></td>
+<td>Declares service bridge classes.</td>
+</tr>
+<tr>
+<td><code>sql/server_component/mysql_binlog_dump_handler_imp.cc</code></td>
+<td>Implements <code>install</code>/<code>uninstall</code>, <code>send_event</code>/<code>flush</code>, <code>service_handler_bridge</code>.</td>
+</tr>
+<tr>
 <td><code>include/mysql/components/services/binlog_server_storage.h</code></td>
-<td>Service ABI (<code>configure_channel</code>, <code>append_event</code>, <code>close_channel</code>).</td>
+<td>Collection service ABI (<code>configure_channel</code>, <code>append_event</code>, <code>close_channel</code>).</td>
+</tr>
+<tr>
+<td><code>include/mysql/components/services/mysql_binlog_dump_handler_register.h</code></td>
+<td>Dump handler registration service ABI (<code>install</code>, <code>uninstall</code>).</td>
+</tr>
+<tr>
+<td><code>include/mysql/components/services/mysql_binlog_dump_handler_io.h</code></td>
+<td>Dump handler I/O service ABI (<code>send_event</code>, <code>flush</code>).</td>
+</tr>
+<tr>
+<td><code>include/mysql/components/services/bits/mysql_binlog_dump_handler_bits.h</code></td>
+<td>Shared types: <code>mysql_binlog_dump_handler_fn</code>, checksum enum.</td>
 </tr>
 </tbody>
 </table>
@@ -438,6 +492,209 @@ thread. Errors are logged via the error log with stable error codes.</p>
 configuration is still persisted to <code>Master_info</code>; when the component
 is loaded later, the next <code>thread_start</code> will trigger
 <code>configure_channel</code> again.</p>
+<h2 id="dump-handler-dispatch-slot">Dump handler dispatch slot<a class="headerlink" href="#dump-handler-dispatch-slot" title="Permanent link">&#x00B6;</a></h2>
+<p>The dispatch slot is a <strong>two-layer atomic</strong> mechanism:</p>
+<h3 id="layer-1-internal-slot-sqlbinlog_dump_handlerhcc">Layer 1: Internal slot (<code>sql/binlog_dump_handler.{h,cc}</code>)<a class="headerlink" href="#layer-1-internal-slot-sqlbinlog_dump_handlerhcc" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="k">static</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">atomic</span><span class="o">&lt;</span><span class="n">Binlog_dump_handler_func</span><span class="o">&gt;</span><span class="w"> </span><span class="n">g_binlog_dump_handler</span><span class="p">{</span><span class="nb">nullptr</span><span class="p">};</span>
+
+<span class="kt">void</span><span class="w"> </span><span class="nf">set_binlog_dump_handler</span><span class="p">(</span><span class="n">Binlog_dump_handler_func</span><span class="w"> </span><span class="n">f</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="n">g_binlog_dump_handler</span><span class="p">.</span><span class="n">store</span><span class="p">(</span><span class="n">f</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">memory_order_release</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="n">Binlog_dump_handler_func</span><span class="w"> </span><span class="nf">get_binlog_dump_handler</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="n">g_binlog_dump_handler</span><span class="p">.</span><span class="n">load</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">memory_order_acquire</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>The internal function pointer type:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">using</span><span class="w"> </span><span class="n">Binlog_dump_handler_func</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="p">)(</span><span class="n">THD</span><span class="w"> </span><span class="o">*</span><span class="n">thd</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">log_ident</span><span class="p">,</span>
+<span class="w">                                          </span><span class="n">my_off_t</span><span class="w"> </span><span class="n">pos</span><span class="p">,</span><span class="w"> </span><span class="n">Gtid_set</span><span class="w"> </span><span class="o">*</span><span class="n">gtid_set</span><span class="p">,</span>
+<span class="w">                                          </span><span class="n">uint32</span><span class="w"> </span><span class="n">flags</span><span class="p">);</span>
+</code></pre></div>
+
+<h3 id="layer-2-service-bridge-sqlserver_componentmysql_binlog_dump_handler_impcc">Layer 2: Service bridge (<code>sql/server_component/mysql_binlog_dump_handler_imp.cc</code>)<a class="headerlink" href="#layer-2-service-bridge-sqlserver_componentmysql_binlog_dump_handler_impcc" title="Permanent link">&#x00B6;</a></h3>
+<p>The service bridge translates between the internal slot and the
+component's callback signature:</p>
+<div class="codehilite"><pre><span></span><code>install(callback, user_data):
+  1. Store callback + user_data in file-static variables
+  2. set_binlog_dump_handler(&amp;service_handler_bridge)
+
+uninstall():
+  1. set_binlog_dump_handler(nullptr)
+  2. Clear callback + user_data
+
+service_handler_bridge(thd, log_ident, pos, gtid_set, flags):
+  1. snapshot_user(thd)          → capture replica_user from THD
+  2. snapshot_checksum(thd)      → read negotiated checksum from user variable
+  3. snapshot_replica_executed() → serialize gtid_set to text
+  4. Call stored callback(user_data, thd, log_ident, pos, gtid_text,
+                          flags, server_id, replica_server_id, checksum, user)
+</code></pre></div>
+
+<h3 id="dispatch-site-sqlrpl_sourcecc">Dispatch site (<code>sql/rpl_source.cc</code>)<a class="headerlink" href="#dispatch-site-sqlrpl_sourcecc" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1">// In mysql_binlog_send(), before constructing Binlog_sender:</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="k">auto</span><span class="w"> </span><span class="n">handler</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">get_binlog_dump_handler</span><span class="p">();</span><span class="w"> </span><span class="n">handler</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nb">nullptr</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">handler</span><span class="p">(</span><span class="n">thd</span><span class="p">,</span><span class="w"> </span><span class="n">log_ident</span><span class="p">,</span><span class="w"> </span><span class="n">pos</span><span class="p">,</span><span class="w"> </span><span class="n">gtid_set</span><span class="p">,</span><span class="w"> </span><span class="n">flags</span><span class="p">))</span>
+<span class="w">    </span><span class="k">return</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="c1">// ... standard Binlog_sender path ...</span>
+</code></pre></div>
+
+<p>If the handler returns <code>true</code>, the dump request was fully served by
+the component and the function returns without touching <code>Binlog_sender</code>.
+If it returns <code>false</code>, the request falls through to the built-in path.</p>
+<h2 id="archivesender-and-archivedumpsession">ArchiveSender and ArchiveDumpSession<a class="headerlink" href="#archivesender-and-archivedumpsession" title="Permanent link">&#x00B6;</a></h2>
+<h3 id="archivesender-singleton">ArchiveSender (singleton)<a class="headerlink" href="#archivesender-singleton" title="Permanent link">&#x00B6;</a></h3>
+<ul>
+<li>Holds a pointer to <code>BinlogArchive</code> (set at component init).</li>
+<li>Holds the <code>default_serve_channel</code> string (updated via sysvar callback).</li>
+<li>The <code>dispatch()</code> method is the callback installed into the dump handler slot.</li>
+</ul>
+<h3 id="archivedumpsession-per-connection">ArchiveDumpSession (per connection)<a class="headerlink" href="#archivedumpsession-per-connection" title="Permanent link">&#x00B6;</a></h3>
+<p>Created on the dump thread when a <code>COM_BINLOG_DUMP_GTID</code> request
+arrives and the dispatch slot fires. Lifetime is exactly one dump
+request.</p>
+<p>Key state:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">ArchiveDumpSession</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="n">MYSQL_THD</span><span class="w"> </span><span class="n">thd_</span><span class="p">;</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">channel_</span><span class="p">;</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">base_dir_</span><span class="p">;</span>
+<span class="w">  </span><span class="n">binlog_server</span><span class="o">::</span><span class="n">gtid</span><span class="o">::</span><span class="n">Gtid_set</span><span class="w"> </span><span class="n">replica_executed_</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">uint32_t</span><span class="w"> </span><span class="n">source_server_id_</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">uint32_t</span><span class="w"> </span><span class="n">replica_server_id_</span><span class="p">;</span>
+<span class="w">  </span><span class="n">mysql_binlog_dump_handler_checksum_alg</span><span class="w"> </span><span class="n">checksum_alg_</span><span class="p">;</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&gt;</span><span class="w"> </span><span class="n">index_files_</span><span class="p">;</span><span class="w">  </span><span class="c1">// from binlog.index</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">ifstream</span><span class="w"> </span><span class="n">file_</span><span class="p">;</span><span class="w">                    </span><span class="c1">// current read position</span>
+<span class="p">};</span>
+</code></pre></div>
+
+<p>Key methods:</p>
+<ul>
+<li><code>run()</code> — orchestrates the full dump lifecycle</li>
+<li><code>resolve_start_position()</code> — reverse-walks index using GTID set</li>
+<li><code>stream_file()</code> — reads events from one archive file, filters, sends</li>
+<li><code>tail_follow()</code> — polls active file for new data, sends heartbeats</li>
+</ul>
+<h2 id="component-local-gtid-set">Component-local GTID set<a class="headerlink" href="#component-local-gtid-set" title="Permanent link">&#x00B6;</a></h2>
+<p>The component cannot use the server's <code>Gtid_set</code> class (it is part
+of the server core, not exported as a service). Instead, a self-contained
+implementation lives in <code>gtid_set.{h,cc}</code>:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">namespace</span><span class="w"> </span><span class="nn">binlog_server</span><span class="o">::</span><span class="nn">gtid</span><span class="w"> </span><span class="p">{</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">Gtid_set</span><span class="w"> </span><span class="p">{</span>
+<span class="w"> </span><span class="k">public</span><span class="o">:</span>
+<span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="n">parse_text</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">text</span><span class="p">);</span>
+<span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="nf">decode_previous_gtids_event</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">uint8_t</span><span class="w"> </span><span class="o">*</span><span class="n">payload</span><span class="p">,</span><span class="w"> </span><span class="kt">size_t</span><span class="w"> </span><span class="n">len</span><span class="p">);</span>
+<span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="nf">contains</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="o">&amp;</span><span class="n">uuid</span><span class="p">,</span><span class="w"> </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">gno</span><span class="p">)</span><span class="w"> </span><span class="k">const</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="nf">is_subset_of</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">Gtid_set</span><span class="w"> </span><span class="o">&amp;</span><span class="n">super</span><span class="p">)</span><span class="w"> </span><span class="k">const</span><span class="p">;</span>
+<span class="w">  </span><span class="kt">void</span><span class="w"> </span><span class="nf">add</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="o">&amp;</span><span class="n">uuid</span><span class="p">,</span><span class="w"> </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">gno</span><span class="p">);</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="nf">to_string</span><span class="p">()</span><span class="w"> </span><span class="k">const</span><span class="p">;</span>
+
+<span class="w"> </span><span class="k">private</span><span class="o">:</span>
+<span class="w">  </span><span class="c1">// uuid → sorted vector of [start, end) intervals</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">map</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">pair</span><span class="o">&lt;</span><span class="kt">uint64_t</span><span class="p">,</span><span class="w"> </span><span class="kt">uint64_t</span><span class="o">&gt;&gt;&gt;</span><span class="w"> </span><span class="n">sets_</span><span class="p">;</span>
+<span class="p">};</span>
+
+<span class="p">}</span><span class="w">  </span><span class="c1">// namespace binlog_server::gtid</span>
+</code></pre></div>
+
+<p>Design decisions:</p>
+<ul>
+<li><strong>Text parsing</strong> handles the standard <code>uuid:interval[:interval][,...]</code>
+  format that MySQL uses in <code>SHOW MASTER STATUS</code> and
+  <code>Executed_Gtid_Set</code>.</li>
+<li><strong>Binary decoding</strong> reads <code>Previous_gtids_log_event</code> payloads
+  (the on-disk format: <code>n_sids</code> followed by <code>{uuid, n_intervals,
+  intervals[]}</code> tuples).</li>
+<li><strong>Interval merging</strong> is performed on <code>add()</code> to keep the set compact.</li>
+<li><strong>Subset check</strong> is used during reverse-walk to determine the start
+  file.</li>
+<li><strong>Contains check</strong> is used per-event to decide whether to skip a
+  GTID-tagged transaction group.</li>
+</ul>
+<h2 id="serve-path-gtid-position-resolution">Serve path: GTID position resolution<a class="headerlink" href="#serve-path-gtid-position-resolution" title="Permanent link">&#x00B6;</a></h2>
+<div class="codehilite"><pre><span></span><code>resolve_start_position():
+  1. Read binlog.index → populate index_files_ (ordered)
+  2. For i = index_files_.size()-1 downto 0:
+     a. Open index_files_[i]
+     b. Skip 4-byte magic, read FDE
+     c. Read Previous_gtids_log_event (type 35, always second event)
+     d. Decode into a Gtid_set (file_previous_gtids)
+     e. If file_previous_gtids.is_subset_of(replica_executed_):
+        → this file is the start point (all prior GTIDs are already
+          applied; this file may contain new ones)
+        → break
+  3. If no file found: start from the very first file in the index
+  4. Open the start file, position after FDE
+</code></pre></div>
+
+<p>This mirrors the standard MySQL algorithm for GTID AUTO_POSITION, but
+operates on the archive's <code>Previous_gtids_log_event</code> rather than the
+server's own binlog.</p>
+<h2 id="serve-path-event-streaming-and-filtering">Serve path: event streaming and filtering<a class="headerlink" href="#serve-path-event-streaming-and-filtering" title="Permanent link">&#x00B6;</a></h2>
+<div class="codehilite"><pre><span></span><code>send_event_loop():
+  Loop (while not killed):
+     a. Read 19-byte event header
+     b. If not enough bytes → EOF handling (see tail-follow)
+     c. If event_len &lt; 19 → log corrupt header error, abort session
+     d. Read full event (event_length bytes)
+     e. should_skip_event() check:
+        - Artificial flag (0x20) → skip
+        - FDE (type 15) → skip (already shipped)
+        - STOP (type 3) on non-active file → skip (suppress mid-archive)
+        - Heartbeat v1/v2 (type 27/41) → skip (upstream heartbeats)
+        - GTID (type 33/42): check replica_executed_.contains(uuid, gno)
+          → if yes: set skip_group = true
+        - If skip_group: skip event; reset on XID (16) or XA_PREPARE (38)
+     f. If skipped: increment counter + maybe_send_idle_heartbeat()
+        (sends heartbeat if heartbeat_period elapsed since last sent event,
+        preventing replica timeout during long skip runs)
+     g. send_event(thd_, event_buf, event_len)
+        - On failure: log type/len/file/pos, abort session
+     h. On real ROTATE: advance to next index file, ship new FDE
+</code></pre></div>
+
+<h2 id="serve-path-tail-follow-and-heartbeat">Serve path: tail-follow and heartbeat<a class="headerlink" href="#serve-path-tail-follow-and-heartbeat" title="Permanent link">&#x00B6;</a></h2>
+<p>When the dump session reaches the last (active) file in the index and
+exhausts all currently-written data:</p>
+<div class="codehilite"><pre><span></span><code>wait_for_more_data():
+  deadline = now() + heartbeat_period (5s)
+  Loop (until deadline):
+    1. Check if THD is killed → return false (abort)
+    2. Re-stat file → if size &gt; current_pos → return true (data ready)
+    3. Refresh index → if next file appeared → return true
+    4. Sleep 100ms
+  Return true (no data, caller sends heartbeat)
+
+On EOF in send_event_loop():
+  If BINLOG_DUMP_NON_BLOCK flag set → return (session ends cleanly)
+  Otherwise → wait_for_more_data() + send heartbeat
+</code></pre></div>
+
+<h3 id="heartbeat-version-selection">Heartbeat version selection<a class="headerlink" href="#heartbeat-version-selection" title="Permanent link">&#x00B6;</a></h3>
+<p>The session inspects the dump request flags:</p>
+<ul>
+<li><code>USE_HEARTBEAT_EVENT_V2</code> (bit 1) set → emit type 41 (Heartbeat v2)
+  with length-prefixed log filename in payload</li>
+<li>Otherwise → emit type 27 (Heartbeat v1) with raw filename bytes</li>
+</ul>
+<p>Both carry <code>log_pos = current_pos</code> and CRC32 if <code>m_has_checksum</code>.</p>
+<h3 id="binlog_dump_non_block">BINLOG_DUMP_NON_BLOCK<a class="headerlink" href="#binlog_dump_non_block" title="Permanent link">&#x00B6;</a></h3>
+<p>When the <code>BINLOG_DUMP_NON_BLOCK</code> flag (bit 0) is set in the dump
+request, the session returns successfully when it reaches the end of
+available data instead of tail-following. This is the mode used by
+<code>mysqlbinlog --read-from-remote-server</code>.</p>
+<h3 id="idle-heartbeats-during-event-skipping">Idle heartbeats during event skipping<a class="headerlink" href="#idle-heartbeats-during-event-skipping" title="Permanent link">&#x00B6;</a></h3>
+<p>When the GTID filter is skipping a long run of already-applied
+transactions, <code>maybe_send_idle_heartbeat()</code> is called after each
+skipped event. If <code>heartbeat_period</code> (5s) has elapsed since the last
+event was sent to the replica, a heartbeat is emitted. This prevents
+the replica from timing out its connection during large skip runs
+(e.g., a fresh replica with an empty executed set connecting to an
+archive where most GTIDs are already applied from a prior lifecycle).</p>
+<p>The <code>mysql_thd_kill_handler</code> service is used to register a callback
+on the THD so that <code>KILL &lt;connection_id&gt;</code> or server shutdown
+immediately sets a flag that the tail-follow loop checks.</p>
 <h2 id="error-code-catalogue">Error code catalogue<a class="headerlink" href="#error-code-catalogue" title="Permanent link">&#x00B6;</a></h2>
 <table>
 <thead>
@@ -495,6 +752,8 @@ the standard timestamp and subsystem prefix.</p>
 <div class="codehilite"><pre><span></span><code><span class="nb">MYSQL_ADD_COMPONENT</span><span class="p">(</span><span class="s">binlog_server</span>
 <span class="w">  </span><span class="s">binlog_server_component.cc</span>
 <span class="w">  </span><span class="s">binlog_archive.cc</span>
+<span class="w">  </span><span class="s">archive_sender.cc</span>
+<span class="w">  </span><span class="s">gtid_set.cc</span>
 <span class="w">  </span><span class="s">file_storage.cc</span>
 <span class="w">  </span><span class="s">log_helpers.cc</span>
 <span class="w">  </span><span class="s">MODULE_ONLY</span>
@@ -510,9 +769,27 @@ the standard timestamp and subsystem prefix.</p>
 </code></pre></div>
 
 <h3 id="server-core">Server core<a class="headerlink" href="#server-core" title="Permanent link">&#x00B6;</a></h3>
-<p><code>sql/rpl_binlog_server.cc</code> is added to the <code>sql/CMakeLists.txt</code> source
-list. It compiles into <code>mysqld</code> directly and uses standard component
-service acquisition at runtime.</p>
+<ul>
+<li><code>sql/rpl_binlog_server.cc</code> — notify layer, compiles into <code>mysqld</code>.</li>
+<li><code>sql/binlog_dump_handler.cc</code> — dispatch slot, compiles into <code>mysqld</code>.</li>
+<li><code>sql/server_component/mysql_binlog_dump_handler_imp.cc</code> — service bridge,
+  compiles into <code>mysqld</code>. Registered in <code>server_component.cc</code>.</li>
+</ul>
+<p>All are added to their respective <code>CMakeLists.txt</code> source lists.</p>
+<h3 id="service-registration">Service registration<a class="headerlink" href="#service-registration" title="Permanent link">&#x00B6;</a></h3>
+<p>In <code>sql/server_component/server_component.cc</code>, the dump handler
+services are registered:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">BEGIN_SERVICE_IMPLEMENTATION</span><span class="p">(</span><span class="n">mysql_server</span><span class="p">,</span><span class="w"> </span><span class="n">mysql_binlog_dump_handler_register</span><span class="p">)</span>
+<span class="w">  </span><span class="n">mysql_binlog_dump_handler_register_imp</span><span class="o">::</span><span class="n">install</span><span class="p">,</span>
+<span class="w">  </span><span class="n">mysql_binlog_dump_handler_register_imp</span><span class="o">::</span><span class="n">uninstall</span><span class="p">,</span>
+<span class="n">END_SERVICE_IMPLEMENTATION</span><span class="p">()</span>
+
+<span class="n">BEGIN_SERVICE_IMPLEMENTATION</span><span class="p">(</span><span class="n">mysql_server</span><span class="p">,</span><span class="w"> </span><span class="n">mysql_binlog_dump_handler_io</span><span class="p">)</span>
+<span class="w">  </span><span class="n">mysql_binlog_dump_handler_io_imp</span><span class="o">::</span><span class="n">send_event</span><span class="p">,</span>
+<span class="w">  </span><span class="n">mysql_binlog_dump_handler_io_imp</span><span class="o">::</span><span class="n">flush</span><span class="p">,</span>
+<span class="n">END_SERVICE_IMPLEMENTATION</span><span class="p">()</span>
+</code></pre></div>
+
 <h3 id="system-table-ddl">System table DDL<a class="headerlink" href="#system-table-ddl" title="Permanent link">&#x00B6;</a></h3>
 <p><code>scripts/mysql_system_tables.sql</code> and <code>scripts/mysql_system_tables_fix.sql</code>
 add the <code>Binlog_server</code> (BOOLEAN) and <code>Binlog_server_storage_uri</code> (TEXT)

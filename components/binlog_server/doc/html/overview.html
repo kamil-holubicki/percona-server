@@ -70,18 +70,21 @@
 <a href="design.html">Low-level design</a></p>
 <h2 id="what-it-is">What it is<a class="headerlink" href="#what-it-is" title="Permanent link">&#x00B6;</a></h2>
 <p>A <strong>binlog server</strong> is a Percona Server 9.6 instance that has been
-configured to do one thing:</p>
+configured to do two things:</p>
 <ol>
 <li><strong>Collect</strong> the raw binary log of one or more upstream MySQL sources
    into local on-disk files.</li>
+<li><strong>Serve</strong> those collected binlogs to downstream replicas via the
+   standard MySQL replication protocol (<code>COM_BINLOG_DUMP_GTID</code>).</li>
 </ol>
 <p>Crucially, it does <strong>not</strong> apply anything. Connecting an IO thread to
 an upstream and disabling the SQL thread is not a new idea (the
 <code>BINLOG_SERVER</code> clause on <code>CHANGE REPLICATION SOURCE</code> is exactly that
 switch); the rest of the work &mdash; persistent on-disk archives with a
 deduplication watermark, crash recovery, idempotent index management,
-and transaction-boundary durability &mdash; is what makes the result an
-actual <em>server</em> rather than just a stalled replica.</p>
+transaction-boundary durability, and a full-featured serving engine
+with GTID AUTO_POSITION &mdash; is what makes the result an actual
+<em>server</em> rather than just a stalled replica.</p>
 <h2 id="why-it-exists">Why it exists<a class="headerlink" href="#why-it-exists" title="Permanent link">&#x00B6;</a></h2>
 <p>The classic MySQL replication topology pushes a lot of moving parts to
 the edge:</p>
@@ -94,7 +97,8 @@ the edge:</p>
 <li>Cross-WAN replicas pay the WAN cost on every fanout.</li>
 </ul>
 <p>A binlog server inverts that: the source ships one stream to one node
-that <strong>persists</strong> it.</p>
+that <strong>persists</strong> it, and that node serves it to all downstream
+replicas on demand.</p>
 <div class="diagram">
 <div class="mermaid">
 flowchart LR
@@ -115,7 +119,10 @@ flowchart LR
         direction LR
         S2["source"]:::src
         H["binlog server<br/>(persistent buffer)"]:::hub
-        S2 --> H
+        R2A["replica"]:::rep
+        R2B["replica"]:::rep
+        R2C["replica"]:::rep
+        S2 --> H --> R2A & R2B & R2C
     end
 </div>
 </div>
@@ -123,18 +130,21 @@ flowchart LR
 <h3 id="1-replica-fan-out-at-scale">1. Replica fan-out at scale<a class="headerlink" href="#1-replica-fan-out-at-scale" title="Permanent link">&#x00B6;</a></h3>
 <p>One source, many replicas. Without a binlog server the source pays for
 every reader. With a binlog server the source pays for one TCP
-connection.</p>
+connection; downstream replicas all read from the binlog server's
+local archive.</p>
 <h3 id="2-cross-region-buffer">2. Cross-region buffer<a class="headerlink" href="#2-cross-region-buffer" title="Permanent link">&#x00B6;</a></h3>
 <p>Keep an in-region binlog server warm with a single WAN-bound dump
-thread; replicas in the remote region will later talk to the local
-binlog server over the LAN.</p>
+thread; replicas in the remote region talk to the local binlog server
+over the LAN instead of crossing the WAN individually.</p>
 <h3 id="3-fan-in-multi-source-archiver">3. Fan-in (multi-source archiver)<a class="headerlink" href="#3-fan-in-multi-source-archiver" title="Permanent link">&#x00B6;</a></h3>
 <p>A single binlog server collects multiple unrelated sources into
 side-by-side archives, each on its own channel.</p>
 <h3 id="4-offline-replica-catch-up-buffer">4. Offline replica catch-up buffer<a class="headerlink" href="#4-offline-replica-catch-up-buffer" title="Permanent link">&#x00B6;</a></h3>
 <p>A replica that has been offline for hours can resume from the binlog
 server's on-disk archive even after the upstream has rotated out the
-binlogs it needed.</p>
+binlogs it needed. The binlog server serves from whatever it has
+persisted, using GTID AUTO_POSITION to skip already-applied
+transactions.</p>
 <h2 id="whats-in-the-box">What's in the box<a class="headerlink" href="#whats-in-the-box" title="Permanent link">&#x00B6;</a></h2>
 <p>Two artifacts ship with this feature, both built from the same source
 tree:</p>
@@ -148,25 +158,31 @@ flowchart TB
 
     subgraph BIN["mysqld (binlog-server node)"]
         direction TB
-        SRV["server core<br/>sql/rpl_binlog_server.{h,cc}<br/>+ CHANGE REPLICATION SOURCE<br/>BINLOG_SERVER clause"]:::srv
+        SRV["server core<br/>sql/rpl_binlog_server.{h,cc}<br/>sql/binlog_dump_handler.{h,cc}<br/>+ CHANGE REPLICATION SOURCE<br/>BINLOG_SERVER clause"]:::srv
         PLG["binlog_server_relay<br/>(MySQL plugin)<br/>Binlog_relay_IO_observer hooks"]:::plg
-        CMP["component_binlog_server<br/>(MySQL component)<br/>BinlogArchive + FileStorage"]:::cmp
+        CMP["component_binlog_server<br/>(MySQL component)<br/>BinlogArchive + ArchiveSender"]:::cmp
     end
 
     SVC1[("binlog_server_storage<br/>component service")]:::ext
+    SVC2[("mysql_binlog_dump_handler_register<br/>+ _io services")]:::ext
 
     PLG -- "acquires" --> SVC1
     CMP -- "publishes" --> SVC1
     SRV -- "notify on<br/>CHANGE REPLICATION SOURCE" --> SVC1
+    SRV -- "provides" --> SVC2
+    CMP -- "acquires" --> SVC2
 </div>
 </div>
 <ul>
 <li><strong>Server core</strong> (in <code>sql/</code>). The <code>BINLOG_SERVER</code> and
   <code>BINLOG_SERVER_STORAGE_URI</code> clauses for <code>CHANGE REPLICATION SOURCE</code>,
   the persistence in <code>mysql.slave_master_info</code>, the SQL-thread
-  suppression mask, and the notify layer
-  (<code>sql/rpl_binlog_server.{h,cc}</code>) that calls the storage service when
-  an operator runs <code>CHANGE REPLICATION SOURCE</code>.</li>
+  suppression mask, the notify layer (<code>sql/rpl_binlog_server.{h,cc}</code>)
+  that calls the storage service when an operator runs
+  <code>CHANGE REPLICATION SOURCE</code>, and the <strong>binlog dump handler dispatch
+  slot</strong> (<code>sql/binlog_dump_handler.{h,cc}</code>) that allows the component
+  to intercept <code>COM_BINLOG_DUMP_GTID</code> requests before the standard
+  <code>Binlog_sender</code>.</li>
 <li><strong><code>binlog_server_relay</code> plugin</strong> (in
   <code>plugin/binlog_server_relay/</code>). Registers itself as a
   <code>Binlog_relay_IO_observer</code>. Its <code>after_queue_event</code> callback fires
@@ -175,13 +191,16 @@ flowchart TB
   <code>thread_stop</code> / <code>after_reset_slave</code> so a stop/start cycle does the
   right thing.</li>
 <li><strong><code>component_binlog_server</code> component</strong> (in
-  <code>components/binlog_server/</code>). The actual storage engine. Owns the
-  on-disk archive, the per-channel state, and the <code>binlog_server_storage</code>
-  service implementation.</li>
+  <code>components/binlog_server/</code>). The storage and serving engine. Owns
+  the on-disk archive, the per-channel state, the
+  <code>binlog_server_storage</code> service implementation, and the
+  <strong><code>ArchiveSender</code></strong> that serves collected binlogs to downstream
+  replicas via the dump handler dispatch slot.</li>
 </ul>
 <p>The split is intentional. The relay plugin handles the IO-thread
 event-rate hot path (registered observer callbacks; cannot fail to
-load lightly). The component owns persistent state and configuration.
+load lightly). The component owns persistent state, configuration,
+and the serving engine.
 The server-core hooks are the smallest interfaces that let both live
 as out-of-tree-ish loadables.</p>
 <h2 id="glossary">Glossary<a class="headerlink" href="#glossary" title="Permanent link">&#x00B6;</a></h2>
@@ -218,12 +237,28 @@ as out-of-tree-ish loadables.</p>
 <td>The fallback URI used when a channel is created with <code>BINLOG_SERVER=1</code> but no <code>BINLOG_SERVER_STORAGE_URI</code> of its own. Typically <code>file:///var/binlog-store/</code>.</td>
 </tr>
 <tr>
+<td><strong><code>default_serve_channel</code></strong></td>
+<td>Sysvar (<code>binlog_server.default_serve_channel</code>) that names the channel whose archive is served to downstream replicas when they issue <code>COM_BINLOG_DUMP_GTID</code>.</td>
+</tr>
+<tr>
 <td><strong><code>ChannelState</code></strong></td>
 <td>The per-channel I/O bookkeeping struct inside <code>BinlogArchive</code> &mdash; mutex, current file, watermark, checksum flag, indexed-file set, event counters, fsync fd. Held in <code>shared_ptr</code> inside a registry map; per-channel mutex isolates appends on different channels.</td>
 </tr>
 <tr>
 <td><strong><code>BinlogArchive</code></strong></td>
 <td>The top-level archive object inside the component. Owns the per-channel registry and the binlog protocol logic (event parsing, FDE caching, source-rotate handling, deduplication, crash recovery).</td>
+</tr>
+<tr>
+<td><strong><code>ArchiveSender</code></strong></td>
+<td>Singleton that manages dump sessions. When a dump request arrives, it resolves the target channel, opens an <code>ArchiveDumpSession</code>, and streams events until the downstream disconnects.</td>
+</tr>
+<tr>
+<td><strong><code>ArchiveDumpSession</code></strong></td>
+<td>The per-connection serving session. Resolves the GTID start position, walks archive files sending events, filters by GTID, and tail-follows the active file with heartbeats.</td>
+</tr>
+<tr>
+<td><strong>Dump handler dispatch slot</strong></td>
+<td>An atomic function-pointer slot in <code>sql/binlog_dump_handler.{h,cc}</code> that the component installs at load time. If set, <code>mysql_binlog_send()</code> delegates to the component instead of the built-in <code>Binlog_sender</code>.</td>
 </tr>
 </tbody>
 </table>
@@ -238,8 +273,10 @@ as out-of-tree-ish loadables.</p>
 <li><strong>Not a transform engine.</strong> Events are forwarded byte-for-byte,
   modulo the deduplication watermark and the FDE handling that makes
   each archive file a valid standalone binlog.</li>
-<li><strong>Not serving binlogs yet.</strong> Phase 1 is collection only. Serving
-  collected binlogs to downstream replicas is planned for Phase 2.</li>
+<li><strong>Not a per-user router yet.</strong> Phase 2 serves a single configured
+  channel to all downstream replicas. Per-user routing (different
+  channels to different replicas based on the connecting user) is
+  planned for Phase 3.</li>
 </ul>
 <h2 id="continue-reading">Continue reading<a class="headerlink" href="#continue-reading" title="Permanent link">&#x00B6;</a></h2>
 <ul>

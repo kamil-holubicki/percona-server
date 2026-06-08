@@ -22,6 +22,12 @@
 - [Sanitize binlog name](#sanitize-binlog-name)
 - [Observer plugin lifecycle](#observer-plugin-lifecycle)
 - [Configure-time notify path](#configure-time-notify-path)
+- [Dump handler dispatch slot](#dump-handler-dispatch-slot)
+- [ArchiveSender and ArchiveDumpSession](#archivesender-and-archivedumpsession)
+- [Component-local GTID set](#component-local-gtid-set)
+- [Serve path: GTID position resolution](#serve-path-gtid-position-resolution)
+- [Serve path: event streaming and filtering](#serve-path-event-streaming-and-filtering)
+- [Serve path: tail-follow and heartbeat](#serve-path-tail-follow-and-heartbeat)
 - [Error code catalogue](#error-code-catalogue)
 - [Build wiring](#build-wiring)
 
@@ -29,9 +35,14 @@
 
 | File | Role |
 | --- | --- |
-| `components/binlog_server/binlog_server_component.cc` | Component entry point. Publishes `binlog_server_storage` service, acquires logging services. |
+| `components/binlog_server/binlog_server_component.cc` | Component entry point. Publishes `binlog_server_storage` service, acquires logging + dump handler services, registers sysvars. |
 | `components/binlog_server/binlog_archive.h` | Declares `BinlogArchive` (singleton), `ChannelState` (per-channel), and all protocol methods. |
 | `components/binlog_server/binlog_archive.cc` | Implements configure, append, close, crash recovery, rotation, deduplication. |
+| `components/binlog_server/archive_sender.h` | Declares `ArchiveSender` singleton, `UserChannelMap`, dispatch callback. |
+| `components/binlog_server/archive_sender.cc` | Implements `ArchiveSender`, `ArchiveDumpSession` (GTID resolution, event streaming, tail-follow). |
+| `components/binlog_server/gtid_set.h` | Declares `binlog_server::gtid::Gtid_set` (component-local GTID implementation). |
+| `components/binlog_server/gtid_set.cc` | Implements GTID text parsing, binary decoding, interval management, subset checks. |
+| `components/binlog_server/server_services.h` | Thin C++ aliases for `mysql_binlog_dump_handler_register`, `_io`, `mysql_thd_kill_handler`. |
 | `components/binlog_server/storage_backend.h` | Abstract `StorageBackend` interface. |
 | `components/binlog_server/file_storage.h` | `FileStorage` &mdash; concrete backend for `file://` URIs. |
 | `components/binlog_server/file_storage.cc` | Directory creation, path resolution. |
@@ -40,7 +51,14 @@
 | `plugin/binlog_server_relay/binlog_server_relay.cc` | Plugin: `Binlog_relay_IO_observer` callbacks, RAII service acquisition. |
 | `sql/rpl_binlog_server.h` | Notify function declarations + URI shape validator. |
 | `sql/rpl_binlog_server.cc` | Service acquisition, `binlog_server_notify_channel_config()`. |
-| `include/mysql/components/services/binlog_server_storage.h` | Service ABI (`configure_channel`, `append_event`, `close_channel`). |
+| `sql/binlog_dump_handler.h` | Declares `set_binlog_dump_handler()`, `get_binlog_dump_handler()`, typedef. |
+| `sql/binlog_dump_handler.cc` | Atomic function pointer slot implementation. |
+| `sql/server_component/mysql_binlog_dump_handler_imp.h` | Declares service bridge classes. |
+| `sql/server_component/mysql_binlog_dump_handler_imp.cc` | Implements `install`/`uninstall`, `send_event`/`flush`, `service_handler_bridge`. |
+| `include/mysql/components/services/binlog_server_storage.h` | Collection service ABI (`configure_channel`, `append_event`, `close_channel`). |
+| `include/mysql/components/services/mysql_binlog_dump_handler_register.h` | Dump handler registration service ABI (`install`, `uninstall`). |
+| `include/mysql/components/services/mysql_binlog_dump_handler_io.h` | Dump handler I/O service ABI (`send_event`, `flush`). |
+| `include/mysql/components/services/bits/mysql_binlog_dump_handler_bits.h` | Shared types: `mysql_binlog_dump_handler_fn`, checksum enum. |
 
 ## Locking discipline
 
@@ -353,6 +371,244 @@ configuration is still persisted to `Master_info`; when the component
 is loaded later, the next `thread_start` will trigger
 `configure_channel` again.
 
+## Dump handler dispatch slot
+
+The dispatch slot is a **two-layer atomic** mechanism:
+
+### Layer 1: Internal slot (`sql/binlog_dump_handler.{h,cc}`)
+
+```cpp
+static std::atomic<Binlog_dump_handler_func> g_binlog_dump_handler{nullptr};
+
+void set_binlog_dump_handler(Binlog_dump_handler_func f) {
+  g_binlog_dump_handler.store(f, std::memory_order_release);
+}
+
+Binlog_dump_handler_func get_binlog_dump_handler() {
+  return g_binlog_dump_handler.load(std::memory_order_acquire);
+}
+```
+
+The internal function pointer type:
+
+```cpp
+using Binlog_dump_handler_func = bool (*)(THD *thd, const char *log_ident,
+                                          my_off_t pos, Gtid_set *gtid_set,
+                                          uint32 flags);
+```
+
+### Layer 2: Service bridge (`sql/server_component/mysql_binlog_dump_handler_imp.cc`)
+
+The service bridge translates between the internal slot and the
+component's callback signature:
+
+```
+install(callback, user_data):
+  1. Store callback + user_data in file-static variables
+  2. set_binlog_dump_handler(&service_handler_bridge)
+
+uninstall():
+  1. set_binlog_dump_handler(nullptr)
+  2. Clear callback + user_data
+
+service_handler_bridge(thd, log_ident, pos, gtid_set, flags):
+  1. snapshot_user(thd)          → capture replica_user from THD
+  2. snapshot_checksum(thd)      → read negotiated checksum from user variable
+  3. snapshot_replica_executed() → serialize gtid_set to text
+  4. Call stored callback(user_data, thd, log_ident, pos, gtid_text,
+                          flags, server_id, replica_server_id, checksum, user)
+```
+
+### Dispatch site (`sql/rpl_source.cc`)
+
+```cpp
+// In mysql_binlog_send(), before constructing Binlog_sender:
+if (auto handler = get_binlog_dump_handler(); handler != nullptr) {
+  if (handler(thd, log_ident, pos, gtid_set, flags))
+    return;
+}
+// ... standard Binlog_sender path ...
+```
+
+If the handler returns `true`, the dump request was fully served by
+the component and the function returns without touching `Binlog_sender`.
+If it returns `false`, the request falls through to the built-in path.
+
+## ArchiveSender and ArchiveDumpSession
+
+### ArchiveSender (singleton)
+
+- Holds a pointer to `BinlogArchive` (set at component init).
+- Holds the `default_serve_channel` string (updated via sysvar callback).
+- The `dispatch()` method is the callback installed into the dump handler slot.
+
+### ArchiveDumpSession (per connection)
+
+Created on the dump thread when a `COM_BINLOG_DUMP_GTID` request
+arrives and the dispatch slot fires. Lifetime is exactly one dump
+request.
+
+Key state:
+
+```cpp
+class ArchiveDumpSession {
+  MYSQL_THD thd_;
+  std::string channel_;
+  std::string base_dir_;
+  binlog_server::gtid::Gtid_set replica_executed_;
+  uint32_t source_server_id_;
+  uint32_t replica_server_id_;
+  mysql_binlog_dump_handler_checksum_alg checksum_alg_;
+  std::vector<std::string> index_files_;  // from binlog.index
+  std::ifstream file_;                    // current read position
+};
+```
+
+Key methods:
+
+- `run()` — orchestrates the full dump lifecycle
+- `resolve_start_position()` — reverse-walks index using GTID set
+- `stream_file()` — reads events from one archive file, filters, sends
+- `tail_follow()` — polls active file for new data, sends heartbeats
+
+## Component-local GTID set
+
+The component cannot use the server's `Gtid_set` class (it is part
+of the server core, not exported as a service). Instead, a self-contained
+implementation lives in `gtid_set.{h,cc}`:
+
+```cpp
+namespace binlog_server::gtid {
+
+class Gtid_set {
+ public:
+  bool parse_text(const char *text);
+  bool decode_previous_gtids_event(const uint8_t *payload, size_t len);
+  bool contains(const std::string &uuid, uint64_t gno) const;
+  bool is_subset_of(const Gtid_set &super) const;
+  void add(const std::string &uuid, uint64_t gno);
+  std::string to_string() const;
+
+ private:
+  // uuid → sorted vector of [start, end) intervals
+  std::map<std::string, std::vector<std::pair<uint64_t, uint64_t>>> sets_;
+};
+
+}  // namespace binlog_server::gtid
+```
+
+Design decisions:
+
+- **Text parsing** handles the standard `uuid:interval[:interval][,...]`
+  format that MySQL uses in `SHOW MASTER STATUS` and
+  `Executed_Gtid_Set`.
+- **Binary decoding** reads `Previous_gtids_log_event` payloads
+  (the on-disk format: `n_sids` followed by `{uuid, n_intervals,
+  intervals[]}` tuples).
+- **Interval merging** is performed on `add()` to keep the set compact.
+- **Subset check** is used during reverse-walk to determine the start
+  file.
+- **Contains check** is used per-event to decide whether to skip a
+  GTID-tagged transaction group.
+
+## Serve path: GTID position resolution
+
+```
+resolve_start_position():
+  1. Read binlog.index → populate index_files_ (ordered)
+  2. For i = index_files_.size()-1 downto 0:
+     a. Open index_files_[i]
+     b. Skip 4-byte magic, read FDE
+     c. Read Previous_gtids_log_event (type 35, always second event)
+     d. Decode into a Gtid_set (file_previous_gtids)
+     e. If file_previous_gtids.is_subset_of(replica_executed_):
+        → this file is the start point (all prior GTIDs are already
+          applied; this file may contain new ones)
+        → break
+  3. If no file found: start from the very first file in the index
+  4. Open the start file, position after FDE
+```
+
+This mirrors the standard MySQL algorithm for GTID AUTO_POSITION, but
+operates on the archive's `Previous_gtids_log_event` rather than the
+server's own binlog.
+
+## Serve path: event streaming and filtering
+
+```
+send_event_loop():
+  Loop (while not killed):
+     a. Read 19-byte event header
+     b. If not enough bytes → EOF handling (see tail-follow)
+     c. If event_len < 19 → log corrupt header error, abort session
+     d. Read full event (event_length bytes)
+     e. should_skip_event() check:
+        - Artificial flag (0x20) → skip
+        - FDE (type 15) → skip (already shipped)
+        - STOP (type 3) on non-active file → skip (suppress mid-archive)
+        - Heartbeat v1/v2 (type 27/41) → skip (upstream heartbeats)
+        - GTID (type 33/42): check replica_executed_.contains(uuid, gno)
+          → if yes: set skip_group = true
+        - If skip_group: skip event; reset on XID (16) or XA_PREPARE (38)
+     f. If skipped: increment counter + maybe_send_idle_heartbeat()
+        (sends heartbeat if heartbeat_period elapsed since last sent event,
+        preventing replica timeout during long skip runs)
+     g. send_event(thd_, event_buf, event_len)
+        - On failure: log type/len/file/pos, abort session
+     h. On real ROTATE: advance to next index file, ship new FDE
+```
+
+## Serve path: tail-follow and heartbeat
+
+When the dump session reaches the last (active) file in the index and
+exhausts all currently-written data:
+
+```
+wait_for_more_data():
+  deadline = now() + heartbeat_period (5s)
+  Loop (until deadline):
+    1. Check if THD is killed → return false (abort)
+    2. Re-stat file → if size > current_pos → return true (data ready)
+    3. Refresh index → if next file appeared → return true
+    4. Sleep 100ms
+  Return true (no data, caller sends heartbeat)
+
+On EOF in send_event_loop():
+  If BINLOG_DUMP_NON_BLOCK flag set → return (session ends cleanly)
+  Otherwise → wait_for_more_data() + send heartbeat
+```
+
+### Heartbeat version selection
+
+The session inspects the dump request flags:
+
+- `USE_HEARTBEAT_EVENT_V2` (bit 1) set → emit type 41 (Heartbeat v2)
+  with length-prefixed log filename in payload
+- Otherwise → emit type 27 (Heartbeat v1) with raw filename bytes
+
+Both carry `log_pos = current_pos` and CRC32 if `m_has_checksum`.
+
+### BINLOG_DUMP_NON_BLOCK
+
+When the `BINLOG_DUMP_NON_BLOCK` flag (bit 0) is set in the dump
+request, the session returns successfully when it reaches the end of
+available data instead of tail-following. This is the mode used by
+`mysqlbinlog --read-from-remote-server`.
+
+### Idle heartbeats during event skipping
+
+When the GTID filter is skipping a long run of already-applied
+transactions, `maybe_send_idle_heartbeat()` is called after each
+skipped event. If `heartbeat_period` (5s) has elapsed since the last
+event was sent to the replica, a heartbeat is emitted. This prevents
+the replica from timing out its connection during large skip runs
+(e.g., a fresh replica with an empty executed set connecting to an
+archive where most GTIDs are already applied from a prior lifecycle).
+
+The `mysql_thd_kill_handler` service is used to register a callback
+on the THD so that `KILL <connection_id>` or server shutdown
+immediately sets a flag that the tail-follow loop checks.
+
 ## Error code catalogue
 
 | Code | Symbol | Level | Message |
@@ -376,6 +632,8 @@ the standard timestamp and subsystem prefix.
 MYSQL_ADD_COMPONENT(binlog_server
   binlog_server_component.cc
   binlog_archive.cc
+  archive_sender.cc
+  gtid_set.cc
   file_storage.cc
   log_helpers.cc
   MODULE_ONLY
@@ -394,9 +652,29 @@ MYSQL_ADD_PLUGIN(binlog_server_relay
 
 ### Server core
 
-`sql/rpl_binlog_server.cc` is added to the `sql/CMakeLists.txt` source
-list. It compiles into `mysqld` directly and uses standard component
-service acquisition at runtime.
+- `sql/rpl_binlog_server.cc` — notify layer, compiles into `mysqld`.
+- `sql/binlog_dump_handler.cc` — dispatch slot, compiles into `mysqld`.
+- `sql/server_component/mysql_binlog_dump_handler_imp.cc` — service bridge,
+  compiles into `mysqld`. Registered in `server_component.cc`.
+
+All are added to their respective `CMakeLists.txt` source lists.
+
+### Service registration
+
+In `sql/server_component/server_component.cc`, the dump handler
+services are registered:
+
+```cpp
+BEGIN_SERVICE_IMPLEMENTATION(mysql_server, mysql_binlog_dump_handler_register)
+  mysql_binlog_dump_handler_register_imp::install,
+  mysql_binlog_dump_handler_register_imp::uninstall,
+END_SERVICE_IMPLEMENTATION()
+
+BEGIN_SERVICE_IMPLEMENTATION(mysql_server, mysql_binlog_dump_handler_io)
+  mysql_binlog_dump_handler_io_imp::send_event,
+  mysql_binlog_dump_handler_io_imp::flush,
+END_SERVICE_IMPLEMENTATION()
+```
 
 ### System table DDL
 

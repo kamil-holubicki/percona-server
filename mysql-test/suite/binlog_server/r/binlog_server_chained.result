@@ -1,0 +1,88 @@
+include/rpl/init.inc [topology=1->2->3]
+
+# ============================================================
+# Configure server_2 as the binlog server
+# ============================================================
+[connection server_2]
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL PLUGIN binlog_server_relay SONAME 'BINLOG_SERVER_RELAY';
+SET GLOBAL binlog_server.default_serve_channel = 'upstream';
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = SOURCE_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1,
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORE/'
+  FOR CHANNEL 'upstream';
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA IO_THREAD FOR CHANNEL 'upstream';
+include/rpl/wait_for_receiver_to_start.inc [FOR CHANNEL 'upstream']
+
+# ============================================================
+# Configure server_3 as a plain replica of server_2
+# ============================================================
+[connection server_3]
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = COLLECTOR_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1;
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA;
+include/rpl/wait_for_replica_to_start.inc
+
+# ============================================================
+# Generate traffic on server_1
+# ============================================================
+[connection server_1]
+CREATE TABLE t1 (id INT PRIMARY KEY, payload VARCHAR(32)) ENGINE = InnoDB;
+INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+INSERT INTO t1 VALUES (4, 'd');
+
+# ---- Sync the binlog server channel on server_2 to server_1
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'upstream']
+
+# ---- Sync server_3 (served from server_2's archive) to server_1
+[connection server_1]
+include/rpl/sync_to_replica.inc
+
+# ============================================================
+# Verify server_3 received the data via the binlog server
+# ============================================================
+[connection server_3]
+# ---- Row count on the downstream replica
+SELECT COUNT(*) AS rows_on_replica FROM t1;
+rows_on_replica
+4
+# ---- Payload integrity
+SELECT id, payload FROM t1 ORDER BY id;
+id	payload
+1	a
+2	b
+3	c
+4	d
+
+# ============================================================
+# Tear down
+# ============================================================
+[connection server_3]
+STOP REPLICA;
+include/rpl/wait_for_replica_to_stop.inc
+RESET REPLICA ALL;
+[connection server_2]
+STOP REPLICA IO_THREAD FOR CHANNEL 'upstream';
+include/rpl/wait_for_receiver_to_stop.inc [FOR CHANNEL 'upstream']
+RESET REPLICA ALL FOR CHANNEL 'upstream';
+SET GLOBAL binlog_server.default_serve_channel = '';
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+[connection server_1]
+DROP TABLE t1;
+[connection server_3]
+DROP TABLE t1;
+include/rpl/deinit.inc

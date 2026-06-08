@@ -1,20 +1,22 @@
 # Binlog Server &mdash; Documentation
 
 A Percona Server 9.6 add-on that turns a MySQL instance into a **binlog
-collector**: it connects to one or many upstream MySQL sources as a
+server**: it connects to one or many upstream MySQL sources as a
 standard asynchronous replica, intercepts the raw binary log stream via
-the IO thread, and materialises it onto local storage as verbatim
-replicas of the source's binlog files.
+the IO thread, materialises it onto local storage, and **serves** it to
+downstream replicas via standard MySQL replication protocol.
 
 It is not a SQL applier. It never opens a transaction, never runs DDL,
 never creates a single row. From the upstream's point of view it is an
-ordinary asynchronous replica that only runs the IO thread.
+ordinary asynchronous replica that only runs the IO thread. From a
+downstream replica's point of view it is a standard MySQL source.
 
 ```mermaid
 flowchart LR
     classDef src fill:#e3f2fd,stroke:#1976d2,color:#0d47a1
     classDef hub fill:#fff8e1,stroke:#f9a825,color:#5d4037
     classDef disk fill:#fafafa,stroke:#9e9e9e,color:#424242
+    classDef rep fill:#e8f5e9,stroke:#43a047,color:#1b5e20
 
     SRC1["mysqld<br/>source A"]:::src
     SRC2["mysqld<br/>source B"]:::src
@@ -22,15 +24,20 @@ flowchart LR
     subgraph Hub["Binlog Server (this Percona Server instance)"]
         direction TB
         REL["binlog_server_relay<br/>(plugin)<br/>IO-thread observer"]:::hub
-        STO["component_binlog_server<br/>BinlogArchive"]:::hub
+        STO["component_binlog_server<br/>BinlogArchive + ArchiveSender"]:::hub
         DISK[("on-disk archive<br/>file://root/channel/...")]:::disk
 
         REL -- "append_event" --> STO
         STO --> DISK
     end
 
+    REP1["mysqld<br/>replica 1"]:::rep
+    REP2["mysqld<br/>replica 2"]:::rep
+
     SRC1 -- "COM_BINLOG_DUMP_GTID<br/>channel='src_a'" --> REL
     SRC2 -- "COM_BINLOG_DUMP_GTID<br/>channel='src_b'" --> REL
+    DISK -- "serve via<br/>ArchiveSender" --> REP1
+    DISK -- "serve via<br/>ArchiveSender" --> REP2
 ```
 
 ## Documentation map
@@ -65,26 +72,34 @@ CHANGE REPLICATION SOURCE TO
 
 START REPLICA IO_THREAD FOR CHANNEL 'src_a';
 
--- 4) Verify collection is active.
-SELECT SERVICE_STATE
-FROM performance_schema.replication_connection_status
-WHERE CHANNEL_NAME = 'src_a';
+-- 4) Enable serving: downstream replicas connecting to this node
+--    will be served from the 'src_a' archive.
+SET GLOBAL binlog_server.default_serve_channel = 'src_a';
+
+-- 5) On a downstream replica, point at the binlog-server node:
+--    CHANGE REPLICATION SOURCE TO
+--      SOURCE_HOST = 'binlog-server.example.com',
+--      SOURCE_PORT = 3306,
+--      SOURCE_USER = 'repl',
+--      SOURCE_AUTO_POSITION = 1;
+--    START REPLICA;
 ```
 
 ## At a glance
 
 | Aspect | What it means |
 | --- | --- |
-| **Single binary, two pieces** | `component_binlog_server` owns storage; `binlog_server_relay` is the IO-thread observer plugin that ships events into it. |
+| **Single binary, two pieces** | `component_binlog_server` owns storage and serving; `binlog_server_relay` is the IO-thread observer plugin that ships events into it. |
 | **One channel per upstream** | Each channel has its own on-disk subdirectory, its own mutex, its own watermark. No global serialisation between channels. |
+| **Serve to multiple downstreams** | The `ArchiveSender` intercepts `COM_BINLOG_DUMP_GTID` and streams archived events to any number of concurrent downstream replicas. |
 | **No SQL applier** | `BINLOG_SERVER=1` strips the SQL thread off the channel. The binlog server is a write-back buffer, never an applier. |
 | **GTID auto-position only** | `BINLOG_SERVER` requires `SOURCE_AUTO_POSITION=1`. |
 | **Crash-safe** | On startup, the archive walks the last file to find the last fully-written event, truncates any partial tail, and restores the watermark. |
 | **Durable at transaction boundaries** | Every `Xid` / `XA_prepare` event triggers an `fsync(2)`, ensuring committed transactions survive a power loss. |
 
-## Current status (Phase 1)
+## Current status (Phase 1 + Phase 2)
 
-Phase 1 implements the **collection path** only:
+**Phase 1** — collection path:
 
 - Receive binlogs from upstream sources via the IO thread
 - Store them as local files mirroring the source's binlog naming
@@ -92,8 +107,18 @@ Phase 1 implements the **collection path** only:
 - Crash recovery with partial-event truncation
 - Transaction-boundary fsync for durability
 
+**Phase 2** — serve path:
+
+- Downstream replicas connect with standard `CHANGE REPLICATION SOURCE` + `START REPLICA`
+- `COM_BINLOG_DUMP_GTID` intercepted via atomic dispatch slot in `mysql_binlog_send()`
+- GTID AUTO_POSITION fully supported (reverse-walk archive index to find starting file)
+- GTID filtering: transactions already in the replica's executed set are skipped
+- Tail-follow on the actively-written file with heartbeat every 5 seconds
+- Multiple concurrent downstream replicas supported
+- `default_serve_channel` sysvar routes dump connections to a named channel archive
+
 **Not yet implemented** (planned for later phases):
-- Serving collected binlogs to downstream replicas
+- Per-user channel routing (`user_channel_map` sysvar)
 - S3-compatible object storage backend
 - Performance Schema observability tables
 - Binlog purging

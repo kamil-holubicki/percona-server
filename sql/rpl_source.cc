@@ -23,6 +23,8 @@
 
 #include "sql/rpl_source.h"
 
+#include "sql/binlog_dump_handler.h"
+
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
@@ -1042,6 +1044,10 @@ error_malformed_packet:
 
 void mysql_binlog_send(THD *thd, char *log_ident, my_off_t pos,
                        Gtid_set *slave_gtid_executed, uint32 flags) {
+  if (auto handler = get_binlog_dump_handler(); handler != nullptr) {
+    if (handler(thd, log_ident, pos, slave_gtid_executed, flags)) return;
+  }
+
   Binlog_sender sender(thd, log_ident, pos, slave_gtid_executed, flags);
 
   sender.run();

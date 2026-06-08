@@ -3,5 +3,7 @@ MYSQL_ADD_COMPONENT(binlog_server
   binlog_archive.cc
   file_storage.cc
   log_helpers.cc
+  archive_sender.cc
+  gtid_set.cc
   MODULE_ONLY
 )

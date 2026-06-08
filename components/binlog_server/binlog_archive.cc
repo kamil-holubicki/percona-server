@@ -437,6 +437,16 @@ std::string BinlogArchive::get_default_storage_uri() const {
   return m_default_storage_uri;
 }
 
+std::string BinlogArchive::resolve_channel_base_dir(
+    const char *channel_name) const {
+  if (channel_name == nullptr || channel_name[0] == '\0') return {};
+  std::lock_guard<std::mutex> lk(m_registry_mutex);
+  auto it = m_channels.find(channel_name);
+  if (it == m_channels.end()) return {};
+  std::lock_guard<std::mutex> io_lk(it->second->io_mutex);
+  return it->second->base_dir;
+}
+
 std::string BinlogArchive::effective_uri(const std::string &channel_uri) {
   if (!channel_uri.empty()) return channel_uri;
   std::lock_guard<std::mutex> lk(m_uri_mutex);

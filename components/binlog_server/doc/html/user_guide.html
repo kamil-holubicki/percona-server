@@ -76,6 +76,8 @@
 <li><a href="#change-replication-source-additions">CHANGE REPLICATION SOURCE additions</a></li>
 <li><a href="#configuring-a-channel">Configuring a channel</a></li>
 <li><a href="#multi-channel-collection">Multi-channel collection</a></li>
+<li><a href="#serving-to-downstream-replicas">Serving to downstream replicas</a></li>
+<li><a href="#system-variables">System variables</a></li>
 <li><a href="#stopping-and-restarting">Stopping and restarting</a></li>
 <li><a href="#resume-after-crash">Resume after crash</a></li>
 <li><a href="#day-2-operations">Day-2 operations</a></li>
@@ -265,6 +267,116 @@ will not be stored until the component is loaded.</p>
 
 <p>Channels are fully independent: they have separate mutexes, separate
 watermarks, and can be started/stopped independently.</p>
+<h2 id="serving-to-downstream-replicas">Serving to downstream replicas<a class="headerlink" href="#serving-to-downstream-replicas" title="Permanent link">&#x00B6;</a></h2>
+<p>Once the binlog server is collecting from an upstream source, you can
+configure downstream replicas to replicate from the binlog server node
+instead of directly from the source.</p>
+<h3 id="setting-the-serve-channel">Setting the serve channel<a class="headerlink" href="#setting-the-serve-channel" title="Permanent link">&#x00B6;</a></h3>
+<p>Tell the component which channel's archive to serve:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">-- On the binlog-server node:</span>
+<span class="k">SET</span><span class="w"> </span><span class="k">GLOBAL</span><span class="w"> </span><span class="n">binlog_server</span><span class="p">.</span><span class="n">default_serve_channel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>All downstream replicas connecting to this node will be served events
+from the <code>src_a</code> channel archive.</p>
+<h3 id="configuring-a-downstream-replica">Configuring a downstream replica<a class="headerlink" href="#configuring-a-downstream-replica" title="Permanent link">&#x00B6;</a></h3>
+<p>On each downstream replica, point at the binlog-server node using
+standard replication commands:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">-- On the downstream replica:</span>
+<span class="n">CHANGE</span><span class="w"> </span><span class="n">REPLICATION</span><span class="w"> </span><span class="k">SOURCE</span><span class="w"> </span><span class="k">TO</span>
+<span class="w">    </span><span class="n">SOURCE_HOST</span><span class="w">          </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;binlog-server.example.com&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_PORT</span><span class="w">          </span><span class="o">=</span><span class="w"> </span><span class="mi">3306</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_USER</span><span class="w">          </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;repl_user&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_PASSWORD</span><span class="w">      </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;secret&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_AUTO_POSITION</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+
+<span class="k">START</span><span class="w"> </span><span class="n">REPLICA</span><span class="p">;</span>
+</code></pre></div>
+
+<p>The downstream replica sees the binlog server as an ordinary MySQL
+source. <code>SOURCE_AUTO_POSITION=1</code> is required so that GTID-based
+positioning works correctly.</p>
+<h3 id="how-it-works">How it works<a class="headerlink" href="#how-it-works" title="Permanent link">&#x00B6;</a></h3>
+<div class="diagram">
+<div class="mermaid">
+sequenceDiagram
+    participant Replica as downstream replica
+    participant Server as binlog-server mysqld
+    participant Component as component_binlog_server<br/>(ArchiveSender)
+    participant Disk as archive on disk
+
+    Replica->>Server: COM_BINLOG_DUMP_GTID<br/>(replica_executed_gtids)
+    Server->>Server: dispatch slot check
+    Server->>Component: archive_sender_dispatch(thd, ...)
+    Component->>Component: resolve channel from<br/>default_serve_channel
+    Component->>Disk: reverse-walk binlog.index<br/>to find GTID start file
+    loop Stream events
+        Component->>Disk: read event from archive file
+        Component->>Component: GTID filter:<br/>skip if already in replica's set
+        Component->>Replica: send_event(event_bytes)
+    end
+    Note over Component,Replica: When caught up to the active file,<br/>tail-follow with heartbeat every 5s
+</div>
+</div>
+<h3 id="multiple-downstream-replicas">Multiple downstream replicas<a class="headerlink" href="#multiple-downstream-replicas" title="Permanent link">&#x00B6;</a></h3>
+<p>The binlog server supports multiple concurrent downstream replicas.
+Each dump connection gets its own <code>ArchiveDumpSession</code> with
+independent file handles and GTID state. There is no shared lock
+between dump sessions, so they do not block each other.</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">-- Replica A:</span>
+<span class="n">CHANGE</span><span class="w"> </span><span class="n">REPLICATION</span><span class="w"> </span><span class="k">SOURCE</span><span class="w"> </span><span class="k">TO</span>
+<span class="w">    </span><span class="n">SOURCE_HOST</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;binlog-server.example.com&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">SOURCE_PORT</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3306</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_USER</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;repl&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">SOURCE_AUTO_POSITION</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="k">START</span><span class="w"> </span><span class="n">REPLICA</span><span class="p">;</span>
+
+<span class="c1">-- Replica B (same binlog server, independent session):</span>
+<span class="n">CHANGE</span><span class="w"> </span><span class="n">REPLICATION</span><span class="w"> </span><span class="k">SOURCE</span><span class="w"> </span><span class="k">TO</span>
+<span class="w">    </span><span class="n">SOURCE_HOST</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;binlog-server.example.com&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">SOURCE_PORT</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3306</span><span class="p">,</span>
+<span class="w">    </span><span class="n">SOURCE_USER</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;repl&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">SOURCE_AUTO_POSITION</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="k">START</span><span class="w"> </span><span class="n">REPLICA</span><span class="p">;</span>
+</code></pre></div>
+
+<h3 id="gtid-auto_position-behaviour">GTID AUTO_POSITION behaviour<a class="headerlink" href="#gtid-auto_position-behaviour" title="Permanent link">&#x00B6;</a></h3>
+<p>When a downstream replica connects with <code>SOURCE_AUTO_POSITION=1</code>:</p>
+<ol>
+<li>The replica sends its <code>Executed_Gtid_Set</code> (all GTIDs it has already
+   applied).</li>
+<li>The <code>ArchiveSender</code> reverse-walks the archive's <code>binlog.index</code>,
+   reading <code>Previous_gtids_log_event</code> from each file to find the
+   earliest file that contains transactions not in the replica's set.</li>
+<li>Events belonging to transactions already in the replica's set are
+   filtered (not sent).</li>
+<li>Once all historical events are sent, the session tail-follows the
+   active file, polling for new data and sending heartbeats.</li>
+</ol>
+<h2 id="system-variables">System variables<a class="headerlink" href="#system-variables" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Scope</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>binlog_server.default_storage_uri</code></td>
+<td>GLOBAL</td>
+<td>String</td>
+<td><code>''</code></td>
+<td>Default <code>file://</code> URI for new BINLOG_SERVER channels</td>
+</tr>
+<tr>
+<td><code>binlog_server.default_serve_channel</code></td>
+<td>GLOBAL</td>
+<td>String</td>
+<td><code>''</code></td>
+<td>Channel name whose archive is served to downstream replicas</td>
+</tr>
+</tbody>
+</table>
 <h2 id="stopping-and-restarting">Stopping and restarting<a class="headerlink" href="#stopping-and-restarting" title="Permanent link">&#x00B6;</a></h2>
 <div class="codehilite"><pre><span></span><code><span class="c1">-- Stop collection for a specific channel.</span>
 <span class="n">STOP</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="n">IO_THREAD</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
@@ -385,6 +497,21 @@ sequenceDiagram
 <td><code>START REPLICA SQL_THREAD</code> rejected</td>
 <td>Expected: SQL thread is suppressed on BINLOG_SERVER channels</td>
 <td>Use <code>START REPLICA IO_THREAD</code> only</td>
+</tr>
+<tr>
+<td>Downstream replica connects but gets no events</td>
+<td><code>default_serve_channel</code> not set or set to wrong channel</td>
+<td><code>SET GLOBAL binlog_server.default_serve_channel = '&lt;channel&gt;'</code></td>
+</tr>
+<tr>
+<td>Downstream replica falls behind</td>
+<td>Archive on disk may not have caught up yet</td>
+<td>Verify the upstream IO thread is running and the channel is actively collecting</td>
+</tr>
+<tr>
+<td>Downstream shows <code>Got fatal error 1236</code></td>
+<td>Archive files may have been manually deleted or purged</td>
+<td>Rebuild the replica or ensure the archive contains the required GTID range</td>
 </tr>
 </tbody>
 </table>

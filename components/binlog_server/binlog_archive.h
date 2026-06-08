@@ -60,6 +60,8 @@ class BinlogArchive {
   void set_default_storage_uri(const std::string &uri);
   std::string get_default_storage_uri() const;
 
+  std::string resolve_channel_base_dir(const char *channel_name) const;
+
  private:
   std::shared_ptr<ChannelState> find_channel(const std::string &name);
   std::unique_ptr<StorageBackend> create_backend(const std::string &uri);
