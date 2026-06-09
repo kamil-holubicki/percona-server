@@ -1,0 +1,55 @@
+include/rpl/init_source_replica.inc
+[connection master]
+
+# ---- Setup ----
+[connection slave]
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL PLUGIN binlog_server_relay SONAME 'BINLOG_SERVER_RELAY';
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = SOURCE_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1,
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORE/'
+  FOR CHANNEL 'no_apply_ch';
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+
+# ---- Start IO thread only (SQL thread must not start) ----
+START REPLICA IO_THREAD FOR CHANNEL 'no_apply_ch';
+include/rpl/wait_for_receiver_to_start.inc [FOR CHANNEL 'no_apply_ch']
+
+# ---- Create objects on source ----
+[connection master]
+CREATE TABLE t_no_apply (id INT PRIMARY KEY);
+INSERT INTO t_no_apply VALUES (1), (2), (3);
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'no_apply_ch']
+
+# ---- Verify table does NOT exist on replica ----
+[connection slave]
+SELECT * FROM t_no_apply;
+ERROR 42S02: Table 'test.t_no_apply' doesn't exist
+
+# ---- Verify SQL thread is not running ----
+include/assert.inc [SQL thread is OFF for binlog_server channel]
+
+# ---- Attempting to START SQL thread should fail or be no-op ----
+START REPLICA SQL_THREAD FOR CHANNEL 'no_apply_ch';
+
+# ---- Tear down ----
+[connection master]
+DROP TABLE t_no_apply;
+[connection slave]
+STOP REPLICA IO_THREAD FOR CHANNEL 'no_apply_ch';
+include/rpl/wait_for_receiver_to_stop.inc [FOR CHANNEL 'no_apply_ch']
+RESET REPLICA ALL FOR CHANNEL 'no_apply_ch';
+SET GLOBAL binlog_server.default_storage_uri = '';
+SET GLOBAL binlog_server.default_serve_channel = '';
+SET GLOBAL binlog_server.storage_root = '';
+SET GLOBAL binlog_server.rewrite_file_size = 0;
+SET GLOBAL binlog_server.rewrite_base_name = '';
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+include/rpl/deinit.inc

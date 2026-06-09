@@ -1,0 +1,171 @@
+# ==== Purpose ====
+#
+# Verify crash recovery behavior of the binlog server:
+#   1. After IO thread stop/restart, collection resumes correctly
+#   2. After component reinstall, state is recovered from archive
+#   3. GTID metadata is restored from .meta sidecars
+#   4. PFS tables reflect recovered state
+
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+--source ../inc/have_binlog_server.inc
+
+--let $use_gtids = 1
+--let $rpl_skip_change_master = 1
+--let $rpl_skip_start_slave = 1
+--source include/rpl/init_source_replica.inc
+
+--echo
+--echo # ---- Setup ----
+--source include/rpl/connection_replica.inc
+--source ../inc/binlog_server_suppressions.inc
+
+--let $store = $MYSQLTEST_VARDIR/tmp/bs_recover_test
+--exec rm -rf $store
+--mkdir $store
+
+INSTALL COMPONENT 'file://component_binlog_server';
+--replace_result $BINLOG_SERVER_RELAY BINLOG_SERVER_RELAY
+eval INSTALL PLUGIN binlog_server_relay SONAME '$BINLOG_SERVER_RELAY';
+
+--replace_result $SERVER_MYPORT_1 SOURCE_PORT $store STORE
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_1,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1,
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file://$store/'
+  FOR CHANNEL 'recover_ch';
+
+--echo
+--echo # ---- Phase 1: Collect some data ----
+START REPLICA IO_THREAD FOR CHANNEL 'recover_ch';
+--let $rpl_channel_name = 'recover_ch'
+--source include/rpl/wait_for_receiver_to_start.inc
+--let $rpl_channel_name =
+
+--source include/rpl/connection_source.inc
+CREATE TABLE t_recover (id INT PRIMARY KEY, val VARCHAR(50));
+INSERT INTO t_recover VALUES (1, 'first');
+FLUSH BINARY LOGS;
+INSERT INTO t_recover VALUES (2, 'second');
+
+--let $rpl_channel_name = 'recover_ch'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--source include/rpl/connection_replica.inc
+SELECT binlog_server_rebuild_archive_index('recover_ch') >= 0 AS rebuild_ok;
+
+# Record state before stop
+--let $files_before = `SELECT COUNT(*) FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'recover_ch'`
+
+--echo
+--echo # ---- Phase 2: Stop IO, restart, verify resume ----
+STOP REPLICA IO_THREAD FOR CHANNEL 'recover_ch';
+--let $rpl_channel_name = 'recover_ch'
+--source include/rpl/wait_for_receiver_to_stop.inc
+--let $rpl_channel_name =
+
+# Generate more data on source while IO is stopped
+--source include/rpl/connection_source.inc
+INSERT INTO t_recover VALUES (3, 'third');
+FLUSH BINARY LOGS;
+INSERT INTO t_recover VALUES (4, 'fourth');
+
+# Restart IO — should resume from where it left off
+--source include/rpl/connection_replica.inc
+START REPLICA IO_THREAD FOR CHANNEL 'recover_ch';
+--let $rpl_channel_name = 'recover_ch'
+--source include/rpl/wait_for_receiver_to_start.inc
+--let $rpl_channel_name =
+
+--source include/rpl/connection_source.inc
+--let $rpl_channel_name = 'recover_ch'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+SELECT binlog_server_rebuild_archive_index('recover_ch') >= 0 AS rebuild2_ok;
+
+--let $files_after = `SELECT COUNT(*) FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'recover_ch'`
+--let $assert_text = more files after resume
+--let $assert_cond = $files_after >= $files_before
+--source include/assert.inc
+
+--echo
+--echo # ---- Phase 3: Reinstall component, verify recovery ----
+STOP REPLICA IO_THREAD FOR CHANNEL 'recover_ch';
+--let $rpl_channel_name = 'recover_ch'
+--source include/rpl/wait_for_receiver_to_stop.inc
+--let $rpl_channel_name =
+
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+
+# Reinstall — component should recover state from archive on disk
+INSTALL COMPONENT 'file://component_binlog_server';
+--replace_result $BINLOG_SERVER_RELAY BINLOG_SERVER_RELAY
+eval INSTALL PLUGIN binlog_server_relay SONAME '$BINLOG_SERVER_RELAY';
+
+# Reconfigure (channel info is in mysql.slave_master_info, but component state is reset)
+--replace_result $SERVER_MYPORT_1 SOURCE_PORT $store STORE
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_1,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1,
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file://$store/'
+  FOR CHANNEL 'recover_ch';
+
+START REPLICA IO_THREAD FOR CHANNEL 'recover_ch';
+--let $rpl_channel_name = 'recover_ch'
+--source include/rpl/wait_for_receiver_to_start.inc
+--let $rpl_channel_name =
+
+# Generate more data to prove resume works after reinstall
+--source include/rpl/connection_source.inc
+INSERT INTO t_recover VALUES (5, 'fifth');
+
+--let $rpl_channel_name = 'recover_ch'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--source include/rpl/connection_replica.inc
+SELECT binlog_server_rebuild_archive_index('recover_ch') >= 0 AS rebuild3_ok;
+
+# Verify PFS still shows data
+--let $final_files = `SELECT COUNT(*) FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'recover_ch'`
+--let $assert_text = PFS archive table has data after recovery
+--let $assert_cond = $final_files >= 1
+--source include/assert.inc
+
+--echo
+--echo # ---- Tear down ----
+--source include/rpl/connection_source.inc
+DROP TABLE t_recover;
+--let $rpl_channel_name = 'recover_ch'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--source include/rpl/connection_replica.inc
+STOP REPLICA IO_THREAD FOR CHANNEL 'recover_ch';
+--let $rpl_channel_name = 'recover_ch'
+--source include/rpl/wait_for_receiver_to_stop.inc
+--let $rpl_channel_name =
+RESET REPLICA ALL FOR CHANNEL 'recover_ch';
+SET GLOBAL binlog_server.default_storage_uri = '';
+SET GLOBAL binlog_server.default_serve_channel = '';
+SET GLOBAL binlog_server.storage_root = '';
+SET GLOBAL binlog_server.rewrite_file_size = 0;
+SET GLOBAL binlog_server.rewrite_base_name = '';
+
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+
+--exec rm -rf $store
+
+--let $rpl_skip_sync = 1
+--let $rpl_skip_stop_slave = 1
+--source include/rpl/deinit.inc

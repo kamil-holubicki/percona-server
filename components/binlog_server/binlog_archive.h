@@ -130,6 +130,10 @@ class BinlogArchive {
   void set_default_storage_uri(const std::string &uri);
   std::string get_default_storage_uri() const;
 
+  void set_storage_root(const std::string &root);
+  bool storage_uri_allowed(const std::string &uri,
+                           std::string *reason = nullptr) const;
+
   std::string resolve_channel_base_dir(const char *channel_name) const;
 
   // PFS snapshot methods
@@ -162,6 +166,9 @@ class BinlogArchive {
 
   mutable std::mutex m_uri_mutex;
   std::string m_default_storage_uri;
+
+  mutable std::mutex m_root_mutex;
+  std::string m_storage_root;
 };
 
 }  // namespace binlog_server

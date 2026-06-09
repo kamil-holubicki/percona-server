@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -59,6 +60,11 @@ class ArchiveSender {
   bool trace_send_path() const { return m_trace_send_path; }
   UserChannelMap &user_channel_map() { return m_user_channel_map; }
 
+  void pin_file(const std::string &channel, const std::string &filename);
+  void unpin_file(const std::string &channel, const std::string &filename);
+  bool is_file_pinned(const std::string &channel,
+                      const std::string &filename) const;
+
   bool handle(MYSQL_THD thd, const char *log_ident, std::uint64_t pos,
               const char *replica_executed_gtids_text, std::uint32_t flags,
               std::uint32_t source_server_id, std::uint32_t replica_server_id,
@@ -75,6 +81,9 @@ class ArchiveSender {
   std::string m_default_channel;
   UserChannelMap m_user_channel_map;
   bool m_trace_send_path{false};
+
+  mutable std::mutex m_pin_mutex;
+  std::map<std::string, std::set<std::string>> m_pinned_files;
 };
 
 }  // namespace binlog_server

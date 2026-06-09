@@ -4,6 +4,7 @@
    it under the terms of the GNU General Public License, version 2.0,
    as published by the Free Software Foundation. */
 
+#include "archive_sender.h"
 #include "binlog_archive.h"
 #include "file_storage.h"
 #include "gtid_set.h"
@@ -11,6 +12,7 @@
 #include "s3_storage.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -47,6 +49,7 @@ constexpr unsigned char kXidEventType = 16;
 constexpr unsigned char kXaPrepareEventType = 38;
 constexpr unsigned char kPreviousGtidsLogEventType = 35;
 constexpr unsigned char kGtidLogEventType = 33;
+constexpr unsigned char kAnonymousGtidLogEventType = 34;
 constexpr unsigned char kGtidTaggedLogEventType = 42;
 constexpr unsigned char kChecksumAlgOff = 0;
 constexpr unsigned char kChecksumAlgUndef = 255;
@@ -111,6 +114,25 @@ std::string sanitize_binlog_name(const char *p, size_t max_len) {
   return std::string(p + start, end - start);
 }
 
+std::string sanitize_channel_dir_name(const std::string &channel_name) {
+  if (channel_name.empty()) return "_default";
+  std::string result;
+  result.reserve(channel_name.size());
+  for (char ch : channel_name) {
+    if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+        (ch >= '0' && ch <= '9') || ch == '_' || ch == '-') {
+      result += ch;
+    } else if (ch == '.') {
+      result += '_';
+    } else {
+      result += '_';
+    }
+  }
+  if (result == "." || result == ".." || result.empty()) return "_sanitized";
+  while (!result.empty() && result[0] == '.') result[0] = '_';
+  return result;
+}
+
 // Read all lines from binlog.index for a channel directory.
 std::vector<std::string> read_index_lines(const std::string &base_dir) {
   std::vector<std::string> lines;
@@ -127,7 +149,13 @@ std::vector<std::string> read_index_lines(const std::string &base_dir) {
 void load_index_file(ChannelState &state) {
   if (state.index_loaded) return;
   state.index_loaded = true;
-  auto lines = read_index_lines(state.base_dir);
+
+  std::vector<std::string> lines;
+  if (state.backend) {
+    state.backend->index_load(state.base_dir, lines);
+  } else {
+    lines = read_index_lines(state.base_dir);
+  }
   for (auto &line : lines) {
     if (state.indexed_files.insert(line).second) {
       state.file_order.push_back(line);
@@ -140,12 +168,19 @@ bool add_to_index(ChannelState &state, const std::string &log_name) {
   if (state.indexed_files.find(log_name) != state.indexed_files.end()) {
     return true;
   }
-  std::string path = state.base_dir + "binlog.index";
-  std::ofstream out(path, std::ios::binary | std::ios::app);
-  if (!out.is_open()) return false;
-  out << log_name << "\n";
-  out.flush();
-  if (!out.good()) return false;
+
+  bool ok = false;
+  if (state.backend) {
+    ok = state.backend->index_append(state.base_dir, log_name);
+  } else {
+    std::string path = state.base_dir + "binlog.index";
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    if (!out.is_open()) return false;
+    out << log_name << "\n";
+    out.flush();
+    ok = out.good();
+  }
+  if (!ok) return false;
   state.indexed_files.insert(log_name);
   state.file_order.push_back(log_name);
   return true;
@@ -251,11 +286,20 @@ void record_channel_error(ChannelState &state, int code,
                           const std::string &msg);
 
 // Crash recovery: walk events in the last archive file, restore watermark,
-// truncate partial tail.
+// truncate to transaction boundary (not just event boundary), and restore
+// GTID metadata from sidecar.
 void recover_state_from_archive(ChannelState &state,
                                 const char *channel_name) {
   load_index_file(state);
-  const std::string last_name = read_last_index_entry(state.base_dir);
+
+  std::string last_name;
+  if (state.backend) {
+    std::vector<std::string> entries;
+    state.backend->index_load(state.base_dir, entries);
+    if (!entries.empty()) last_name = entries.back();
+  } else {
+    last_name = read_last_index_entry(state.base_dir);
+  }
   if (last_name.empty()) return;
 
   const std::string path = state.base_dir + last_name;
@@ -275,7 +319,10 @@ void recover_state_from_archive(ChannelState &state,
   }
 
   uint64_t last_good_offset = kBinlogMagicSize;
+  // Transaction-safe offset: advances only at FDE, Previous_gtids, Xid, XA
+  uint64_t last_safe_offset = kBinlogMagicSize;
   uint64_t watermark = 0;
+  uint64_t safe_watermark = 0;
   bool has_fde = false;
   bool has_checksum = false;
 
@@ -321,38 +368,71 @@ void recover_state_from_archive(ChannelState &state,
     if (log_pos > 0 && !(flags & kLogEventArtificialF)) {
       watermark = log_pos;
     }
+
+    // Advance safe offset at transaction boundaries and structural events
+    if (event_type == kFormatDescriptionEventType ||
+        event_type == kPreviousGtidsLogEventType ||
+        event_type == kXidEventType ||
+        event_type == kXaPrepareEventType) {
+      last_safe_offset = last_good_offset;
+      safe_watermark = watermark;
+    }
   }
   f.close();
 
+  // Truncate to transaction boundary (discards partial transactions)
+  const uint64_t truncate_to = last_safe_offset;
   std::error_code ec;
   const uintmax_t physical_size = fs::file_size(path, ec);
-  if (!ec && physical_size > last_good_offset) {
-    fs::resize_file(path, last_good_offset, ec);
+  if (!ec && physical_size > truncate_to) {
+    fs::resize_file(path, truncate_to, ec);
     if (!ec) {
-      bslog(WARNING_LEVEL,
-            "binlog_server: channel '%s' truncated partial tail of '%s' "
-            "from %llu to %llu (recovered after crash)",
-            channel_name, path.c_str(),
-            static_cast<unsigned long long>(physical_size),
-            static_cast<unsigned long long>(last_good_offset));
+      if (truncate_to < last_good_offset) {
+        bslog(WARNING_LEVEL,
+              "binlog_server: channel '%s' truncated '%s' from %llu to %llu "
+              "(discarded %llu bytes of incomplete transaction after crash)",
+              channel_name, path.c_str(),
+              static_cast<unsigned long long>(physical_size),
+              static_cast<unsigned long long>(truncate_to),
+              static_cast<unsigned long long>(last_good_offset - truncate_to));
+      } else {
+        bslog(WARNING_LEVEL,
+              "binlog_server: channel '%s' truncated partial tail of '%s' "
+              "from %llu to %llu (recovered after crash)",
+              channel_name, path.c_str(),
+              static_cast<unsigned long long>(physical_size),
+              static_cast<unsigned long long>(truncate_to));
+      }
     }
   }
 
   state.current_log_name = last_name;
-  state.last_source_log_pos = watermark;
+  state.last_source_log_pos = safe_watermark;
   state.wrote_fde = has_fde;
   state.has_checksum = has_checksum;
 
-  // Load .meta sidecars for all indexed files
+  // Load .meta sidecars for all indexed files (restores GTID state)
   load_file_metadata(state);
+
+  // If we have a sidecar for the last file, restore last_gtid_set as the
+  // recovery baseline for duplicate detection
+  auto meta_it = state.file_metadata.find(last_name);
+  if (meta_it != state.file_metadata.end() &&
+      !meta_it->second.last_gtid_set.empty()) {
+    bslog(INFORMATION_LEVEL,
+          "binlog_server: channel '%s' restored GTID state from sidecar: %s",
+          channel_name, meta_it->second.last_gtid_set.c_str());
+  }
 
   bslog(INFORMATION_LEVEL,
         "binlog_server: channel '%s' recovered state from '%s' "
-        "(file_size=%llu, watermark=%llu, has_fde=%d, has_checksum=%d)",
+        "(truncated_to=%llu, watermark=%llu, has_fde=%d, has_checksum=%d, "
+        "discarded_partial_txn=%s)",
         channel_name, last_name.c_str(),
-        static_cast<unsigned long long>(last_good_offset),
-        static_cast<unsigned long long>(watermark),
-        static_cast<int>(has_fde), static_cast<int>(has_checksum));
+        static_cast<unsigned long long>(truncate_to),
+        static_cast<unsigned long long>(safe_watermark),
+        static_cast<int>(has_fde), static_cast<int>(has_checksum),
+        (truncate_to < last_good_offset) ? "yes" : "no");
 }
 
 void handle_rotate_event(ChannelState &state, const char *channel_name,
@@ -475,8 +555,8 @@ void record_channel_error(ChannelState &state, int code,
 void note_event_timestamp(ChannelState &state, const char *event_buf) {
   const uint32_t ts = read_u32_le(event_buf);
   if (ts == 0) return;
-  state.last_event_timestamp_us =
-      static_cast<uint64_t>(ts) * 1000000ULL;
+
+  state.last_event_timestamp_us = now_microseconds();
 
   auto &fm = state.file_metadata[state.current_log_name];
   if (fm.min_event_timestamp == 0 || ts < fm.min_event_timestamp)
@@ -614,15 +694,21 @@ void note_gtid_event(ChannelState &state, const char *event_buf,
         extract_previous_gtids_text(event_buf, event_len, state.has_checksum);
     if (!text.empty()) {
       fm.previous_gtid_set = text;
-      fm.last_gtid_set = std::move(text);
+      fm.last_gtid_set = text;
     }
   } else if (event_type == kGtidLogEventType ||
              event_type == kGtidTaggedLogEventType) {
     std::string gtid = extract_gtid_text(event_buf, event_len);
     if (!gtid.empty()) {
-      if (!fm.last_gtid_set.empty()) fm.last_gtid_set += ',';
-      fm.last_gtid_set += gtid;
+      gtid::Gtid_set merged;
+      if (!fm.last_gtid_set.empty())
+        merged.assign_from_text(fm.last_gtid_set);
+      gtid::Gtid_set single;
+      if (single.assign_from_text(gtid))
+        merged.merge(single);
+      fm.last_gtid_set = merged.to_text();
     }
+  } else if (event_type == kAnonymousGtidLogEventType) {
   }
 }
 
@@ -630,54 +716,82 @@ void flush_file_metadata(ChannelState &state, const std::string &log_name) {
   auto it = state.file_metadata.find(log_name);
   if (it == state.file_metadata.end()) return;
   auto &fm = it->second;
-  // Update size_bytes from the actual file on disk
   {
     std::error_code ec;
     auto sz = fs::file_size(state.base_dir + log_name, ec);
     if (!ec && sz > 0) fm.size_bytes = sz;
   }
-  const std::string path = state.base_dir + log_name + ".meta";
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out.is_open()) return;
-  out << "version=1\n";
-  out << "min_event_timestamp=" << fm.min_event_timestamp << "\n";
-  out << "max_event_timestamp=" << fm.max_event_timestamp << "\n";
-  out << "event_count=" << fm.event_count << "\n";
-  out << "size_bytes=" << fm.size_bytes << "\n";
+
+  std::string content;
+  content += "version=1\n";
+  content += "min_event_timestamp=" + std::to_string(fm.min_event_timestamp) + "\n";
+  content += "max_event_timestamp=" + std::to_string(fm.max_event_timestamp) + "\n";
+  content += "event_count=" + std::to_string(fm.event_count) + "\n";
+  content += "size_bytes=" + std::to_string(fm.size_bytes) + "\n";
   if (!fm.previous_gtid_set.empty())
-    out << "previous_gtid_set=" << fm.previous_gtid_set << "\n";
+    content += "previous_gtid_set=" + fm.previous_gtid_set + "\n";
   if (!fm.last_gtid_set.empty())
-    out << "last_gtid_set=" << fm.last_gtid_set << "\n";
-  out.flush();
+    content += "last_gtid_set=" + fm.last_gtid_set + "\n";
+
+  if (state.backend) {
+    state.backend->sidecar_store(state.base_dir, log_name, content);
+  } else {
+    const std::string path = state.base_dir + log_name + ".meta";
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (out.is_open()) {
+      out << content;
+      out.flush();
+    }
+  }
+}
+
+void parse_metadata_content(const std::string &content, FileMetadata &fm) {
+  std::istringstream in(content);
+  std::string line;
+  while (std::getline(in, line)) {
+    auto eq = line.find('=');
+    if (eq == std::string::npos) continue;
+    std::string key = line.substr(0, eq);
+    std::string val = line.substr(eq + 1);
+    try {
+      if (key == "min_event_timestamp")
+        fm.min_event_timestamp = static_cast<uint32_t>(std::stoul(val));
+      else if (key == "max_event_timestamp")
+        fm.max_event_timestamp = static_cast<uint32_t>(std::stoul(val));
+      else if (key == "event_count")
+        fm.event_count = std::stoull(val);
+      else if (key == "size_bytes")
+        fm.size_bytes = std::stoull(val);
+      else if (key == "previous_gtid_set")
+        fm.previous_gtid_set = val;
+      else if (key == "last_gtid_set")
+        fm.last_gtid_set = val;
+    } catch (const std::exception &) {
+    }
+  }
 }
 
 void load_file_metadata(ChannelState &state) {
   for (const auto &fname : state.file_order) {
-    const std::string path = state.base_dir + fname + ".meta";
-    std::ifstream in(path);
-    if (!in.is_open()) continue;
-    auto &fm = state.file_metadata[fname];
-    std::string line;
-    while (std::getline(in, line)) {
-      auto eq = line.find('=');
-      if (eq == std::string::npos) continue;
-      std::string key = line.substr(0, eq);
-      std::string val = line.substr(eq + 1);
-      try {
-        if (key == "min_event_timestamp")
-          fm.min_event_timestamp = static_cast<uint32_t>(std::stoul(val));
-        else if (key == "max_event_timestamp")
-          fm.max_event_timestamp = static_cast<uint32_t>(std::stoul(val));
-        else if (key == "event_count")
-          fm.event_count = std::stoull(val);
-        else if (key == "size_bytes")
-          fm.size_bytes = std::stoull(val);
-        else if (key == "previous_gtid_set")
-          fm.previous_gtid_set = val;
-        else if (key == "last_gtid_set")
-          fm.last_gtid_set = val;
-      } catch (const std::exception &) {
+    std::string content;
+    bool loaded = false;
+
+    if (state.backend) {
+      loaded = state.backend->sidecar_load(state.base_dir, fname, content);
+    } else {
+      const std::string path = state.base_dir + fname + ".meta";
+      std::ifstream in(path);
+      if (in.is_open()) {
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        content = ss.str();
+        loaded = true;
       }
+    }
+
+    if (loaded && !content.empty()) {
+      auto &fm = state.file_metadata[fname];
+      parse_metadata_content(content, fm);
     }
   }
 }
@@ -695,6 +809,54 @@ void BinlogArchive::set_default_storage_uri(const std::string &uri) {
 std::string BinlogArchive::get_default_storage_uri() const {
   std::lock_guard<std::mutex> lk(m_uri_mutex);
   return m_default_storage_uri;
+}
+
+void BinlogArchive::set_storage_root(const std::string &root) {
+  std::lock_guard<std::mutex> lk(m_root_mutex);
+  m_storage_root = root;
+  if (!m_storage_root.empty() && m_storage_root.back() != '/')
+    m_storage_root += '/';
+}
+
+bool BinlogArchive::storage_uri_allowed(const std::string &uri,
+                                        std::string *reason) const {
+  std::lock_guard<std::mutex> lk(m_root_mutex);
+  if (m_storage_root.empty()) return true;
+
+  std::string path = parse_file_uri(uri);
+  if (path.empty()) {
+    if (uri.compare(0, 5, "s3://") == 0) return true;
+    if (reason) *reason = "URI scheme not recognized";
+    return false;
+  }
+  std::error_code ec;
+  auto resolved = fs::canonical(fs::path(path), ec);
+  if (ec) {
+    auto parent = fs::path(path).parent_path();
+    resolved = fs::canonical(parent, ec);
+    if (ec) {
+      if (reason) *reason = "path does not exist and parent is not resolvable";
+      return false;
+    }
+    resolved /= fs::path(path).filename();
+  }
+  auto root_resolved = fs::canonical(fs::path(m_storage_root), ec);
+  if (ec) {
+    if (reason) *reason = "storage_root path is not resolvable";
+    return false;
+  }
+
+  std::string resolved_str = resolved.string();
+  std::string root_str = root_resolved.string();
+  if (!root_str.empty() && root_str.back() != '/') root_str += '/';
+
+  if (resolved_str.compare(0, root_str.size(), root_str) != 0) {
+    if (reason)
+      *reason = "URI path is not under binlog_server.storage_root ('" +
+                m_storage_root + "')";
+    return false;
+  }
+  return true;
 }
 
 std::string BinlogArchive::resolve_channel_base_dir(
@@ -741,6 +903,16 @@ int BinlogArchive::configure_channel(const char *channel_name, int enabled,
   std::string uri_str = storage_uri != nullptr ? storage_uri : "";
   std::string eff_uri = effective_uri(uri_str);
 
+  {
+    std::string rejection;
+    if (!storage_uri_allowed(eff_uri, &rejection)) {
+      bslog(ERROR_LEVEL,
+            "binlog_server: channel '%s' configure rejected: %s",
+            name.c_str(), rejection.c_str());
+      return 1;
+    }
+  }
+
   std::lock_guard<std::mutex> lk(m_registry_mutex);
   auto &cs_ptr = m_channels[name];
 
@@ -777,23 +949,7 @@ int BinlogArchive::configure_channel(const char *channel_name, int enabled,
   }
   if (!path.empty() && path.back() != '/') path += '/';
 
-  // Sanitize channel name for directory (defense-in-depth against traversal)
-  std::string dir_name;
-  if (name.empty()) {
-    dir_name = "_default";
-  } else {
-    dir_name.reserve(name.size());
-    for (char ch : name) {
-      if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-          (ch >= '0' && ch <= '9') || ch == '_' || ch == '.' || ch == '-')
-        dir_name.push_back(ch);
-      else
-        dir_name.push_back('_');
-    }
-    if (dir_name == "." || dir_name == "..") {
-      dir_name = "_" + dir_name + "_";
-    }
-  }
+  std::string dir_name = sanitize_channel_dir_name(name);
 
   std::string base_dir = path + dir_name + "/";
   std::error_code ec;
@@ -849,7 +1005,17 @@ int BinlogArchive::append_event(const char *channel_name,
 
   std::string name = channel_name != nullptr ? channel_name : "";
   auto cs_ptr = find_channel(name);
-  if (!cs_ptr) return 0;
+  if (!cs_ptr) {
+    static std::atomic<unsigned long> unconfigured_count{0};
+    unsigned long count = ++unconfigured_count;
+    if (count <= 3 || count % 10000 == 0) {
+      bslog(WARNING_LEVEL,
+            "binlog_server: append_event for unconfigured channel '%s' "
+            "(occurrence #%lu); event dropped",
+            name.c_str(), count);
+    }
+    return 0;
+  }
 
   auto &cs = *cs_ptr;
   std::lock_guard<std::mutex> lk(cs.io_mutex);
@@ -863,7 +1029,15 @@ int BinlogArchive::append_event(const char *channel_name,
   const uint16_t flags = read_u16_le(event_buf + kFlagsOffset);
   const bool is_artificial = (flags & kLogEventArtificialF) != 0;
 
-  (void)hdr_event_len;
+  if (hdr_event_len != event_len) {
+    if (should_log_io_failure(cs)) {
+      bslog(WARNING_LEVEL,
+            "binlog_server: channel '%s' event_len mismatch: header says %u "
+            "but buffer is %lu bytes; skipping event",
+            name.c_str(), hdr_event_len, event_len);
+    }
+    return 0;
+  }
 
   switch (event_type) {
     case kRotateEventType:
@@ -910,7 +1084,8 @@ int BinlogArchive::append_event(const char *channel_name,
   note_event_timestamp(cs, event_buf);
   if (event_type == kGtidLogEventType ||
       event_type == kGtidTaggedLogEventType ||
-      event_type == kPreviousGtidsLogEventType) {
+      event_type == kPreviousGtidsLogEventType ||
+      event_type == kAnonymousGtidLogEventType) {
     note_gtid_event(cs, event_buf, event_len);
   }
 
@@ -1327,8 +1502,13 @@ long long BinlogArchive::rebuild_archive_index(const char *channel_name) {
           } else {
             std::string gtid = extract_gtid_text(ev.data(), elen);
             if (!gtid.empty()) {
-              if (!fm.last_gtid_set.empty()) fm.last_gtid_set += ',';
-              fm.last_gtid_set += gtid;
+              gtid::Gtid_set merged;
+              if (!fm.last_gtid_set.empty())
+                merged.assign_from_text(fm.last_gtid_set);
+              gtid::Gtid_set single;
+              if (single.assign_from_text(gtid))
+                merged.merge(single);
+              fm.last_gtid_set = merged.to_text();
             }
           }
         }
@@ -1364,6 +1544,19 @@ long long commit_purge(ChannelState &cs, const std::vector<std::string> &victims
                        const char *channel_name) {
   if (victims.empty()) return 0;
 
+  // Check if any victim is pinned by an active dump session
+  auto &sender = ArchiveSender::instance();
+  std::string channel_str(channel_name);
+  for (const auto &fname : victims) {
+    if (sender.is_file_pinned(channel_str, fname)) {
+      bslog(WARNING_LEVEL,
+            "binlog_server: channel '%s' purge refused: file '%s' is "
+            "being served to a downstream replica",
+            channel_name, fname.c_str());
+      return -1;
+    }
+  }
+
   // Step 1: update in-memory state
   for (const auto &fname : victims) {
     cs.file_metadata.erase(fname);
@@ -1379,19 +1572,30 @@ long long commit_purge(ChannelState &cs, const std::vector<std::string> &victims
   // Step 2: atomic index rewrite (commit point)
   if (cs.backend) {
     if (!cs.backend->index_rewrite(cs.base_dir, cs.file_order)) {
-      bslog(WARNING_LEVEL,
-            "binlog_server: channel '%s' purge index rewrite failed; "
-            "purge aborted (in-memory state updated, disk may be stale)",
+      bslog(ERROR_LEVEL,
+            "binlog_server: channel '%s' purge ABORTED: atomic index rewrite "
+            "failed; restoring in-memory state",
             channel_name);
+      for (const auto &fname : victims) {
+        cs.indexed_files.insert(fname);
+      }
+      cs.file_order.clear();
+      for (const auto &f : cs.indexed_files) cs.file_order.push_back(f);
+      std::sort(cs.file_order.begin(), cs.file_order.end());
+      return -1;
     }
   } else {
-    // Fallback direct write if no backend (should not happen)
-    std::string idx_path = cs.base_dir + "binlog.index";
-    std::ofstream idx_out(idx_path, std::ios::binary | std::ios::trunc);
-    if (idx_out.is_open()) {
-      for (const auto &f : cs.file_order) idx_out << f << "\n";
-      idx_out.flush();
+    bslog(ERROR_LEVEL,
+          "binlog_server: channel '%s' purge ABORTED: no storage backend "
+          "available for index rewrite",
+          channel_name);
+    for (const auto &fname : victims) {
+      cs.indexed_files.insert(fname);
     }
+    cs.file_order.clear();
+    for (const auto &f : cs.indexed_files) cs.file_order.push_back(f);
+    std::sort(cs.file_order.begin(), cs.file_order.end());
+    return -1;
   }
 
   // Step 3: best-effort file removal (after commit point)

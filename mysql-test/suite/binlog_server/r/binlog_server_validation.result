@@ -1,0 +1,64 @@
+include/rpl/init_source_replica.inc
+[connection master]
+
+# ---- Setup binlog server component ----
+[connection slave]
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL PLUGIN binlog_server_relay SONAME 'BINLOG_SERVER_RELAY';
+
+# ==== Test 1: storage_root sysvar exists and is settable ====
+SET GLOBAL binlog_server.storage_root = 'STORE';
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = SOURCE_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1,
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORE/good_channel/'
+  FOR CHANNEL 'valid_ch';
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+RESET REPLICA ALL FOR CHANNEL 'valid_ch';
+
+# ==== Test 2: Channel name sanitization ====
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = SOURCE_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1,
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORE/test_sanitize/'
+  FOR CHANNEL 'my.channel';
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+RESET REPLICA ALL FOR CHANNEL 'my.channel';
+
+# ==== Test 3: trace_send_path sysvar ====
+SELECT @@GLOBAL.binlog_server.trace_send_path;
+@@GLOBAL.binlog_server.trace_send_path
+0
+SET GLOBAL binlog_server.trace_send_path = ON;
+SELECT @@GLOBAL.binlog_server.trace_send_path;
+@@GLOBAL.binlog_server.trace_send_path
+1
+SET GLOBAL binlog_server.trace_send_path = OFF;
+SELECT @@GLOBAL.binlog_server.trace_send_path;
+@@GLOBAL.binlog_server.trace_send_path
+0
+
+# ==== Test 4: storage_root sysvar ====
+SELECT @@GLOBAL.binlog_server.storage_root = 'STORE' AS root_matches;
+root_matches
+1
+SET GLOBAL binlog_server.storage_root = '';
+
+# ---- Tear down ----
+SET GLOBAL binlog_server.default_storage_uri = '';
+SET GLOBAL binlog_server.default_serve_channel = '';
+SET GLOBAL binlog_server.rewrite_file_size = 0;
+SET GLOBAL binlog_server.rewrite_base_name = '';
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+include/rpl/deinit.inc

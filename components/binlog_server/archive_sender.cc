@@ -200,6 +200,12 @@ class ArchiveDumpSession {
     m_last_event_sent = std::chrono::steady_clock::now();
   }
 
+  ~ArchiveDumpSession() {
+    if (!m_pinned_file.empty()) {
+      ArchiveSender::instance().unpin_file(m_channel, m_pinned_file);
+    }
+  }
+
   bool run();
 
  private:
@@ -253,6 +259,8 @@ class ArchiveDumpSession {
 
   unsigned long long m_events_sent{0};
   unsigned long long m_events_skipped{0};
+
+  std::string m_pinned_file;
 };
 
 bool ArchiveDumpSession::refresh_index_cache() {
@@ -359,6 +367,10 @@ bool ArchiveDumpSession::resolve_starting_position() {
 }
 
 bool ArchiveDumpSession::open_current_file() {
+  if (!m_pinned_file.empty()) {
+    ArchiveSender::instance().unpin_file(m_channel, m_pinned_file);
+    m_pinned_file.clear();
+  }
   m_in.close();
   m_in.clear();
   const std::string path = m_base_dir + m_current_file;
@@ -370,6 +382,8 @@ bool ArchiveDumpSession::open_current_file() {
     return false;
   }
   m_fde_seen = false;
+  ArchiveSender::instance().pin_file(m_channel, m_current_file);
+  m_pinned_file = m_current_file;
   return true;
 }
 
@@ -824,6 +838,30 @@ void ArchiveSender::set_storage(BinlogArchive *storage) { m_storage = storage; }
 
 void ArchiveSender::set_default_channel(const char *channel_name) {
   m_default_channel.assign(channel_name == nullptr ? "" : channel_name);
+}
+
+void ArchiveSender::pin_file(const std::string &channel,
+                             const std::string &filename) {
+  std::lock_guard<std::mutex> lk(m_pin_mutex);
+  m_pinned_files[channel].insert(filename);
+}
+
+void ArchiveSender::unpin_file(const std::string &channel,
+                               const std::string &filename) {
+  std::lock_guard<std::mutex> lk(m_pin_mutex);
+  auto it = m_pinned_files.find(channel);
+  if (it != m_pinned_files.end()) {
+    it->second.erase(filename);
+    if (it->second.empty()) m_pinned_files.erase(it);
+  }
+}
+
+bool ArchiveSender::is_file_pinned(const std::string &channel,
+                                   const std::string &filename) const {
+  std::lock_guard<std::mutex> lk(m_pin_mutex);
+  auto it = m_pinned_files.find(channel);
+  if (it == m_pinned_files.end()) return false;
+  return it->second.count(filename) > 0;
 }
 
 std::string ArchiveSender::resolve_channel(const char *replica_user) const {

@@ -67,11 +67,13 @@ static int bs_relay_after_queue_event(Binlog_relay_IO_param *param,
   int rc = (*g_storage)->append_event(param->channel_name, event_buf,
                                       event_len);
   if (rc != 0) {
-    LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-                    "append_event failed for channel '%s' (rc=%d, len=%lu)",
+    LogPluginErrMsg(WARNING_LEVEL, ER_LOG_PRINTF_MSG,
+                    "binlog_server: append_event failed for channel '%s' "
+                    "(rc=%d, len=%lu); archive may be incomplete but IO "
+                    "thread continues",
                     param->channel_name, rc, event_len);
   }
-  return rc;
+  return 0;
 }
 
 static int bs_relay_after_reset_slave(Binlog_relay_IO_param *param) {

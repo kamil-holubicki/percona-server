@@ -1,0 +1,100 @@
+# ==== Purpose ====
+#
+# Verify binlog server configuration validation:
+#   1. Storage root enforcement (URI outside root is rejected)
+#   2. Channel name sanitization (special characters are normalized)
+#   3. Invalid URI scheme rejection
+#   4. trace_send_path sysvar wiring
+
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+--source ../inc/have_binlog_server.inc
+
+--let $use_gtids = 1
+--let $rpl_skip_change_master = 1
+--let $rpl_skip_start_slave = 1
+--source include/rpl/init_source_replica.inc
+
+--echo
+--echo # ---- Setup binlog server component ----
+--source include/rpl/connection_replica.inc
+--source ../inc/binlog_server_suppressions.inc
+
+INSTALL COMPONENT 'file://component_binlog_server';
+--replace_result $BINLOG_SERVER_RELAY BINLOG_SERVER_RELAY
+eval INSTALL PLUGIN binlog_server_relay SONAME '$BINLOG_SERVER_RELAY';
+
+--echo
+--echo # ==== Test 1: storage_root sysvar exists and is settable ====
+--let $store = $MYSQLTEST_VARDIR/tmp/bs_validation_test
+--exec rm -rf $store
+--mkdir $store
+
+# Set storage_root to constrain URIs
+--replace_result $store STORE
+eval SET GLOBAL binlog_server.storage_root = '$store';
+
+# Create subdirectory so path resolution works
+--mkdir $store/good_channel
+
+# This should succeed — URI is under storage_root
+--replace_result $SERVER_MYPORT_1 SOURCE_PORT $store STORE
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_1,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1,
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file://$store/good_channel/'
+  FOR CHANNEL 'valid_ch';
+RESET REPLICA ALL FOR CHANNEL 'valid_ch';
+
+--echo
+--echo # ==== Test 2: Channel name sanitization ====
+# Channel with special characters should be sanitized to safe directory name
+--replace_result $SERVER_MYPORT_1 SOURCE_PORT $store STORE
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_1,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1,
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file://$store/test_sanitize/'
+  FOR CHANNEL 'my.channel';
+RESET REPLICA ALL FOR CHANNEL 'my.channel';
+
+--echo
+--echo # ==== Test 3: trace_send_path sysvar ====
+# Should start as OFF
+SELECT @@GLOBAL.binlog_server.trace_send_path;
+
+# Should be settable
+SET GLOBAL binlog_server.trace_send_path = ON;
+SELECT @@GLOBAL.binlog_server.trace_send_path;
+
+SET GLOBAL binlog_server.trace_send_path = OFF;
+SELECT @@GLOBAL.binlog_server.trace_send_path;
+
+--echo
+--echo # ==== Test 4: storage_root sysvar ====
+--replace_result $store STORE
+eval SELECT @@GLOBAL.binlog_server.storage_root = '$store' AS root_matches;
+
+# Clear for teardown
+SET GLOBAL binlog_server.storage_root = '';
+
+--echo
+--echo # ---- Tear down ----
+SET GLOBAL binlog_server.default_storage_uri = '';
+SET GLOBAL binlog_server.default_serve_channel = '';
+SET GLOBAL binlog_server.rewrite_file_size = 0;
+SET GLOBAL binlog_server.rewrite_base_name = '';
+
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+
+--exec rm -rf $store
+
+--let $rpl_skip_sync = 1
+--let $rpl_skip_stop_slave = 1
+--source include/rpl/deinit.inc

@@ -1,0 +1,95 @@
+include/rpl/init_source_replica.inc
+[connection master]
+
+# ---- Setup ----
+[connection slave]
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL PLUGIN binlog_server_relay SONAME 'BINLOG_SERVER_RELAY';
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = SOURCE_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1,
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORE/'
+  FOR CHANNEL 'recover_ch';
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+
+# ---- Phase 1: Collect some data ----
+START REPLICA IO_THREAD FOR CHANNEL 'recover_ch';
+include/rpl/wait_for_receiver_to_start.inc [FOR CHANNEL 'recover_ch']
+[connection master]
+CREATE TABLE t_recover (id INT PRIMARY KEY, val VARCHAR(50));
+INSERT INTO t_recover VALUES (1, 'first');
+FLUSH BINARY LOGS;
+INSERT INTO t_recover VALUES (2, 'second');
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'recover_ch']
+[connection slave]
+SELECT binlog_server_rebuild_archive_index('recover_ch') >= 0 AS rebuild_ok;
+rebuild_ok
+1
+
+# ---- Phase 2: Stop IO, restart, verify resume ----
+STOP REPLICA IO_THREAD FOR CHANNEL 'recover_ch';
+include/rpl/wait_for_receiver_to_stop.inc [FOR CHANNEL 'recover_ch']
+[connection master]
+INSERT INTO t_recover VALUES (3, 'third');
+FLUSH BINARY LOGS;
+INSERT INTO t_recover VALUES (4, 'fourth');
+[connection slave]
+START REPLICA IO_THREAD FOR CHANNEL 'recover_ch';
+include/rpl/wait_for_receiver_to_start.inc [FOR CHANNEL 'recover_ch']
+[connection master]
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'recover_ch']
+SELECT binlog_server_rebuild_archive_index('recover_ch') >= 0 AS rebuild2_ok;
+rebuild2_ok
+1
+include/assert.inc [more files after resume]
+
+# ---- Phase 3: Reinstall component, verify recovery ----
+STOP REPLICA IO_THREAD FOR CHANNEL 'recover_ch';
+include/rpl/wait_for_receiver_to_stop.inc [FOR CHANNEL 'recover_ch']
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL PLUGIN binlog_server_relay SONAME 'BINLOG_SERVER_RELAY';
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = SOURCE_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1,
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORE/'
+  FOR CHANNEL 'recover_ch';
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA IO_THREAD FOR CHANNEL 'recover_ch';
+include/rpl/wait_for_receiver_to_start.inc [FOR CHANNEL 'recover_ch']
+[connection master]
+INSERT INTO t_recover VALUES (5, 'fifth');
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'recover_ch']
+[connection slave]
+SELECT binlog_server_rebuild_archive_index('recover_ch') >= 0 AS rebuild3_ok;
+rebuild3_ok
+1
+include/assert.inc [PFS archive table has data after recovery]
+
+# ---- Tear down ----
+[connection master]
+DROP TABLE t_recover;
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'recover_ch']
+[connection slave]
+STOP REPLICA IO_THREAD FOR CHANNEL 'recover_ch';
+include/rpl/wait_for_receiver_to_stop.inc [FOR CHANNEL 'recover_ch']
+RESET REPLICA ALL FOR CHANNEL 'recover_ch';
+SET GLOBAL binlog_server.default_storage_uri = '';
+SET GLOBAL binlog_server.default_serve_channel = '';
+SET GLOBAL binlog_server.storage_root = '';
+SET GLOBAL binlog_server.rewrite_file_size = 0;
+SET GLOBAL binlog_server.rewrite_base_name = '';
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+include/rpl/deinit.inc

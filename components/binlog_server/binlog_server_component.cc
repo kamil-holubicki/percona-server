@@ -78,6 +78,8 @@ static char *sysvar_default_serve_channel = nullptr;
 static char *sysvar_user_channel_map = nullptr;
 static unsigned long long sysvar_rewrite_file_size = 0;
 static char *sysvar_rewrite_base_name = nullptr;
+static char *sysvar_storage_root = nullptr;
+static bool sysvar_trace_send_path = false;
 
 static void default_storage_uri_update(MYSQL_THD, SYS_VAR *, void *var_ptr,
                                        const void *save) {
@@ -180,6 +182,22 @@ static void rewrite_base_name_update(MYSQL_THD, SYS_VAR *, void *var_ptr,
         "rewrite_base_name='%s' will be ignored until a future release",
         new_val);
   }
+}
+
+static void storage_root_update(MYSQL_THD, SYS_VAR *, void *var_ptr,
+                                const void *save) {
+  const char *new_val = *static_cast<const char *const *>(save);
+  *static_cast<const char **>(var_ptr) = new_val;
+  if (g_archive) {
+    g_archive->set_storage_root(new_val != nullptr ? new_val : "");
+  }
+}
+
+static void trace_send_path_update(MYSQL_THD, SYS_VAR *, void *var_ptr,
+                                   const void *save) {
+  const bool new_val = *static_cast<const bool *>(save);
+  *static_cast<bool *>(var_ptr) = new_val;
+  binlog_server::ArchiveSender::instance().set_trace_send_path(new_val);
 }
 
 // =====================================================
@@ -579,6 +597,41 @@ static mysql_service_status_t component_init() {
     }
   }
 
+  // Register system variable: binlog_server.storage_root
+  {
+    STR_CHECK_ARG(str) sr_arg;
+    sr_arg.def_val = nullptr;
+    if (mysql_service_component_sys_variable_register->register_variable(
+            "binlog_server", "storage_root",
+            PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_RQCMDARG,
+            "Root directory for binlog server archive storage. When set, "
+            "all channel storage URIs must resolve to paths under this "
+            "root. Empty (default) disables the restriction.",
+            nullptr, storage_root_update, (void *)&sr_arg,
+            (void *)&sysvar_storage_root)) {
+      binlog_server::bslog(WARNING_LEVEL,
+                           "binlog_server: failed to register "
+                           "storage_root system variable");
+    }
+  }
+
+  // Register system variable: binlog_server.trace_send_path
+  {
+    BOOL_CHECK_ARG(bool) tsp_arg;
+    tsp_arg.def_val = false;
+    if (mysql_service_component_sys_variable_register->register_variable(
+            "binlog_server", "trace_send_path",
+            PLUGIN_VAR_BOOL | PLUGIN_VAR_RQCMDARG,
+            "Enable verbose tracing of the archive send path "
+            "(dump sessions). Default OFF.",
+            nullptr, trace_send_path_update, (void *)&tsp_arg,
+            (void *)&sysvar_trace_send_path)) {
+      binlog_server::bslog(WARNING_LEVEL,
+                           "binlog_server: failed to register "
+                           "trace_send_path system variable");
+    }
+  }
+
   // Wire up ArchiveSender with storage and persisted default_serve_channel
   binlog_server::ArchiveSender::instance().set_storage(g_archive);
   binlog_server::ArchiveSender::instance().set_default_channel(
@@ -764,6 +817,10 @@ static mysql_service_status_t component_deinit() {
   binlog_server::unregister_pfs_storage_table();
   binlog_server::unregister_pfs_status_table();
 
+  mysql_service_component_sys_variable_unregister->unregister_variable(
+      "binlog_server", "trace_send_path");
+  mysql_service_component_sys_variable_unregister->unregister_variable(
+      "binlog_server", "storage_root");
   mysql_service_component_sys_variable_unregister->unregister_variable(
       "binlog_server", "rewrite_base_name");
   mysql_service_component_sys_variable_unregister->unregister_variable(

@@ -1,0 +1,100 @@
+# ==== Purpose ====
+#
+# Verify that BINLOG_SERVER channels suppress the SQL/applier thread.
+# The IO thread should collect events, but they should never be applied
+# to the replica's schema. This prevents accidental data writes on the
+# binlog server instance.
+
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+--source ../inc/have_binlog_server.inc
+
+--let $use_gtids = 1
+--let $rpl_skip_change_master = 1
+--let $rpl_skip_start_slave = 1
+--source include/rpl/init_source_replica.inc
+
+--echo
+--echo # ---- Setup ----
+--source include/rpl/connection_replica.inc
+--source ../inc/binlog_server_suppressions.inc
+
+--let $store = $MYSQLTEST_VARDIR/tmp/bs_no_apply_test
+--exec rm -rf $store
+--mkdir $store
+
+INSTALL COMPONENT 'file://component_binlog_server';
+--replace_result $BINLOG_SERVER_RELAY BINLOG_SERVER_RELAY
+eval INSTALL PLUGIN binlog_server_relay SONAME '$BINLOG_SERVER_RELAY';
+
+--replace_result $SERVER_MYPORT_1 SOURCE_PORT $store STORE
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_1,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1,
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file://$store/'
+  FOR CHANNEL 'no_apply_ch';
+
+--echo
+--echo # ---- Start IO thread only (SQL thread must not start) ----
+START REPLICA IO_THREAD FOR CHANNEL 'no_apply_ch';
+--let $rpl_channel_name = 'no_apply_ch'
+--source include/rpl/wait_for_receiver_to_start.inc
+--let $rpl_channel_name =
+
+--echo
+--echo # ---- Create objects on source ----
+--source include/rpl/connection_source.inc
+CREATE TABLE t_no_apply (id INT PRIMARY KEY);
+INSERT INTO t_no_apply VALUES (1), (2), (3);
+
+--let $rpl_channel_name = 'no_apply_ch'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--echo
+--echo # ---- Verify table does NOT exist on replica ----
+--source include/rpl/connection_replica.inc
+--error ER_NO_SUCH_TABLE
+SELECT * FROM t_no_apply;
+
+--echo
+--echo # ---- Verify SQL thread is not running ----
+--let $sql_running = `SELECT SERVICE_STATE FROM performance_schema.replication_applier_status WHERE CHANNEL_NAME = 'no_apply_ch'`
+--let $assert_text = SQL thread is OFF for binlog_server channel
+--let $assert_cond = "$sql_running" = "OFF"
+--source include/assert.inc
+
+--echo
+--echo # ---- Attempting to START SQL thread should fail or be no-op ----
+# Binlog server channels should not allow SQL thread to start
+--error 0, ER_REPLICA_CHANNEL_OPERATION_NOT_ALLOWED
+START REPLICA SQL_THREAD FOR CHANNEL 'no_apply_ch';
+
+--echo
+--echo # ---- Tear down ----
+--source include/rpl/connection_source.inc
+DROP TABLE t_no_apply;
+
+--source include/rpl/connection_replica.inc
+STOP REPLICA IO_THREAD FOR CHANNEL 'no_apply_ch';
+--let $rpl_channel_name = 'no_apply_ch'
+--source include/rpl/wait_for_receiver_to_stop.inc
+--let $rpl_channel_name =
+RESET REPLICA ALL FOR CHANNEL 'no_apply_ch';
+SET GLOBAL binlog_server.default_storage_uri = '';
+SET GLOBAL binlog_server.default_serve_channel = '';
+SET GLOBAL binlog_server.storage_root = '';
+SET GLOBAL binlog_server.rewrite_file_size = 0;
+SET GLOBAL binlog_server.rewrite_base_name = '';
+
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+
+--exec rm -rf $store
+
+--let $rpl_skip_sync = 1
+--let $rpl_skip_stop_slave = 1
+--source include/rpl/deinit.inc

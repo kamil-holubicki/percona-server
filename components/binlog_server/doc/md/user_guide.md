@@ -125,6 +125,19 @@ The component creates the directory structure:
 
 File names mirror the source's binlog file names exactly.
 
+### Storage root constraint
+
+For production deployments, set `binlog_server.storage_root` to
+constrain all storage URIs to a specific directory tree:
+
+```sql
+SET GLOBAL binlog_server.storage_root = '/data/binlog-archive';
+```
+
+Any `CHANGE REPLICATION SOURCE` with a `BINLOG_SERVER_STORAGE_URI`
+that resolves outside this directory will be rejected. This prevents
+accidental writes to system directories from misconfigured URIs.
+
 ## Multi-channel collection
 
 Multiple channels can collect from different sources simultaneously:
@@ -462,6 +475,8 @@ them.
 | `binlog_server.default_storage_uri` | GLOBAL | String | `''` | Default `file://` URI for new BINLOG_SERVER channels |
 | `binlog_server.default_serve_channel` | GLOBAL | String | `''` | Channel name whose archive is served to downstream replicas when no user mapping matches |
 | `binlog_server.user_channel_map` | GLOBAL | String | `''` | User-to-channel routing. Two shapes: inline CSV (`user1=channel1,user2=channel2,...`) or table URI (`table://<db>.<tbl>`). See [Per-user channel routing](#per-user-channel-routing). |
+| `binlog_server.storage_root` | GLOBAL | String | `''` | When non-empty, all `file://` storage URIs must resolve under this directory. Prevents path-traversal misconfiguration. |
+| `binlog_server.trace_send_path` | GLOBAL | Boolean | `OFF` | When enabled, the `ArchiveSender` logs detailed trace messages for each dump session (file opens, GTID skips, heartbeats). Useful for debugging per-user routing issues. |
 | `binlog_server.rewrite_file_size` | GLOBAL | ULONGLONG | `0` | Target archive file size for local rewrite rotation (bytes). **Not yet implemented** -- setting a non-zero value logs a warning and has no effect. |
 | `binlog_server.rewrite_base_name` | GLOBAL | String | `''` | Base filename pattern for rewritten archives. **Not yet implemented** -- setting a value logs a warning and has no effect. |
 
@@ -497,12 +512,26 @@ SELECT binlog_server_purge_before_gtid('prod_primary',
 
 ### Purge safety rules
 
-- The active (tail) file -- the file currently being written to -- can
-  never be purged. Attempts return NULL.
-- Purge is channel-scoped: it never touches other channels' data.
-- The `binlog.index` file is rewritten after purge to reflect only the
-  remaining files.
-- Corresponding `.meta` sidecar files are removed alongside binlog files.
+- The **tail file** (last entry in the index) can never be purged,
+  regardless of whether the IO thread is running. At least one file
+  must always remain. Attempts return NULL.
+- Purge is **channel-scoped**: it never touches other channels' data.
+- **Index-first commit order**: the `binlog.index` is atomically
+  rewritten (via tmp + fsync + rename) *before* any files are deleted.
+  A crash after commit leaves orphan files (safe) rather than a
+  corrupt index.
+- If the atomic index rewrite fails, the purge is **aborted** and
+  in-memory state is rolled back. No files are deleted.
+- Files being **actively served** to a downstream replica cannot be
+  purged. The purge UDF returns NULL if any victim file is pinned by
+  a dump session.
+- **Input validation**: the target file must look like a valid binlog
+  filename (`base.NNNNNN`) and share the same base name as existing
+  archive files. Invalid names return NULL.
+- Corresponding `.meta` sidecar files are removed alongside binlog
+  files (best-effort; cleanup failures are logged as warnings).
+- If file deletion fails after the index commit, a warning is logged
+  but the purge is considered successful (the index is authoritative).
 
 ## Stopping and restarting
 
@@ -525,14 +554,18 @@ recovered on the next `configure_channel` call (triggered by
 `CHANGE REPLICATION SOURCE` or server restart with persisted channels):
 
 1. The index file (`binlog.index`) is read to discover existing files.
-2. The last file is opened and walked event-by-event to find the last
-   fully-written event.
-3. Any partial tail (incomplete event) is truncated.
+2. The last file is opened and walked event-by-event.
+3. The file is truncated to the last **transaction boundary** (Xid or
+   XA_prepare event), not just the last complete event. This discards
+   any partial in-flight transaction that was interrupted by the crash.
 4. The watermark (`last_source_log_pos`) is restored from the last
-   complete event's `log_pos`.
+   transaction-safe offset.
 5. The FDE flag and checksum flag are re-derived from the file header.
+6. `.meta` sidecar files are loaded for all indexed files, restoring
+   per-file GTID sets and timestamps without rescanning the archive.
 
-This guarantees that collection can resume seamlessly after any crash.
+This guarantees that collection can resume seamlessly after any crash
+without orphaned partial transactions in the archive.
 
 ## Day-2 operations
 
@@ -663,3 +696,6 @@ When implemented, rewrite mode will:
 | Downstream replica connects but gets no events | `default_serve_channel` not set or set to wrong channel | `SET GLOBAL binlog_server.default_serve_channel = '<channel>'` |
 | Downstream replica falls behind | Archive on disk may not have caught up yet | Verify the upstream IO thread is running and the channel is actively collecting |
 | Downstream shows `Got fatal error 1236` | Archive files may have been manually deleted or purged | Rebuild the replica or ensure the archive contains the required GTID range |
+| `append_event failed` warning in error log | Transient disk full or I/O error during archive write | The IO thread continues (does not abort); the warning is rate-limited. Fix the underlying storage issue; collection resumes automatically on the next event. |
+| `storage_root` rejection on CHANGE REPLICATION SOURCE | The configured URI resolves outside `binlog_server.storage_root` | Either adjust the URI to point under the storage root, or clear the root: `SET GLOBAL binlog_server.storage_root = ''` |
+| `purge refused: file is being served` | A downstream replica is actively reading the file you tried to purge | Wait for the replica to advance past that file, or disconnect it first |

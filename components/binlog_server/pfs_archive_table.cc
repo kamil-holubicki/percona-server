@@ -54,7 +54,7 @@ PFS_engine_table_share_proxy g_share;
 
 struct ScanHandle {
   std::vector<ChannelArchive> rows;
-  unsigned long pos{0};
+  unsigned long pos{static_cast<unsigned long>(-1)};
 };
 
 static PSI_table_handle *open_table(PSI_pos **pos) {
@@ -71,33 +71,36 @@ static void close_table(PSI_table_handle *handle) {
 
 static int rnd_init(PSI_table_handle *handle, bool) {
   auto *h = reinterpret_cast<ScanHandle *>(handle);
-  h->pos = 0;
+  h->pos = static_cast<unsigned long>(-1);
   return 0;
 }
 
 static int rnd_next(PSI_table_handle *handle) {
   auto *h = reinterpret_cast<ScanHandle *>(handle);
+  if (h->pos == static_cast<unsigned long>(-1))
+    h->pos = 0;
+  else
+    ++h->pos;
   if (h->pos >= h->rows.size()) return PFS_HA_ERR_END_OF_FILE;
-  ++h->pos;
   return 0;
 }
 
 static int rnd_pos(PSI_table_handle *handle) {
   auto *h = reinterpret_cast<ScanHandle *>(handle);
-  if (h->pos == 0 || h->pos > h->rows.size()) return PFS_HA_ERR_END_OF_FILE;
+  if (h->pos >= h->rows.size()) return PFS_HA_ERR_END_OF_FILE;
   return 0;
 }
 
 static void reset_position(PSI_table_handle *handle) {
   auto *h = reinterpret_cast<ScanHandle *>(handle);
-  h->pos = 0;
+  h->pos = static_cast<unsigned long>(-1);
 }
 
 static int read_column_value(PSI_table_handle *handle, PSI_field *field,
                              unsigned int index) {
   auto *h = reinterpret_cast<ScanHandle *>(handle);
-  if (h->pos == 0 || h->pos > h->rows.size()) return 0;
-  const auto &row = h->rows[h->pos - 1];
+  if (h->pos >= h->rows.size()) return PFS_HA_ERR_END_OF_FILE;
+  const auto &row = h->rows[h->pos];
 
   switch (static_cast<Column>(index)) {
     case COL_CHANNEL_NAME:
