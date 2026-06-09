@@ -2,6 +2,8 @@ MYSQL_ADD_COMPONENT(binlog_server
   binlog_server_component.cc
   binlog_archive.cc
   file_storage.cc
+  s3_storage.cc
+  gtid_renumberer.cc
   log_helpers.cc
   archive_sender.cc
   gtid_set.cc

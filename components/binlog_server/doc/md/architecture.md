@@ -116,8 +116,10 @@ percona-server/
 │   ├── archive_sender.h / .cc       # ArchiveSender + ArchiveDumpSession (serving)
 │   ├── gtid_set.h / .cc             # component-local GTID set implementation
 │   ├── server_services.h            # thin aliases for acquired server services
-│   ├── storage_backend.h            # StorageBackend abstract interface
-│   ├── file_storage.h / .cc         # FileStorage (file:// implementation)
+│   ├── storage_backend.h            # StorageBackend abstract interface (15 methods)
+│   ├── file_storage.h / .cc         # FileStorage (file:// full implementation)
+│   ├── s3_storage.h / .cc           # S3Storage (stub -- not yet implemented)
+│   ├── gtid_renumberer.h / .cc      # GTID renumbering stub for rewrite mode
 │   ├── log_helpers.h / .cc          # bslog / bslog_code logging wrappers
 │   └── doc/                          # this documentation
 │
@@ -339,30 +341,39 @@ END_SERVICE_DEFINITION(mysql_binlog_dump_handler_io)
 classDiagram
     class StorageBackend {
         <<abstract>>
-        +open_or_create(path) int
-        +close() int
-        +sync() int
+        +type_tag() const char*
+        +uri_allowed(uri, reason) bool
+        +resolve_channel_dir(base_uri, channel) string
+        +ensure_channel_dir(dir) bool
+        +wipe_channel_dir(dir) bool
+        +file_exists(dir, name) bool
+        +file_size(dir, name) uint64
+        +remove_file(dir, name) bool
+        +total_bytes(dir) uint64
+        +index_load(dir, out) bool
+        +index_append(dir, entry) bool
+        +index_rewrite(dir, entries) bool
+        +sidecar_load(dir, name, out) bool
+        +sidecar_store(dir, name, data) bool
     }
     class FileStorage {
-        +open_or_create(path) int
-        +close() int
-        +sync() int
+        +type_tag() "file"
     }
     class S3Storage {
-        <<future>>
-        +open_or_create(path) int
-        +close() int
-        +sync() int
+        <<stub -- not yet implemented>>
+        +type_tag() "s3"
     }
 
     StorageBackend <|-- FileStorage
     StorageBackend <|-- S3Storage
 ```
 
-Phase 1 implements `FileStorage` only. The `S3Storage` backend is a
-placeholder for future phases. The `BinlogArchive` dispatches every
-I/O operation through the `StorageBackend` interface, so adding new
-backends requires no changes to the binlog protocol logic.
+`FileStorage` implements the full interface using `std::filesystem`.
+`S3Storage` is a stub: it recognizes `s3://` URIs but all I/O methods
+return failure with a logged message. The `BinlogArchive` dispatches
+purge, index, and sidecar operations through the `StorageBackend`
+interface, so adding new backends requires no changes to the binlog
+protocol or purge logic.
 
 ## Module map
 
@@ -377,8 +388,10 @@ backends requires no changes to the binlog protocol logic.
 | `user_channel_map_loader.{h,cc}` | Parses inline CSV and `table://` URIs into a user&rarr;channel map | &mdash; |
 | `gtid_set.{h,cc}` | Component-local GTID set: parsing, binary decode, interval management, subset checks | `binlog_server::gtid::Gtid_set` |
 | `server_services.h` | Thin C++ aliases for acquired server services (`dump_handler_register`, `_io`, `thd_kill_handler`) | Service placeholders |
-| `file_storage.{h,cc}` | File I/O abstraction for `file://` URIs | Directory creation, path management |
-| `storage_backend.h` | Abstract interface for storage backends | &mdash; |
+| `file_storage.{h,cc}` | File I/O abstraction for `file://` URIs: dir management, index, sidecars, remove | `std::filesystem` operations |
+| `s3_storage.{h,cc}` | S3 storage stub (`s3://` URIs recognized but not implemented) | Returns failure with logged message |
+| `gtid_renumberer.{h,cc}` | Logical-clock rewriter stub for archive rewrite mode (not yet active). Fixes `sequence_number`/`last_committed` when coalescing; GTID identifiers are never modified. | `rewrite::LogicalClockState` |
+| `storage_backend.h` | Abstract interface for storage backends (15 virtual methods) | &mdash; |
 | `log_helpers.{h,cc}` | Structured logging helpers (`bslog`, `bslog_code`) | &mdash; |
 
 ## Lifecycle

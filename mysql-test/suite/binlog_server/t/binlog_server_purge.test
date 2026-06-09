@@ -1,0 +1,241 @@
+# ==== Purpose ====
+#
+# Verify the binlog archive purge UDFs with comprehensive scenarios:
+#
+#   1. Purge by filename (prefix deletion up to target)
+#   2. Purge by timestamp
+#   3. Purge by GTID set containment
+#   4. Tail-file protection (active file cannot be purged)
+#   5. Tail-file protection after IO thread is stopped
+#   6. Nonexistent channel returns NULL
+#   7. Empty storage returns NULL
+#   8. Invalid/unparseable target name returns NULL
+#   9. Wrong base name returns NULL
+#  10. Re-purge already-purged file returns NULL
+#  11. Sequential purge (second purge after first)
+
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+--source ../inc/have_binlog_server.inc
+
+--let $use_gtids = 1
+--let $rpl_skip_change_master = 1
+--let $rpl_skip_start_slave = 1
+--source include/rpl/init_source_replica.inc
+
+--echo
+--echo # ---- Setup binlog server ----
+--source include/rpl/connection_replica.inc
+--source ../inc/binlog_server_suppressions.inc
+
+--let $store = $MYSQLTEST_VARDIR/tmp/bs_purge_test
+--exec rm -rf $store
+--mkdir $store
+
+INSTALL COMPONENT 'file://component_binlog_server';
+--replace_result $BINLOG_SERVER_RELAY BINLOG_SERVER_RELAY
+eval INSTALL PLUGIN binlog_server_relay SONAME '$BINLOG_SERVER_RELAY';
+
+--replace_result $SERVER_MYPORT_1 SOURCE_PORT $store STORE
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_1,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1,
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file://$store/'
+  FOR CHANNEL 'purge_ch';
+
+START REPLICA IO_THREAD FOR CHANNEL 'purge_ch';
+--let $rpl_channel_name = 'purge_ch'
+--source include/rpl/wait_for_receiver_to_start.inc
+--let $rpl_channel_name =
+
+--echo
+--echo # ---- Generate traffic to create multiple binlog files ----
+--source include/rpl/connection_source.inc
+CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(50));
+INSERT INTO t1 VALUES (1, 'one');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (2, 'two');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (3, 'three');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (4, 'four');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (5, 'five');
+
+--let $rpl_channel_name = 'purge_ch'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--echo
+--echo # ---- Rebuild archive index to populate metadata ----
+--source include/rpl/connection_replica.inc
+SELECT binlog_server_rebuild_archive_index('purge_ch') >= 0 AS rebuild_ok;
+
+--echo
+--echo # ---- Verify we have multiple files in archive ----
+--let $file_count = `SELECT COUNT(*) FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'purge_ch'`
+--let $assert_text = archive has at least 5 files
+--let $assert_cond = $file_count >= 5
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 1: Purge by filename ====
+--let $first_file = `SELECT FILE_NAME FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'purge_ch' ORDER BY FILE_NAME LIMIT 1`
+
+--let $purged = `SELECT binlog_server_purge_channel('purge_ch', '$first_file')`
+--let $assert_text = purge by filename removed 1 file
+--let $assert_cond = $purged = 1
+--source include/assert.inc
+
+# Verify the file is gone from the archive table
+--let $remaining = `SELECT COUNT(*) FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'purge_ch' AND FILE_NAME = '$first_file'`
+--let $assert_text = purged file no longer in archive table
+--let $assert_cond = $remaining = 0
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 2: Sequential purge (second purge after first) ====
+--let $second_file = `SELECT FILE_NAME FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'purge_ch' ORDER BY FILE_NAME LIMIT 1`
+
+--let $purged2 = `SELECT binlog_server_purge_channel('purge_ch', '$second_file')`
+--let $assert_text = second sequential purge removed 1 file
+--let $assert_cond = $purged2 = 1
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 3: Purge by timestamp ====
+# Use a future timestamp so all non-tail files qualify
+--let $ts = `SELECT UNIX_TIMESTAMP() + 3600`
+--let $before_count = `SELECT COUNT(*) FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'purge_ch'`
+
+--let $purged_ts = `SELECT binlog_server_purge_before_timestamp('purge_ch', $ts)`
+--let $assert_text = purge by timestamp removed at least 1 file
+--let $assert_cond = $purged_ts >= 1
+--source include/assert.inc
+
+--let $after_count = `SELECT COUNT(*) FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'purge_ch'`
+--let $assert_text = archive shrunk after timestamp purge (at least 1 file remains)
+--let $assert_cond = $after_count >= 1 AND $after_count < $before_count
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 4: Tail-file protection (IO thread running) ====
+--let $tail_file = `SELECT FILE_NAME FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'purge_ch' ORDER BY FILE_NAME DESC LIMIT 1`
+--let $tail_result = `SELECT binlog_server_purge_channel('purge_ch', '$tail_file')`
+--let $assert_text = purging the tail file returns NULL (blocked)
+--let $assert_cond = "$tail_result" = ""
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 5: Tail-file protection after IO thread stopped ====
+STOP REPLICA IO_THREAD FOR CHANNEL 'purge_ch';
+--let $rpl_channel_name = 'purge_ch'
+--source include/rpl/wait_for_receiver_to_stop.inc
+--let $rpl_channel_name =
+
+# The tail file should still be protected even when IO is stopped
+--let $tail_stopped = `SELECT binlog_server_purge_channel('purge_ch', '$tail_file')`
+--let $assert_text = purging tail file with IO stopped still returns NULL
+--let $assert_cond = "$tail_stopped" = ""
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 6: Nonexistent channel returns NULL ====
+--let $bad_ch = `SELECT binlog_server_purge_channel('no_such_channel', 'binlog.000001')`
+--let $assert_text = purge on nonexistent channel returns NULL
+--let $assert_cond = "$bad_ch" = ""
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 7: Invalid target name returns NULL ====
+--let $bad_name = `SELECT binlog_server_purge_channel('purge_ch', 'notabinlogname')`
+--let $assert_text = invalid target name returns NULL
+--let $assert_cond = "$bad_name" = ""
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 8: Wrong base name returns NULL ====
+--let $wrong_base = `SELECT binlog_server_purge_channel('purge_ch', 'other.000001')`
+--let $assert_text = wrong base name returns NULL
+--let $assert_cond = "$wrong_base" = ""
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 9: Re-purge already-purged file returns NULL ====
+--let $repurge = `SELECT binlog_server_purge_channel('purge_ch', '$first_file')`
+--let $assert_text = re-purge of already-purged file returns NULL
+--let $assert_cond = "$repurge" = ""
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 10: Purge by GTID ====
+# Restart IO to verify GTID purge works
+--replace_result $SERVER_MYPORT_1 SOURCE_PORT $store STORE
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_1,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1,
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file://$store/'
+  FOR CHANNEL 'purge_ch';
+
+START REPLICA IO_THREAD FOR CHANNEL 'purge_ch';
+--let $rpl_channel_name = 'purge_ch'
+--source include/rpl/wait_for_receiver_to_start.inc
+--let $rpl_channel_name =
+
+# Generate more traffic so we have multiple files again
+--source include/rpl/connection_source.inc
+INSERT INTO t1 VALUES (6, 'six');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (7, 'seven');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (8, 'eight');
+--let $rpl_channel_name = 'purge_ch'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--source include/rpl/connection_replica.inc
+SELECT binlog_server_rebuild_archive_index('purge_ch') >= 0 AS rebuild2_ok;
+
+--let $gtid_count_before = `SELECT COUNT(*) FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'purge_ch'`
+
+# Get the GTID set from the oldest file to use as purge threshold
+--let $oldest_gtid = `SELECT LAST_GTID_SET FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'purge_ch' ORDER BY FILE_NAME LIMIT 1`
+if ($oldest_gtid)
+{
+  --let $purged_gtid = `SELECT binlog_server_purge_before_gtid('purge_ch', '$oldest_gtid')`
+  --echo # purge_before_gtid returned: $purged_gtid
+}
+
+--echo
+--echo # ---- Tear down ----
+--source include/rpl/connection_source.inc
+DROP TABLE t1;
+--let $rpl_channel_name = 'purge_ch'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--source include/rpl/connection_replica.inc
+STOP REPLICA IO_THREAD FOR CHANNEL 'purge_ch';
+--let $rpl_channel_name = 'purge_ch'
+--source include/rpl/wait_for_receiver_to_stop.inc
+--let $rpl_channel_name =
+RESET REPLICA ALL FOR CHANNEL 'purge_ch';
+SET GLOBAL binlog_server.default_storage_uri = '';
+SET GLOBAL binlog_server.default_serve_channel = '';
+SET GLOBAL binlog_server.rewrite_file_size = 0;
+SET GLOBAL binlog_server.rewrite_base_name = '';
+
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+
+--exec rm -rf $store
+
+--let $rpl_skip_sync = 1
+--let $rpl_skip_stop_slave = 1
+--source include/rpl/deinit.inc

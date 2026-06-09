@@ -76,6 +76,8 @@ static binlog_server::BinlogArchive *g_archive = nullptr;
 static char *sysvar_default_storage_uri = nullptr;
 static char *sysvar_default_serve_channel = nullptr;
 static char *sysvar_user_channel_map = nullptr;
+static unsigned long long sysvar_rewrite_file_size = 0;
+static char *sysvar_rewrite_base_name = nullptr;
 
 static void default_storage_uri_update(MYSQL_THD, SYS_VAR *, void *var_ptr,
                                        const void *save) {
@@ -151,6 +153,32 @@ static void user_channel_map_update(MYSQL_THD, SYS_VAR *, void *var_ptr,
                          "binlog_server: user_channel_map applied "
                          "(%lld mappings)",
                          n);
+  }
+}
+
+static void rewrite_file_size_update(MYSQL_THD, SYS_VAR *, void *var_ptr,
+                                     const void *save) {
+  const auto new_val = *static_cast<const unsigned long long *>(save);
+  *static_cast<unsigned long long *>(var_ptr) = new_val;
+  if (new_val != 0) {
+    binlog_server::bslog(
+        WARNING_LEVEL,
+        "binlog_server: archive rewrite is not yet implemented; "
+        "rewrite_file_size=%llu will be ignored until a future release",
+        static_cast<unsigned long long>(new_val));
+  }
+}
+
+static void rewrite_base_name_update(MYSQL_THD, SYS_VAR *, void *var_ptr,
+                                     const void *save) {
+  const char *new_val = *static_cast<const char *const *>(save);
+  *static_cast<const char **>(var_ptr) = new_val;
+  if (new_val != nullptr && new_val[0] != '\0') {
+    binlog_server::bslog(
+        WARNING_LEVEL,
+        "binlog_server: archive rewrite is not yet implemented; "
+        "rewrite_base_name='%s' will be ignored until a future release",
+        new_val);
   }
 }
 
@@ -241,6 +269,135 @@ static long long binlog_server_rebuild_idx_func(UDF_INIT *, UDF_ARGS *args,
 }
 
 static void binlog_server_rebuild_idx_deinit(UDF_INIT *) {}
+
+// =====================================================
+// UDF: binlog_server_purge_channel(channel, up_to_file)
+// =====================================================
+
+static bool binlog_server_purge_channel_init(UDF_INIT *initid, UDF_ARGS *args,
+                                             char *message) {
+  if (args->arg_count != 2 || args->arg_type[0] != STRING_RESULT ||
+      args->arg_type[1] != STRING_RESULT) {
+    std::snprintf(message, MYSQL_ERRMSG_SIZE,
+                  "binlog_server_purge_channel(channel_name, up_to_file) "
+                  "requires two string arguments");
+    return true;
+  }
+  initid->maybe_null = true;
+  return false;
+}
+
+static long long binlog_server_purge_channel_func(UDF_INIT *, UDF_ARGS *args,
+                                                  unsigned char *is_null,
+                                                  unsigned char *error) {
+  if (!g_archive || args->args[0] == nullptr || args->args[1] == nullptr) {
+    *is_null = 1;
+    *error = 0;
+    return 0;
+  }
+  const long long n = g_archive->purge_channel(args->args[0], args->args[1]);
+  if (n < 0) {
+    binlog_server::bslog(
+        WARNING_LEVEL,
+        "binlog_server: purge_channel('%s', '%s') failed",
+        args->args[0], args->args[1]);
+    *is_null = 1;
+    *error = 0;
+    return 0;
+  }
+  *is_null = 0;
+  *error = 0;
+  return n;
+}
+
+static void binlog_server_purge_channel_deinit(UDF_INIT *) {}
+
+// =====================================================
+// UDF: binlog_server_purge_before_gtid(channel, gtid_set)
+// =====================================================
+
+static bool binlog_server_purge_gtid_init(UDF_INIT *initid, UDF_ARGS *args,
+                                          char *message) {
+  if (args->arg_count != 2 || args->arg_type[0] != STRING_RESULT ||
+      args->arg_type[1] != STRING_RESULT) {
+    std::snprintf(message, MYSQL_ERRMSG_SIZE,
+                  "binlog_server_purge_before_gtid(channel_name, gtid_set) "
+                  "requires two string arguments");
+    return true;
+  }
+  initid->maybe_null = true;
+  return false;
+}
+
+static long long binlog_server_purge_gtid_func(UDF_INIT *, UDF_ARGS *args,
+                                               unsigned char *is_null,
+                                               unsigned char *error) {
+  if (!g_archive || args->args[0] == nullptr || args->args[1] == nullptr) {
+    *is_null = 1;
+    *error = 0;
+    return 0;
+  }
+  const long long n =
+      g_archive->purge_before_gtid(args->args[0], args->args[1]);
+  if (n < 0) {
+    binlog_server::bslog(
+        WARNING_LEVEL,
+        "binlog_server: purge_before_gtid('%s', ...) failed",
+        args->args[0]);
+    *is_null = 1;
+    *error = 0;
+    return 0;
+  }
+  *is_null = 0;
+  *error = 0;
+  return n;
+}
+
+static void binlog_server_purge_gtid_deinit(UDF_INIT *) {}
+
+// =====================================================
+// UDF: binlog_server_purge_before_timestamp(channel, ts)
+// =====================================================
+
+static bool binlog_server_purge_ts_init(UDF_INIT *initid, UDF_ARGS *args,
+                                        char *message) {
+  if (args->arg_count != 2 || args->arg_type[0] != STRING_RESULT ||
+      args->arg_type[1] != INT_RESULT) {
+    std::snprintf(message, MYSQL_ERRMSG_SIZE,
+                  "binlog_server_purge_before_timestamp(channel_name, "
+                  "unix_timestamp) requires (string, integer) arguments");
+    return true;
+  }
+  initid->maybe_null = true;
+  return false;
+}
+
+static long long binlog_server_purge_ts_func(UDF_INIT *, UDF_ARGS *args,
+                                             unsigned char *is_null,
+                                             unsigned char *error) {
+  if (!g_archive || args->args[0] == nullptr || args->args[1] == nullptr) {
+    *is_null = 1;
+    *error = 0;
+    return 0;
+  }
+  const unsigned long ts =
+      static_cast<unsigned long>(*reinterpret_cast<long long *>(args->args[1]));
+  const long long n = g_archive->purge_before_timestamp(args->args[0], ts);
+  if (n < 0) {
+    binlog_server::bslog(
+        WARNING_LEVEL,
+        "binlog_server: purge_before_timestamp('%s', %lu) failed",
+        args->args[0], ts);
+    *is_null = 1;
+    *error = 0;
+    return 0;
+  }
+  *is_null = 0;
+  *error = 0;
+  return n;
+}
+
+static void binlog_server_purge_ts_deinit(UDF_INIT *) {}
 
 }  // extern "C"
 
@@ -383,6 +540,45 @@ static mysql_service_status_t component_init() {
     }
   }
 
+  // Register system variable: binlog_server.rewrite_file_size
+  {
+    INTEGRAL_CHECK_ARG(ulonglong) rfs_arg;
+    rfs_arg.def_val = 0;
+    rfs_arg.min_val = 0;
+    rfs_arg.max_val = 1099511627776ULL;  // 1 TiB
+    rfs_arg.blk_sz = 0;
+    if (mysql_service_component_sys_variable_register->register_variable(
+            "binlog_server", "rewrite_file_size",
+            PLUGIN_VAR_LONGLONG | PLUGIN_VAR_RQCMDARG,
+            "Target archive file size for local rewrite rotation (bytes). "
+            "NOT YET IMPLEMENTED -- setting a non-zero value has no effect. "
+            "Set to 0 (default) to disable.",
+            nullptr, rewrite_file_size_update, (void *)&rfs_arg,
+            (void *)&sysvar_rewrite_file_size)) {
+      binlog_server::bslog(WARNING_LEVEL,
+                           "binlog_server: failed to register "
+                           "rewrite_file_size system variable");
+    }
+  }
+
+  // Register system variable: binlog_server.rewrite_base_name
+  {
+    STR_CHECK_ARG(str) rbn_arg;
+    rbn_arg.def_val = nullptr;
+    if (mysql_service_component_sys_variable_register->register_variable(
+            "binlog_server", "rewrite_base_name",
+            PLUGIN_VAR_STR | PLUGIN_VAR_MEMALLOC | PLUGIN_VAR_RQCMDARG,
+            "Base filename pattern for rewritten archive files (e.g. "
+            "'archive'). NOT YET IMPLEMENTED -- setting a value has no "
+            "effect. Empty (default) disables.",
+            nullptr, rewrite_base_name_update, (void *)&rbn_arg,
+            (void *)&sysvar_rewrite_base_name)) {
+      binlog_server::bslog(WARNING_LEVEL,
+                           "binlog_server: failed to register "
+                           "rewrite_base_name system variable");
+    }
+  }
+
   // Wire up ArchiveSender with storage and persisted default_serve_channel
   binlog_server::ArchiveSender::instance().set_storage(g_archive);
   binlog_server::ArchiveSender::instance().set_default_channel(
@@ -439,6 +635,35 @@ static mysql_service_status_t component_init() {
     binlog_server::bslog(WARNING_LEVEL,
                          "binlog_server: failed to register "
                          "binlog_server_rebuild_archive_index() UDF");
+  }
+
+  // Register purge UDFs
+  if (udf_registration_srv->udf_register(
+          "binlog_server_purge_channel", INT_RESULT,
+          reinterpret_cast<Udf_func_any>(binlog_server_purge_channel_func),
+          binlog_server_purge_channel_init,
+          binlog_server_purge_channel_deinit)) {
+    binlog_server::bslog(WARNING_LEVEL,
+                         "binlog_server: failed to register "
+                         "binlog_server_purge_channel() UDF");
+  }
+  if (udf_registration_srv->udf_register(
+          "binlog_server_purge_before_gtid", INT_RESULT,
+          reinterpret_cast<Udf_func_any>(binlog_server_purge_gtid_func),
+          binlog_server_purge_gtid_init,
+          binlog_server_purge_gtid_deinit)) {
+    binlog_server::bslog(WARNING_LEVEL,
+                         "binlog_server: failed to register "
+                         "binlog_server_purge_before_gtid() UDF");
+  }
+  if (udf_registration_srv->udf_register(
+          "binlog_server_purge_before_timestamp", INT_RESULT,
+          reinterpret_cast<Udf_func_any>(binlog_server_purge_ts_func),
+          binlog_server_purge_ts_init,
+          binlog_server_purge_ts_deinit)) {
+    binlog_server::bslog(WARNING_LEVEL,
+                         "binlog_server: failed to register "
+                         "binlog_server_purge_before_timestamp() UDF");
   }
 
   // Apply initial user_channel_map spec (CSV applies; table:// may fail
@@ -506,12 +731,43 @@ static mysql_service_status_t component_deinit() {
       if (was_present == 0) break;
     }
   }
+  {
+    int was_present = 0;
+    for (int i = 0; i < 10; ++i) {
+      if (!udf_registration_srv->udf_unregister(
+              "binlog_server_purge_channel", &was_present))
+        break;
+      if (was_present == 0) break;
+    }
+  }
+  {
+    int was_present = 0;
+    for (int i = 0; i < 10; ++i) {
+      if (!udf_registration_srv->udf_unregister(
+              "binlog_server_purge_before_gtid", &was_present))
+        break;
+      if (was_present == 0) break;
+    }
+  }
+  {
+    int was_present = 0;
+    for (int i = 0; i < 10; ++i) {
+      if (!udf_registration_srv->udf_unregister(
+              "binlog_server_purge_before_timestamp", &was_present))
+        break;
+      if (was_present == 0) break;
+    }
+  }
 
   // Unregister PFS tables (reverse order)
   binlog_server::unregister_pfs_archive_table();
   binlog_server::unregister_pfs_storage_table();
   binlog_server::unregister_pfs_status_table();
 
+  mysql_service_component_sys_variable_unregister->unregister_variable(
+      "binlog_server", "rewrite_base_name");
+  mysql_service_component_sys_variable_unregister->unregister_variable(
+      "binlog_server", "rewrite_file_size");
   mysql_service_component_sys_variable_unregister->unregister_variable(
       "binlog_server", "user_channel_map");
   mysql_service_component_sys_variable_unregister->unregister_variable(

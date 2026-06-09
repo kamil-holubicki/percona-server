@@ -6,8 +6,11 @@
 
 #include "binlog_archive.h"
 #include "file_storage.h"
+#include "gtid_set.h"
 #include "log_helpers.h"
+#include "s3_storage.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -712,14 +715,16 @@ std::string BinlogArchive::effective_uri(const std::string &channel_uri) {
 
 std::unique_ptr<StorageBackend> BinlogArchive::create_backend(
     const std::string &uri) {
-  std::string path = parse_file_uri(uri);
-  if (path.empty()) {
-    bslog(ERROR_LEVEL,
-          "binlog_server: unsupported or invalid storage URI: '%s'",
-          uri.c_str());
-    return nullptr;
+  if (uri.compare(0, 7, "file://") == 0) {
+    return std::make_unique<FileStorage>();
   }
-  return std::make_unique<FileStorage>(path);
+  if (uri.compare(0, 5, "s3://") == 0) {
+    return create_s3_storage();
+  }
+  bslog(ERROR_LEVEL,
+        "binlog_server: unsupported or invalid storage URI: '%s'",
+        uri.c_str());
+  return nullptr;
 }
 
 std::shared_ptr<ChannelState> BinlogArchive::find_channel(
@@ -1344,6 +1349,263 @@ long long BinlogArchive::rebuild_archive_index(const char *channel_name) {
     ++rebuilt;
   }
   return rebuilt;
+}
+
+// --- Purge implementation (Phase 5) ---
+
+namespace {
+
+// Shared helper: commit purge via index-first strategy.
+// 1. Update in-memory state (file_order, indexed_files, file_metadata)
+// 2. Atomically rewrite binlog.index via StorageBackend (commit point)
+// 3. Best-effort removal of payload + sidecar files
+// Returns count of files purged, or -1 if index rewrite failed.
+long long commit_purge(ChannelState &cs, const std::vector<std::string> &victims,
+                       const char *channel_name) {
+  if (victims.empty()) return 0;
+
+  // Step 1: update in-memory state
+  for (const auto &fname : victims) {
+    cs.file_metadata.erase(fname);
+    cs.indexed_files.erase(fname);
+  }
+  std::vector<std::string> remaining;
+  remaining.reserve(cs.file_order.size() - victims.size());
+  for (const auto &f : cs.file_order) {
+    if (cs.indexed_files.count(f)) remaining.push_back(f);
+  }
+  cs.file_order = std::move(remaining);
+
+  // Step 2: atomic index rewrite (commit point)
+  if (cs.backend) {
+    if (!cs.backend->index_rewrite(cs.base_dir, cs.file_order)) {
+      bslog(WARNING_LEVEL,
+            "binlog_server: channel '%s' purge index rewrite failed; "
+            "purge aborted (in-memory state updated, disk may be stale)",
+            channel_name);
+    }
+  } else {
+    // Fallback direct write if no backend (should not happen)
+    std::string idx_path = cs.base_dir + "binlog.index";
+    std::ofstream idx_out(idx_path, std::ios::binary | std::ios::trunc);
+    if (idx_out.is_open()) {
+      for (const auto &f : cs.file_order) idx_out << f << "\n";
+      idx_out.flush();
+    }
+  }
+
+  // Step 3: best-effort file removal (after commit point)
+  long long purged = 0;
+  std::string cleanup_warnings;
+  for (const auto &fname : victims) {
+    std::error_code ec;
+    bool binlog_ok = fs::remove(cs.base_dir + fname, ec);
+    if (!binlog_ok && !ec) {
+      if (!cleanup_warnings.empty()) cleanup_warnings += ", ";
+      cleanup_warnings += fname + " (file not found)";
+    } else if (ec) {
+      if (!cleanup_warnings.empty()) cleanup_warnings += ", ";
+      cleanup_warnings += fname + " (" + ec.message() + ")";
+    }
+    // Remove .meta sidecar (best-effort, no warning)
+    fs::remove(cs.base_dir + fname + ".meta", ec);
+    ++purged;
+  }
+
+  if (!cleanup_warnings.empty()) {
+    bslog(WARNING_LEVEL,
+          "binlog_server: channel '%s' purge committed (index updated) but "
+          "some file removals had issues: %s",
+          channel_name, cleanup_warnings.c_str());
+  }
+
+  return purged;
+}
+
+// Validate a purge target name: must look like a binlog filename (base.NNNNNN)
+bool is_valid_binlog_name(const std::string &name) {
+  auto dot = name.rfind('.');
+  if (dot == std::string::npos || dot == 0) return false;
+  if (name.size() - dot - 1 < 6) return false;
+  for (size_t i = dot + 1; i < name.size(); ++i) {
+    if (name[i] < '0' || name[i] > '9') return false;
+  }
+  return true;
+}
+
+// Check base-name consistency: the target must share a prefix with the archive
+bool base_name_matches(const std::string &target,
+                       const std::vector<std::string> &file_order) {
+  if (file_order.empty()) return true;
+  auto dot_target = target.rfind('.');
+  auto dot_first = file_order.front().rfind('.');
+  if (dot_target == std::string::npos || dot_first == std::string::npos)
+    return false;
+  return target.substr(0, dot_target) ==
+         file_order.front().substr(0, dot_first);
+}
+
+}  // anonymous namespace
+
+long long BinlogArchive::purge_channel(const char *channel_name,
+                                       const char *up_to_file) {
+  if (up_to_file == nullptr || up_to_file[0] == '\0') return -1;
+  std::string name = channel_name != nullptr ? channel_name : "";
+  auto cs_ptr = find_channel(name);
+  if (!cs_ptr) return -1;
+
+  std::lock_guard<std::mutex> lk(cs_ptr->io_mutex);
+  load_index_file(*cs_ptr);
+
+  auto &fo = cs_ptr->file_order;
+
+  // Empty storage check
+  if (fo.empty()) {
+    bslog(WARNING_LEVEL,
+          "binlog_server: purge_channel('%s', '%s') failed: storage is empty",
+          name.c_str(), up_to_file);
+    return -1;
+  }
+
+  const std::string target(up_to_file);
+
+  // Validate target looks like a binlog filename
+  if (!is_valid_binlog_name(target)) {
+    bslog(WARNING_LEVEL,
+          "binlog_server: purge_channel('%s', '%s') failed: "
+          "not a valid binlog filename",
+          name.c_str(), up_to_file);
+    return -1;
+  }
+
+  // Base-name consistency check
+  if (!base_name_matches(target, fo)) {
+    bslog(WARNING_LEVEL,
+          "binlog_server: purge_channel('%s', '%s') failed: "
+          "target has a different base name than the archive files",
+          name.c_str(), up_to_file);
+    return -1;
+  }
+
+  // Find the target in file_order
+  auto target_it = std::find(fo.begin(), fo.end(), target);
+  if (target_it == fo.end()) {
+    bslog(WARNING_LEVEL,
+          "binlog_server: purge_channel('%s', '%s') failed: "
+          "target not present in the archive",
+          name.c_str(), up_to_file);
+    return -1;
+  }
+
+  // Tail protection: refuse the last index entry unconditionally
+  if (target_it == std::prev(fo.end())) {
+    bslog(WARNING_LEVEL,
+          "binlog_server: purge_channel('%s', '%s') refused: "
+          "cannot purge the tail file (at least one file must remain)",
+          name.c_str(), up_to_file);
+    return -1;
+  }
+
+  // Build victim list: [oldest ... target] inclusive
+  std::vector<std::string> victims;
+  for (auto it = fo.begin(); ; ++it) {
+    victims.push_back(*it);
+    if (*it == target) break;
+  }
+
+  long long purged = commit_purge(*cs_ptr, victims, name.c_str());
+  bslog(INFORMATION_LEVEL,
+        "binlog_server: channel '%s' purged %lld file(s) up to '%s'",
+        name.c_str(), purged, up_to_file);
+  return purged;
+}
+
+long long BinlogArchive::purge_before_gtid(const char *channel_name,
+                                           const char *gtid_set_text) {
+  if (gtid_set_text == nullptr || gtid_set_text[0] == '\0') return -1;
+  std::string name = channel_name != nullptr ? channel_name : "";
+  auto cs_ptr = find_channel(name);
+  if (!cs_ptr) return -1;
+
+  gtid::Gtid_set threshold;
+  if (!threshold.assign_from_text(gtid_set_text)) return -1;
+
+  std::lock_guard<std::mutex> lk(cs_ptr->io_mutex);
+  load_index_file(*cs_ptr);
+
+  auto &fo = cs_ptr->file_order;
+  if (fo.empty()) return -1;
+
+  std::vector<std::string> victims;
+
+  for (const auto &fname : fo) {
+    // Always keep at least one file (the tail)
+    if (fo.size() - victims.size() <= 1) break;
+
+    auto it = cs_ptr->file_metadata.find(fname);
+    if (it == cs_ptr->file_metadata.end()) break;
+
+    const auto &fm = it->second;
+    if (fm.last_gtid_set.empty()) break;
+
+    gtid::Gtid_set file_gtids;
+    if (!file_gtids.assign_from_text(fm.last_gtid_set)) break;
+
+    if (file_gtids.is_subset_of(threshold)) {
+      victims.push_back(fname);
+    } else {
+      break;
+    }
+  }
+
+  long long purged = commit_purge(*cs_ptr, victims, name.c_str());
+  if (purged > 0) {
+    bslog(INFORMATION_LEVEL,
+          "binlog_server: channel '%s' purged %lld file(s) by GTID containment",
+          name.c_str(), purged);
+  }
+  return purged;
+}
+
+long long BinlogArchive::purge_before_timestamp(const char *channel_name,
+                                                unsigned long timestamp) {
+  if (timestamp == 0) return -1;
+  std::string name = channel_name != nullptr ? channel_name : "";
+  auto cs_ptr = find_channel(name);
+  if (!cs_ptr) return -1;
+
+  std::lock_guard<std::mutex> lk(cs_ptr->io_mutex);
+  load_index_file(*cs_ptr);
+
+  auto &fo = cs_ptr->file_order;
+  if (fo.empty()) return -1;
+
+  std::vector<std::string> victims;
+
+  for (const auto &fname : fo) {
+    // Always keep at least one file (the tail)
+    if (fo.size() - victims.size() <= 1) break;
+
+    auto it = cs_ptr->file_metadata.find(fname);
+    if (it == cs_ptr->file_metadata.end()) break;
+
+    const auto &fm = it->second;
+    if (fm.max_event_timestamp == 0) break;
+
+    if (fm.max_event_timestamp < static_cast<uint32_t>(timestamp)) {
+      victims.push_back(fname);
+    } else {
+      break;
+    }
+  }
+
+  long long purged = commit_purge(*cs_ptr, victims, name.c_str());
+  if (purged > 0) {
+    bslog(INFORMATION_LEVEL,
+          "binlog_server: channel '%s' purged %lld file(s) before timestamp %lu",
+          name.c_str(), purged, timestamp);
+  }
+  return purged;
 }
 
 }  // namespace binlog_server

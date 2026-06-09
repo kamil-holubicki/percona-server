@@ -1,0 +1,117 @@
+include/rpl/init_source_replica.inc
+[connection master]
+
+# ---- Setup binlog server ----
+[connection slave]
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL PLUGIN binlog_server_relay SONAME 'BINLOG_SERVER_RELAY';
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = SOURCE_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1,
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORE/'
+  FOR CHANNEL 'purge_ch';
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA IO_THREAD FOR CHANNEL 'purge_ch';
+include/rpl/wait_for_receiver_to_start.inc [FOR CHANNEL 'purge_ch']
+
+# ---- Generate traffic to create multiple binlog files ----
+[connection master]
+CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(50));
+INSERT INTO t1 VALUES (1, 'one');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (2, 'two');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (3, 'three');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (4, 'four');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (5, 'five');
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'purge_ch']
+
+# ---- Rebuild archive index to populate metadata ----
+[connection slave]
+SELECT binlog_server_rebuild_archive_index('purge_ch') >= 0 AS rebuild_ok;
+rebuild_ok
+1
+
+# ---- Verify we have multiple files in archive ----
+include/assert.inc [archive has at least 5 files]
+
+# ==== Test 1: Purge by filename ====
+include/assert.inc [purge by filename removed 1 file]
+include/assert.inc [purged file no longer in archive table]
+
+# ==== Test 2: Sequential purge (second purge after first) ====
+include/assert.inc [second sequential purge removed 1 file]
+
+# ==== Test 3: Purge by timestamp ====
+include/assert.inc [purge by timestamp removed at least 1 file]
+include/assert.inc [archive shrunk after timestamp purge (at least 1 file remains)]
+
+# ==== Test 4: Tail-file protection (IO thread running) ====
+include/assert.inc [purging the tail file returns NULL (blocked)]
+
+# ==== Test 5: Tail-file protection after IO thread stopped ====
+STOP REPLICA IO_THREAD FOR CHANNEL 'purge_ch';
+include/rpl/wait_for_receiver_to_stop.inc [FOR CHANNEL 'purge_ch']
+include/assert.inc [purging tail file with IO stopped still returns NULL]
+
+# ==== Test 6: Nonexistent channel returns NULL ====
+include/assert.inc [purge on nonexistent channel returns NULL]
+
+# ==== Test 7: Invalid target name returns NULL ====
+include/assert.inc [invalid target name returns NULL]
+
+# ==== Test 8: Wrong base name returns NULL ====
+include/assert.inc [wrong base name returns NULL]
+
+# ==== Test 9: Re-purge already-purged file returns NULL ====
+include/assert.inc [re-purge of already-purged file returns NULL]
+
+# ==== Test 10: Purge by GTID ====
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = SOURCE_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1,
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORE/'
+  FOR CHANNEL 'purge_ch';
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA IO_THREAD FOR CHANNEL 'purge_ch';
+include/rpl/wait_for_receiver_to_start.inc [FOR CHANNEL 'purge_ch']
+[connection master]
+INSERT INTO t1 VALUES (6, 'six');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (7, 'seven');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (8, 'eight');
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'purge_ch']
+[connection slave]
+SELECT binlog_server_rebuild_archive_index('purge_ch') >= 0 AS rebuild2_ok;
+rebuild2_ok
+1
+# purge_before_gtid returned: 0
+
+# ---- Tear down ----
+[connection master]
+DROP TABLE t1;
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'purge_ch']
+[connection slave]
+STOP REPLICA IO_THREAD FOR CHANNEL 'purge_ch';
+include/rpl/wait_for_receiver_to_stop.inc [FOR CHANNEL 'purge_ch']
+RESET REPLICA ALL FOR CHANNEL 'purge_ch';
+SET GLOBAL binlog_server.default_storage_uri = '';
+SET GLOBAL binlog_server.default_serve_channel = '';
+SET GLOBAL binlog_server.rewrite_file_size = 0;
+SET GLOBAL binlog_server.rewrite_base_name = '';
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+include/rpl/deinit.inc

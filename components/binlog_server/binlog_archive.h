@@ -140,6 +140,17 @@ class BinlogArchive {
   // Rebuild .meta sidecars for a channel (backfill missing metadata)
   long long rebuild_archive_index(const char *channel_name);
 
+  // Purge archive files up to and including the named file
+  long long purge_channel(const char *channel_name, const char *up_to_file);
+
+  // Purge files whose accumulated GTID set is fully contained in the given set
+  long long purge_before_gtid(const char *channel_name,
+                              const char *gtid_set_text);
+
+  // Purge files whose max_event_timestamp is below the threshold (unix seconds)
+  long long purge_before_timestamp(const char *channel_name,
+                                   unsigned long timestamp);
+
  private:
   std::shared_ptr<ChannelState> find_channel(const std::string &name);
   std::unique_ptr<StorageBackend> create_backend(const std::string &uri);

@@ -97,7 +97,7 @@ SET GLOBAL binlog_server.default_serve_channel = 'src_a';
 | **Crash-safe** | On startup, the archive walks the last file to find the last fully-written event, truncates any partial tail, and restores the watermark. |
 | **Durable at transaction boundaries** | Every `Xid` / `XA_prepare` event triggers an `fsync(2)`, ensuring committed transactions survive a power loss. |
 
-## Current status (Phase 1 + Phase 2 + Phase 3 + Phase 4)
+## Current status (Phase 1–5)
 
 **Phase 1** — collection path:
 
@@ -136,10 +136,19 @@ SET GLOBAL binlog_server.default_serve_channel = 'src_a';
 - `.meta` sidecar files for fast metadata recovery (no full-archive rescan on startup)
 - `binlog_server_rebuild_archive_index()` UDF for backfilling missing metadata
 
+**Phase 5** — binlog purge + architecture for rotation & S3:
+
+- Purge operations: by file, GTID set, or timestamp (UDFs)
+- Atomic index-first commit order (tmp + fsync + rename before deletion)
+- Pin-based safety: files actively served to a downstream replica cannot be purged
+- S3 storage backend stub (`s3://` URIs recognized, all I/O returns "not implemented")
+- Rewrite/rotation architecture stub (`rewrite_file_size`, `rewrite_base_name` sysvars)
+- GTID renumberer stub for logical-clock adjustment in rewrite mode
+
 **Not yet implemented** (planned for later phases):
-- S3-compatible object storage backend
-- Binlog purging / retention policies
-- Local rotation / rewriting
+- S3-compatible object storage backend (stubs in place)
+- Local rotation / rewriting (stubs in place)
+- At-rest encryption
 - Point-in-time search queries (`search_by_timestamp`, `search_by_gtid_set`)
 
 ## License

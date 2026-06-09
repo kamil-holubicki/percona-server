@@ -462,6 +462,8 @@ them.
 | `binlog_server.default_storage_uri` | GLOBAL | String | `''` | Default `file://` URI for new BINLOG_SERVER channels |
 | `binlog_server.default_serve_channel` | GLOBAL | String | `''` | Channel name whose archive is served to downstream replicas when no user mapping matches |
 | `binlog_server.user_channel_map` | GLOBAL | String | `''` | User-to-channel routing. Two shapes: inline CSV (`user1=channel1,user2=channel2,...`) or table URI (`table://<db>.<tbl>`). See [Per-user channel routing](#per-user-channel-routing). |
+| `binlog_server.rewrite_file_size` | GLOBAL | ULONGLONG | `0` | Target archive file size for local rewrite rotation (bytes). **Not yet implemented** -- setting a non-zero value logs a warning and has no effect. |
+| `binlog_server.rewrite_base_name` | GLOBAL | String | `''` | Base filename pattern for rewritten archives. **Not yet implemented** -- setting a value logs a warning and has no effect. |
 
 ## UDFs
 
@@ -469,6 +471,9 @@ them.
 | --- | --- | --- |
 | `binlog_server_reload_user_channel_map()` | INT (mapping count) or NULL on failure | Re-reads the current `user_channel_map` spec and rebuilds the live routing map. Required after setting a `table://` URI; also useful to pick up table row changes without re-setting the sysvar. |
 | `binlog_server_rebuild_archive_index(channel)` | INT (files processed) or -1 on error | Scans every binlog file in the named channel's archive, extracts timestamps and GTID sets, and writes/updates `.meta` sidecar files. Use after manual file moves or if `.meta` files are missing. Pass the channel name as the single argument. |
+| `binlog_server_purge_channel(channel, up_to_file)` | INT (files purged) or NULL on error | Removes archive files from the oldest up to and including the named file. The active (tail) file can never be purged. |
+| `binlog_server_purge_before_gtid(channel, gtid_set)` | INT (files purged) or NULL on error | Removes archive files whose accumulated GTID set is fully contained in the given set. Files are processed from oldest to newest; stops at the first file not fully contained. |
+| `binlog_server_purge_before_timestamp(channel, unix_ts)` | INT (files purged) or NULL on error | Removes archive files whose `max_event_timestamp` is below the given Unix timestamp (seconds). |
 
 ### Examples
 
@@ -478,7 +483,26 @@ SELECT binlog_server_reload_user_channel_map();
 
 -- Rebuild metadata sidecars for a channel.
 SELECT binlog_server_rebuild_archive_index('prod_primary');
+
+-- Purge archive files up to a specific file.
+SELECT binlog_server_purge_channel('prod_primary', 'binlog.000005');
+
+-- Purge files older than a specific time (1 day ago).
+SELECT binlog_server_purge_before_timestamp('prod_primary', UNIX_TIMESTAMP() - 86400);
+
+-- Purge files whose GTIDs are fully contained in the replica's executed set.
+SELECT binlog_server_purge_before_gtid('prod_primary',
+    'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-100');
 ```
+
+### Purge safety rules
+
+- The active (tail) file -- the file currently being written to -- can
+  never be purged. Attempts return NULL.
+- Purge is channel-scoped: it never touches other channels' data.
+- The `binlog.index` file is rewritten after purge to reflect only the
+  remaining files.
+- Corresponding `.meta` sidecar files are removed alongside binlog files.
 
 ## Stopping and restarting
 
@@ -591,6 +615,40 @@ sequenceDiagram
     Server->>Component: deinit()
     Component-->>Server: unpublishes binlog_server_storage service
 ```
+
+## Planned features (not yet implemented)
+
+The following features are architecturally prepared with stub code and
+system variables, but their runtime logic is not yet active:
+
+### S3 storage backend
+
+The `s3://` URI scheme is recognized by the storage backend factory.
+Configuring a channel with `BINLOG_SERVER_STORAGE_URI = 's3://...'`
+will currently fail with a clear error:
+
+> S3 storage backend is not yet implemented. Use file:// storage URIs for now.
+
+The `S3Storage` class implements the full `StorageBackend` interface so
+that future implementation can be dropped in without interface changes.
+
+### Archive rewrite mode
+
+System variables `binlog_server.rewrite_file_size` and
+`binlog_server.rewrite_base_name` exist and can be set, but non-default
+values produce a warning and are ignored:
+
+> archive rewrite is not yet implemented; rewrite_file_size=N will be
+> ignored until a future release
+
+When implemented, rewrite mode will:
+- Rotate archive files at a configurable size boundary
+- Rename archive files using a custom base name pattern
+- Synthesize `PREVIOUS_GTIDS_LOG` events at each local file boundary
+  from the accumulated GTID set (GTID identifiers are never modified)
+- Fix `sequence_number` / `last_committed` logical clock fields when
+  coalescing multiple source segments into a single local file
+- Respect transaction boundaries (never split mid-transaction)
 
 ## Troubleshooting
 

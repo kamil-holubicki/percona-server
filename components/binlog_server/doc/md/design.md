@@ -29,6 +29,9 @@
 - [Serve path: event streaming and filtering](#serve-path-event-streaming-and-filtering)
 - [Serve path: tail-follow and heartbeat](#serve-path-tail-follow-and-heartbeat)
 - [User channel map loader](#user-channel-map-loader)
+- [Purge operations](#purge-operations)
+- [S3 storage backend (stub)](#s3-storage-backend-stub)
+- [Rewrite mode (stub)](#rewrite-mode-stub)
 - [Error code catalogue](#error-code-catalogue)
 - [Build wiring](#build-wiring)
 
@@ -670,6 +673,103 @@ Registered at `component_init()`, unregistered at `component_deinit()`.
 Takes no arguments; returns the number of mappings loaded (or NULL on
 failure). Calls `apply_spec()` with the current sysvar value, which is
 safe because UDF execution holds no sysvar/plugin locks.
+
+## Purge operations
+
+Three purge UDFs share a common `commit_purge()` core and differ only
+in how they select victim files:
+
+### Victim selection strategies
+
+| UDF | Strategy |
+| --- | --- |
+| `purge_channel(ch, file)` | Oldest → target (inclusive). Validates target exists in index and shares base name. |
+| `purge_before_gtid(ch, set)` | Walk oldest → newest; include file if its `last_gtid_set` metadata is a subset of the given set. Stop at first non-contained file. |
+| `purge_before_timestamp(ch, ts)` | Walk oldest → newest; include file if its `max_event_timestamp` metadata is below the given Unix timestamp. Stop at first file at or above threshold. |
+
+All three enforce the **tail-file invariant**: at least one file must
+always remain in the index.
+
+### Commit algorithm (`commit_purge`)
+
+```
+commit_purge(ChannelState &cs, victims, channel_name):
+  1. Pin check:
+     For each victim file, call ArchiveSender::is_file_pinned(channel, file).
+     If ANY victim is pinned → return -1 (entire purge refused).
+
+  2. Update in-memory state:
+     - Erase victims from cs.file_metadata, cs.indexed_files.
+     - Rebuild cs.file_order with remaining entries only.
+
+  3. Atomic index rewrite (commit point):
+     - backend->index_rewrite(dir, cs.file_order)
+       Implemented as: write to tmp file → fsync → rename over binlog.index.
+     - On failure: rollback in-memory state (re-insert victims), return -1.
+
+  4. Best-effort file deletion (after commit):
+     For each victim:
+       - fs::remove(base_dir + victim)
+       - fs::remove(base_dir + victim + ".meta")  // sidecar, no warning on fail
+     If any removal fails, log a warning but still return the count.
+     (Index is authoritative; orphan files are harmless.)
+```
+
+### File pin mechanism
+
+The `ArchiveSender` tracks which files are actively being read by
+downstream dump sessions:
+
+```cpp
+// In ArchiveSender (singleton)
+mutable std::mutex m_pin_mutex;
+std::map<std::string, std::set<std::string>> m_pinned_files;  // channel → files
+
+void pin_file(channel, filename);    // called when open_current_file() succeeds
+void unpin_file(channel, filename);  // called on file close or session end
+bool is_file_pinned(channel, filename) const;  // checked by commit_purge
+```
+
+Each `ArchiveDumpSession` pins at most one file at a time (the file
+currently being streamed). Unpinning happens when the session advances
+to the next file or terminates.
+
+### Purge validation helpers
+
+```
+is_valid_binlog_name(name):
+  - Must contain a '.' followed by ≥6 digits at end (e.g. "binlog.000003")
+
+base_name_matches(target, file_order):
+  - Prefix before the last '.' must match between target and existing files
+  - Prevents cross-channel or malformed names from passing
+```
+
+## S3 storage backend (stub)
+
+The `S3Storage` class in `s3_storage.{h,cc}` implements the full
+`StorageBackend` interface (including `open_write`, `open_read`,
+`rewrite_header`, `truncate_file`) but every I/O method:
+
+1. Logs a message: `"S3 storage backend is not yet implemented"`
+2. Returns failure (false / nullptr / 0)
+
+The factory recognizes `s3://` URIs and constructs an `S3Storage`
+instance, so configuration-time validation succeeds. Actual runtime
+I/O will fail with clear messages.
+
+## Rewrite mode (stub)
+
+Two system variables exist for future archive rotation:
+
+- `binlog_server.rewrite_file_size` (ULONGLONG, default 0)
+- `binlog_server.rewrite_base_name` (STRING, default '')
+
+Setting non-default values logs a warning and has no runtime effect.
+The `gtid_renumberer.{h,cc}` module provides a `LogicalClockState`
+struct for adjusting `sequence_number` / `last_committed` fields when
+coalescing multiple source segments. GTID identifiers (UUID:GNO) are
+never modified — only the logical clock is rebased.
 
 ## Error code catalogue
 

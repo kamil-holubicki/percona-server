@@ -4,21 +4,27 @@
    it under the terms of the GNU General Public License, version 2.0,
    as published by the Free Software Foundation. */
 
-#ifndef BINLOG_SERVER_FILE_STORAGE_H
-#define BINLOG_SERVER_FILE_STORAGE_H
+#ifndef BINLOG_SERVER_S3_STORAGE_H
+#define BINLOG_SERVER_S3_STORAGE_H
 
 #include "storage_backend.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace binlog_server {
 
-class FileStorage final : public StorageBackend {
+/// S3-backed storage for binlog archives.
+/// NOT YET IMPLEMENTED -- all I/O methods return failure with a clear message.
+/// The class exists to establish the API contract so that s3:// URIs are
+/// recognized and future implementation can be dropped in without interface
+/// changes.
+class S3Storage final : public StorageBackend {
  public:
-  FileStorage();
-  ~FileStorage() override = default;
+  S3Storage();
+  ~S3Storage() override;
 
   const char *type_tag() const override;
   bool uri_allowed(const char *uri, std::string *reason) const override;
@@ -44,6 +50,9 @@ class FileStorage final : public StorageBackend {
                      const std::string &data) override;
 };
 
+/// Factory function used by BinlogArchive::create_backend for s3:// URIs.
+std::unique_ptr<StorageBackend> create_s3_storage();
+
 }  // namespace binlog_server
 
-#endif /* BINLOG_SERVER_FILE_STORAGE_H */
+#endif /* BINLOG_SERVER_S3_STORAGE_H */
