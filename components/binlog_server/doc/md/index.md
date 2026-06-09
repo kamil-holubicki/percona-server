@@ -97,7 +97,7 @@ SET GLOBAL binlog_server.default_serve_channel = 'src_a';
 | **Crash-safe** | On startup, the archive walks the last file to find the last fully-written event, truncates any partial tail, and restores the watermark. |
 | **Durable at transaction boundaries** | Every `Xid` / `XA_prepare` event triggers an `fsync(2)`, ensuring committed transactions survive a power loss. |
 
-## Current status (Phase 1 + Phase 2)
+## Current status (Phase 1 + Phase 2 + Phase 3)
 
 **Phase 1** — collection path:
 
@@ -117,12 +117,22 @@ SET GLOBAL binlog_server.default_serve_channel = 'src_a';
 - Multiple concurrent downstream replicas supported
 - `default_serve_channel` sysvar routes dump connections to a named channel archive
 
+**Phase 3** — per-user channel routing:
+
+- `binlog_server.user_channel_map` sysvar for user-to-channel routing
+- Two configuration shapes: inline CSV (`user1=ch1,user2=ch2`) and `table://<db>.<tbl>`
+- `binlog_server_reload_user_channel_map()` UDF for on-demand table reload
+- `default_serve_channel` as fallback for unmapped users
+- Multiple upstream sources collected simultaneously with independent per-channel archives
+- Channel path sanitization (whitelist `[A-Za-z0-9_.-]`)
+- Per-channel `BINLOG_SERVER_STORAGE_URI` override
+
 **Not yet implemented** (planned for later phases):
-- Per-user channel routing (`user_channel_map` sysvar)
 - S3-compatible object storage backend
 - Performance Schema observability tables
 - Binlog purging
 - Local rotation / rewriting
+- Binlog metadata sidecars (per-file `.json` for faster GTID resolution)
 
 ## License
 

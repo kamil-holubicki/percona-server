@@ -5,5 +5,6 @@ MYSQL_ADD_COMPONENT(binlog_server
   log_helpers.cc
   archive_sender.cc
   gtid_set.cc
+  user_channel_map_loader.cc
   MODULE_ONLY
 )

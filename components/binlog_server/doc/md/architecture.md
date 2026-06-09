@@ -320,6 +320,19 @@ END_SERVICE_DEFINITION(mysql_binlog_dump_handler_io)
 | `_io` | `send_event` | `ArchiveDumpSession` | Sends an event buffer to the dump connection's NET |
 | `_io` | `flush` | `ArchiveDumpSession` | Flushes the NET write buffer |
 
+### Additional services acquired (Phase 3)
+
+| Service | Used by | Purpose |
+| --- | --- | --- |
+| `mysql_command_factory` | `user_channel_map_loader` | Open/close internal SQL session for table:// reads |
+| `mysql_command_options` | `user_channel_map_loader` | Set protocol/user/host for the internal session |
+| `mysql_command_query` | `user_channel_map_loader` | Execute SELECT against the mapping table |
+| `mysql_command_query_result` | `user_channel_map_loader` | Retrieve result set rows |
+| `mysql_command_field_info` | `user_channel_map_loader` | Verify column count of the mapping table |
+| `mysql_command_error_info` | `user_channel_map_loader` | Surface SQL errors to the operator |
+| `mysql_current_thread_reader` | `user_channel_map_loader` | Detect missing SQL context at startup |
+| `udf_registration` | Component init/deinit | Register/unregister `binlog_server_reload_user_channel_map()` |
+
 ## Storage backend abstraction
 
 ```mermaid

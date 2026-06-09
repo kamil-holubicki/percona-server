@@ -91,6 +91,7 @@
 <li><a href="#serve-path-gtid-position-resolution">Serve path: GTID position resolution</a></li>
 <li><a href="#serve-path-event-streaming-and-filtering">Serve path: event streaming and filtering</a></li>
 <li><a href="#serve-path-tail-follow-and-heartbeat">Serve path: tail-follow and heartbeat</a></li>
+<li><a href="#user-channel-map-loader">User channel map loader</a></li>
 <li><a href="#error-code-catalogue">Error code catalogue</a></li>
 <li><a href="#build-wiring">Build wiring</a></li>
 </ul>
@@ -130,6 +131,14 @@
 <tr>
 <td><code>components/binlog_server/gtid_set.cc</code></td>
 <td>Implements GTID text parsing, binary decoding, interval management, subset checks.</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/user_channel_map_loader.h</code></td>
+<td>Public API for the routing-map loader: <code>looks_like_table_uri()</code>, <code>parse_table_uri()</code>, <code>apply_spec()</code>, <code>apply_spec_no_sql()</code>.</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/user_channel_map_loader.cc</code></td>
+<td>Implementation: inline-CSV parsing, <code>table://</code> validation + <code>mysql_command_*</code>-based SELECT, live-map swap.</td>
 </tr>
 <tr>
 <td><code>components/binlog_server/server_services.h</code></td>
@@ -695,6 +704,52 @@ archive where most GTIDs are already applied from a prior lifecycle).</p>
 <p>The <code>mysql_thd_kill_handler</code> service is used to register a callback
 on the THD so that <code>KILL &lt;connection_id&gt;</code> or server shutdown
 immediately sets a flag that the tail-follow loop checks.</p>
+<h2 id="user-channel-map-loader">User channel map loader<a class="headerlink" href="#user-channel-map-loader" title="Permanent link">&#x00B6;</a></h2>
+<p>The <code>user_channel_map_loader</code> module (<code>user_channel_map_loader.{h,cc}</code>)
+manages the lifecycle of the <code>UserChannelMap</code> from the operator-facing
+<code>binlog_server.user_channel_map</code> sysvar.</p>
+<h3 id="two-shape-spec">Two-shape spec<a class="headerlink" href="#two-shape-spec" title="Permanent link">&#x00B6;</a></h3>
+<p>The sysvar accepts two shapes:</p>
+<ol>
+<li><strong>Inline CSV</strong>: <code>'user1=channel1,user2=channel2,...'</code> &mdash; parsed
+   and applied immediately.</li>
+<li><strong>Table URI</strong>: <code>'table://&lt;db&gt;.&lt;tbl&gt;'</code> &mdash; deferred at SET GLOBAL
+   time; loaded by the UDF or at component_init.</li>
+</ol>
+<h3 id="lock-safety-contract">Lock-safety contract<a class="headerlink" href="#lock-safety-contract" title="Permanent link">&#x00B6;</a></h3>
+<p>The sysvar update callback runs while the server's LOCK_plugin is
+held. The <code>table://</code> branch opens an internal <code>Srv_session</code> via
+<code>mysql_command_*</code> services, which re-acquires LOCK_plugin through
+<code>plugin_thdvar_init()</code>. Calling <code>apply_spec()</code> directly from the
+update callback would deadlock.</p>
+<p>Solution: two entry points:</p>
+<ul>
+<li><code>apply_spec_no_sql()</code> &mdash; safe from the update callback. CSV and
+  clear branches apply immediately; <code>table://</code> returns <code>-2</code> (deferred).</li>
+<li><code>apply_spec()</code> &mdash; full implementation including the SELECT.
+  Called from <code>component_init()</code> and the UDF (no sysvar locks held).</li>
+</ul>
+<h3 id="table-backed-routing">Table-backed routing<a class="headerlink" href="#table-backed-routing" title="Permanent link">&#x00B6;</a></h3>
+<p>The <code>run_select()</code> helper opens a local-protocol connection as
+<code>'mysql.session'@'localhost'</code> via:</p>
+<div class="codehilite"><pre><span></span><code>mysql_command_factory -&gt; init, connect
+mysql_command_options -&gt; MYSQL_COMMAND_PROTOCOL=nullptr, USER_NAME, HOST_NAME
+mysql_command_query   -&gt; &quot;SELECT user_name, channel_name FROM `&lt;db&gt;`.`&lt;tbl&gt;`&quot;
+mysql_command_query_result -&gt; store_result, fetch_row
+</code></pre></div>
+
+<p>Identifiers in the SQL are backtick-quoted defensively, but
+<code>parse_table_uri()</code> already restricts them to <code>[A-Za-z0-9_$]+</code> to
+prevent SQL injection.</p>
+<h3 id="failure-semantics">Failure semantics<a class="headerlink" href="#failure-semantics" title="Permanent link">&#x00B6;</a></h3>
+<p>On any failure the previously-loaded live map is preserved. This
+ensures a transient table-read failure (e.g. table dropped, ACL
+revoked) never silently empties replication routing mid-flight.</p>
+<h3 id="udf-binlog_server_reload_user_channel_map">UDF: <code>binlog_server_reload_user_channel_map()</code><a class="headerlink" href="#udf-binlog_server_reload_user_channel_map" title="Permanent link">&#x00B6;</a></h3>
+<p>Registered at <code>component_init()</code>, unregistered at <code>component_deinit()</code>.
+Takes no arguments; returns the number of mappings loaded (or NULL on
+failure). Calls <code>apply_spec()</code> with the current sysvar value, which is
+safe because UDF execution holds no sysvar/plugin locks.</p>
 <h2 id="error-code-catalogue">Error code catalogue<a class="headerlink" href="#error-code-catalogue" title="Permanent link">&#x00B6;</a></h2>
 <table>
 <thead>

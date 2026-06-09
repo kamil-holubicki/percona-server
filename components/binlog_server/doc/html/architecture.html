@@ -490,6 +490,58 @@ and <code>mysql_binlog_dump_handler_io.h</code>:</p>
 </tr>
 </tbody>
 </table>
+<h3 id="additional-services-acquired-phase-3">Additional services acquired (Phase 3)<a class="headerlink" href="#additional-services-acquired-phase-3" title="Permanent link">&#x00B6;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Service</th>
+<th>Used by</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>mysql_command_factory</code></td>
+<td><code>user_channel_map_loader</code></td>
+<td>Open/close internal SQL session for table:// reads</td>
+</tr>
+<tr>
+<td><code>mysql_command_options</code></td>
+<td><code>user_channel_map_loader</code></td>
+<td>Set protocol/user/host for the internal session</td>
+</tr>
+<tr>
+<td><code>mysql_command_query</code></td>
+<td><code>user_channel_map_loader</code></td>
+<td>Execute SELECT against the mapping table</td>
+</tr>
+<tr>
+<td><code>mysql_command_query_result</code></td>
+<td><code>user_channel_map_loader</code></td>
+<td>Retrieve result set rows</td>
+</tr>
+<tr>
+<td><code>mysql_command_field_info</code></td>
+<td><code>user_channel_map_loader</code></td>
+<td>Verify column count of the mapping table</td>
+</tr>
+<tr>
+<td><code>mysql_command_error_info</code></td>
+<td><code>user_channel_map_loader</code></td>
+<td>Surface SQL errors to the operator</td>
+</tr>
+<tr>
+<td><code>mysql_current_thread_reader</code></td>
+<td><code>user_channel_map_loader</code></td>
+<td>Detect missing SQL context at startup</td>
+</tr>
+<tr>
+<td><code>udf_registration</code></td>
+<td>Component init/deinit</td>
+<td>Register/unregister <code>binlog_server_reload_user_channel_map()</code></td>
+</tr>
+</tbody>
+</table>
 <h2 id="storage-backend-abstraction">Storage backend abstraction<a class="headerlink" href="#storage-backend-abstraction" title="Permanent link">&#x00B6;</a></h2>
 <div class="diagram">
 <div class="mermaid">

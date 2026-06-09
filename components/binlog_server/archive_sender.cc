@@ -784,6 +784,18 @@ bool UserChannelMap::set_from_csv(const char *csv) {
   return true;
 }
 
+bool UserChannelMap::set_from_pairs(
+    const std::vector<std::pair<std::string, std::string>> &pairs) {
+  std::map<std::string, std::string> parsed;
+  for (const auto &p : pairs) {
+    if (p.first.empty() || p.second.empty()) return false;
+    parsed[p.first] = p.second;
+  }
+  std::lock_guard<std::mutex> lock(m_mutex);
+  m_map = std::move(parsed);
+  return true;
+}
+
 std::string UserChannelMap::lookup(const char *user) const {
   if (user == nullptr || user[0] == '\0') return {};
   std::lock_guard<std::mutex> lock(m_mutex);
@@ -827,7 +839,7 @@ bool ArchiveSender::handle(MYSQL_THD thd, const char *log_ident,
                            const char *replica_executed_gtids_text,
                            std::uint32_t flags,
                            std::uint32_t source_server_id,
-                           std::uint32_t /*replica_server_id*/,
+                           std::uint32_t replica_server_id,
                            enum mysql_binlog_dump_handler_checksum_alg
                                negotiated_checksum_alg,
                            const char *replica_user) {
@@ -837,9 +849,11 @@ bool ArchiveSender::handle(MYSQL_THD thd, const char *log_ident,
   const std::string channel = resolve_channel(user);
   if (channel.empty()) {
     bslog(INFORMATION_LEVEL,
-          "binlog_server: dump from user '%s' has no channel mapping "
-          "and no default_serve_channel; falling through",
-          user);
+          "binlog_server: dump request from user='%s' "
+          "server_id=%u: no channel mapping and no "
+          "default_serve_channel configured; falling through to "
+          "native Binlog_sender",
+          user, static_cast<unsigned>(replica_server_id));
     return false;
   }
 
@@ -847,9 +861,12 @@ bool ArchiveSender::handle(MYSQL_THD thd, const char *log_ident,
       m_storage->resolve_channel_base_dir(channel.c_str());
   if (base_dir.empty()) {
     bslog_code(WARNING_LEVEL, ER_BINLOG_SERVER_CONFIG_REJECTED,
-               "dump from user '%s' resolved to channel '%s' but channel "
-               "is not configured; falling through",
-               user, channel.c_str());
+               "dump request from user='%s' server_id=%u resolved to "
+               "channel '%s' but that channel has no configured storage "
+               "(not yet started or configure_channel not called); "
+               "falling through",
+               user, static_cast<unsigned>(replica_server_id),
+               channel.c_str());
     return false;
   }
 
@@ -859,9 +876,9 @@ bool ArchiveSender::handle(MYSQL_THD thd, const char *log_ident,
       replica_executed_gtids_text[0] != '\0') {
     if (!replica_executed.assign_from_text(replica_executed_gtids_text)) {
       bslog_code(WARNING_LEVEL, ER_BINLOG_SERVER_INVARIANT_VIOLATED,
-                 "unparseable replica-executed GTID set from user '%s'; "
-                 "treating as empty",
-                 user);
+                 "unparseable replica-executed GTID set from user='%s' "
+                 "server_id=%u; treating as empty",
+                 user, static_cast<unsigned>(replica_server_id));
     } else {
       gtid_mode = !replica_executed.empty();
     }
@@ -869,19 +886,25 @@ bool ArchiveSender::handle(MYSQL_THD thd, const char *log_ident,
   const binlog_server::gtid::Gtid_set *excluded_ptr =
       gtid_mode ? &replica_executed : nullptr;
 
-  bslog(WARNING_LEVEL,
-        "binlog_server: serving dump for user '%s' channel '%s' "
-        "(base_dir='%s', gtid_mode=%d)",
-        user, channel.c_str(), base_dir.c_str(), static_cast<int>(gtid_mode));
+  bslog(INFORMATION_LEVEL,
+        "binlog_server: serving dump for user='%s' server_id=%u "
+        "channel='%s' base_dir='%s' gtid_mode=%s log_ident='%s' pos=%llu "
+        "flags=0x%04x",
+        user, static_cast<unsigned>(replica_server_id), channel.c_str(),
+        base_dir.c_str(), gtid_mode ? "ON" : "OFF",
+        log_ident == nullptr ? "" : log_ident,
+        static_cast<unsigned long long>(pos), static_cast<unsigned>(flags));
 
   ArchiveDumpSession session(
       thd, channel, base_dir, excluded_ptr,
       log_ident == nullptr ? "" : log_ident, pos, flags, source_server_id,
       static_cast<int>(negotiated_checksum_alg), m_trace_send_path);
   const bool rc = session.run();
-  bslog(WARNING_LEVEL,
-        "binlog_server: dump session ended for user '%s' channel '%s'", user,
-        channel.c_str());
+  bslog(INFORMATION_LEVEL,
+        "binlog_server: dump session ended for user='%s' server_id=%u "
+        "channel='%s' (result=%s)",
+        user, static_cast<unsigned>(replica_server_id), channel.c_str(),
+        rc ? "handled" : "error");
   return rc;
 }
 

@@ -14,7 +14,9 @@
 - [Configuring a channel](#configuring-a-channel)
 - [Multi-channel collection](#multi-channel-collection)
 - [Serving to downstream replicas](#serving-to-downstream-replicas)
+- [Per-user channel routing](#per-user-channel-routing)
 - [System variables](#system-variables)
+- [UDFs](#udfs)
 - [Stopping and restarting](#stopping-and-restarting)
 - [Resume after crash](#resume-after-crash)
 - [Day-2 operations](#day-2-operations)
@@ -257,12 +259,106 @@ When a downstream replica connects with `SOURCE_AUTO_POSITION=1`:
 4. Once all historical events are sent, the session tail-follows the
    active file, polling for new data and sending heartbeats.
 
+## Per-user channel routing
+
+When the binlog server collects from multiple upstream sources, you
+can route different downstream replicas to different archives based on
+the MySQL user they connect as.
+
+### Inline CSV routing
+
+The simplest form maps users to channels directly:
+
+```sql
+-- On the binlog-server node:
+SET GLOBAL binlog_server.user_channel_map = 'repl_a=src_a,repl_b=src_b';
+```
+
+When a downstream replica connects as `repl_a`, it will be served from
+the `src_a` archive. If a user is not in the map, the
+`default_serve_channel` is used as a fallback.
+
+### Table-backed routing
+
+For larger deployments, store the mapping in a table:
+
+```sql
+-- Create the mapping table.
+CREATE DATABASE IF NOT EXISTS binlog_server;
+CREATE TABLE binlog_server.user_routes (
+    user_name    VARCHAR(64) NOT NULL,
+    channel_name VARCHAR(64) NOT NULL,
+    PRIMARY KEY (user_name)
+);
+
+INSERT INTO binlog_server.user_routes VALUES
+    ('repl_a', 'src_a'),
+    ('repl_b', 'src_b');
+
+-- Grant access to the service user.
+GRANT SELECT ON binlog_server.user_routes TO 'mysql.session'@'localhost';
+
+-- Point the sysvar at the table.
+SET GLOBAL binlog_server.user_channel_map = 'table://binlog_server.user_routes';
+```
+
+The `table://` shape is *deferred* when set via `SET GLOBAL` because
+the sysvar update callback cannot safely open a SQL session. To
+actually load the rows, call the reload UDF:
+
+```sql
+SELECT binlog_server_reload_user_channel_map();
+```
+
+The table is also loaded automatically at `INSTALL COMPONENT` time
+(when a SQL context is available).
+
+### Routing resolution order
+
+```mermaid
+flowchart LR
+    USER["connecting user"] --> MAP{"user_channel_map<br/>lookup"}
+    MAP -->|"match"| CHANNEL["mapped channel"]
+    MAP -->|"no match"| FALLBACK{"default_serve_channel"}
+    FALLBACK -->|"set"| DEFAULT["default channel"]
+    FALLBACK -->|"empty"| PASSTHRU["fall through to<br/>standard Binlog_sender"]
+```
+
+### Example: multi-source with per-user routing
+
+```sql
+-- Collect from two sources:
+CHANGE REPLICATION SOURCE TO ... BINLOG_SERVER = 1
+    FOR CHANNEL 'prod_primary';
+CHANGE REPLICATION SOURCE TO ... BINLOG_SERVER = 1
+    FOR CHANNEL 'prod_secondary';
+
+START REPLICA IO_THREAD FOR CHANNEL 'prod_primary';
+START REPLICA IO_THREAD FOR CHANNEL 'prod_secondary';
+
+-- Route downstream replicas:
+SET GLOBAL binlog_server.user_channel_map =
+    'repl_primary=prod_primary,repl_secondary=prod_secondary';
+SET GLOBAL binlog_server.default_serve_channel = 'prod_primary';
+```
+
+Downstream replicas connecting as `repl_primary` get events from
+`prod_primary`; those connecting as `repl_secondary` get events from
+`prod_secondary`. Any other user falls back to the default.
+
 ## System variables
 
 | Variable | Scope | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `binlog_server.default_storage_uri` | GLOBAL | String | `''` | Default `file://` URI for new BINLOG_SERVER channels |
-| `binlog_server.default_serve_channel` | GLOBAL | String | `''` | Channel name whose archive is served to downstream replicas |
+| `binlog_server.default_serve_channel` | GLOBAL | String | `''` | Channel name whose archive is served to downstream replicas when no user mapping matches |
+| `binlog_server.user_channel_map` | GLOBAL | String | `''` | User-to-channel routing. Two shapes: inline CSV (`user1=channel1,user2=channel2,...`) or table URI (`table://<db>.<tbl>`). See [Per-user channel routing](#per-user-channel-routing). |
+
+## UDFs
+
+| Function | Returns | Description |
+| --- | --- | --- |
+| `binlog_server_reload_user_channel_map()` | INT (mapping count) or NULL on failure | Re-reads the current `user_channel_map` spec and rebuilds the live routing map. Required after setting a `table://` URI; also useful to pick up table row changes without re-setting the sysvar. |
 
 ## Stopping and restarting
 

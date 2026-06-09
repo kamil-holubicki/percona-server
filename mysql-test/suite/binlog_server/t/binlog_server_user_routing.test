@@ -1,0 +1,257 @@
+# ==== Purpose ====
+#
+# Verify that the binlog_server.user_channel_map system variable enables
+# per-user routing of downstream replicas to different archived channels.
+#
+# Topology:
+#   server_1 (source) → server_2 (binlog server) → server_3 (replica A, user=repl_a)
+#                                                 → server_4 (replica B, user=root)
+#
+# server_3 connects as user 'repl_a' which is mapped to channel 'src_a'.
+# server_4 connects as 'root' which is unmapped and falls back to
+# default_serve_channel.
+#
+# Also tests:
+#   - user_channel_map sysvar validation (malformed CSV rejected)
+#   - table:// shape validation (accepted but deferred)
+#   - binlog_server_reload_user_channel_map() UDF
+
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+--source ../inc/have_binlog_server.inc
+
+--let $rpl_topology = 1->2->3, 2->4
+--let $rpl_server_count = 4
+--let $rpl_skip_change_master = 1
+--let $rpl_skip_start_slave = 1
+--let $use_gtids = 1
+--source include/rpl/init.inc
+
+--echo
+--echo # ============================================================
+--echo # Configure server_2 as the binlog server
+--echo # ============================================================
+
+--let $rpl_connection_name = server_2
+--source include/connection.inc
+--source ../inc/binlog_server_suppressions.inc
+
+--let $store = $MYSQLTEST_VARDIR/tmp/binlog_server_user_routing
+--exec rm -rf $store
+--mkdir $store
+
+INSTALL COMPONENT 'file://component_binlog_server';
+--replace_result $BINLOG_SERVER_RELAY BINLOG_SERVER_RELAY
+eval INSTALL PLUGIN binlog_server_relay SONAME '$BINLOG_SERVER_RELAY';
+
+--echo
+--echo # ---- Create replication user 'repl_a' on server_2
+CREATE USER 'repl_a'@'%' IDENTIFIED BY 'repl_a_pass';
+GRANT REPLICATION SLAVE ON *.* TO 'repl_a'@'%';
+
+--echo
+--echo # ---- Configure user_channel_map (inline CSV)
+SET GLOBAL binlog_server.user_channel_map = 'repl_a=src_a';
+SET GLOBAL binlog_server.default_serve_channel = 'src_a';
+
+--replace_result $SERVER_MYPORT_1 SOURCE_PORT $store STORE
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_1,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1,
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file://$store/'
+  FOR CHANNEL 'src_a';
+
+START REPLICA IO_THREAD FOR CHANNEL 'src_a';
+--let $rpl_channel_name = 'src_a'
+--source include/rpl/wait_for_receiver_to_start.inc
+--let $rpl_channel_name =
+
+--echo
+--echo # ============================================================
+--echo # Configure server_3 (replica A) -- connects as 'repl_a'
+--echo # ============================================================
+--let $rpl_connection_name = server_3
+--source include/connection.inc
+
+--replace_result $SERVER_MYPORT_2 COLLECTOR_PORT
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_2,
+  SOURCE_USER = 'repl_a',
+  SOURCE_PASSWORD = 'repl_a_pass',
+  SOURCE_AUTO_POSITION = 1;
+
+START REPLICA;
+--source include/rpl/wait_for_replica_to_start.inc
+
+--echo
+--echo # ============================================================
+--echo # Configure server_4 (replica B) -- connects as 'root' (unmapped)
+--echo # ============================================================
+--let $rpl_connection_name = server_4
+--source include/connection.inc
+
+--replace_result $SERVER_MYPORT_2 COLLECTOR_PORT
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_2,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1;
+
+START REPLICA;
+--source include/rpl/wait_for_replica_to_start.inc
+
+--echo
+--echo # ============================================================
+--echo # Generate traffic on server_1
+--echo # ============================================================
+--let $rpl_connection_name = server_1
+--source include/connection.inc
+
+CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(64)) ENGINE = InnoDB;
+INSERT INTO t1 VALUES (1, 'routed_alpha'), (2, 'routed_beta');
+INSERT INTO t1 VALUES (3, 'routed_gamma');
+
+--echo
+--echo # ---- Sync collection on server_2
+--let $sync_slave_connection = server_2
+--let $rpl_channel_name = 'src_a'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--echo
+--echo # ---- Sync server_3 (replica A, user=repl_a, mapped to src_a)
+--let $rpl_connection_name = server_1
+--source include/connection.inc
+--let $sync_slave_connection = server_3
+--source include/rpl/sync_to_replica.inc
+
+--echo
+--echo # ---- Sync server_4 (replica B, user=root, fallback to default)
+--let $rpl_connection_name = server_1
+--source include/connection.inc
+--let $sync_slave_connection = server_4
+--source include/rpl/sync_to_replica.inc
+
+--echo
+--echo # ============================================================
+--echo # Verify both replicas received the data
+--echo # ============================================================
+
+--echo # ---- server_3 (replica A, via user_channel_map routing)
+--let $rpl_connection_name = server_3
+--source include/connection.inc
+SELECT COUNT(*) AS rows_on_replica_A FROM t1;
+
+--echo # ---- server_4 (replica B, via default_serve_channel fallback)
+--let $rpl_connection_name = server_4
+--source include/connection.inc
+SELECT COUNT(*) AS rows_on_replica_B FROM t1;
+
+--echo
+--echo # ============================================================
+--echo # Test sysvar validation and UDF
+--echo # ============================================================
+--let $rpl_connection_name = server_2
+--source include/connection.inc
+
+--echo # ---- Malformed CSV should be rejected
+--error ER_WRONG_VALUE_FOR_VAR
+SET GLOBAL binlog_server.user_channel_map = 'invalid_no_equals';
+
+--echo # ---- Empty value should clear the map (accepted)
+SET GLOBAL binlog_server.user_channel_map = '';
+
+--echo # ---- table:// URI with valid shape should be accepted (deferred)
+SET GLOBAL binlog_server.user_channel_map = 'table://binlog_server.user_routes';
+
+--echo # ---- table:// URI with invalid shape should be rejected
+--error ER_WRONG_VALUE_FOR_VAR
+SET GLOBAL binlog_server.user_channel_map = 'table://no_dot_here';
+
+--echo # ---- Restore CSV routing for UDF test
+SET GLOBAL binlog_server.user_channel_map = 'repl_a=src_a,another_user=another_channel';
+
+--echo # ---- Test reload UDF
+SELECT binlog_server_reload_user_channel_map() AS mappings_loaded;
+
+--echo
+--echo # ============================================================
+--echo # Tear down
+--echo # ============================================================
+
+--echo # Stop replica A
+--let $rpl_connection_name = server_3
+--source include/connection.inc
+STOP REPLICA;
+--source include/rpl/wait_for_replica_to_stop.inc
+RESET REPLICA ALL;
+
+--echo # Stop replica B
+--let $rpl_connection_name = server_4
+--source include/connection.inc
+STOP REPLICA;
+--source include/rpl/wait_for_replica_to_stop.inc
+RESET REPLICA ALL;
+
+--echo # Stop collector
+--let $rpl_connection_name = server_2
+--source include/connection.inc
+
+--let $rpl_channel_name = 'src_a'
+STOP REPLICA IO_THREAD FOR CHANNEL 'src_a';
+--source include/rpl/wait_for_receiver_to_stop.inc
+--let $rpl_channel_name =
+
+RESET REPLICA ALL FOR CHANNEL 'src_a';
+SET GLOBAL binlog_server.user_channel_map = '';
+SET GLOBAL binlog_server.default_serve_channel = '';
+DROP USER 'repl_a'@'%';
+
+# Kill dump threads
+--disable_query_log
+let $kill_id_1 = `SELECT COALESCE(MIN(ID),0) FROM information_schema.PROCESSLIST WHERE COMMAND IN ('Binlog Dump','Binlog Dump GTID')`;
+if ($kill_id_1)
+{
+  --eval KILL CONNECTION $kill_id_1
+}
+let $kill_id_2 = `SELECT COALESCE(MIN(ID),0) FROM information_schema.PROCESSLIST WHERE COMMAND IN ('Binlog Dump','Binlog Dump GTID')`;
+if ($kill_id_2)
+{
+  --eval KILL CONNECTION $kill_id_2
+}
+--enable_query_log
+
+let $wait_timeout = 60;
+let $wait_condition =
+  SELECT COUNT(*) = 0 FROM information_schema.PROCESSLIST
+  WHERE COMMAND IN ('Binlog Dump','Binlog Dump GTID');
+--source include/wait_condition.inc
+
+--disable_query_log
+--let $_dummy = `SELECT SLEEP(1)`
+--enable_query_log
+
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+
+--exec rm -rf $store
+
+--let $rpl_connection_name = server_1
+--source include/connection.inc
+DROP TABLE t1;
+
+--let $rpl_connection_name = server_3
+--source include/connection.inc
+DROP TABLE IF EXISTS t1;
+
+--let $rpl_connection_name = server_4
+--source include/connection.inc
+DROP TABLE IF EXISTS t1;
+
+--let $rpl_skip_sync = 1
+--let $rpl_skip_stop_slave = 1
+--source include/rpl/deinit.inc

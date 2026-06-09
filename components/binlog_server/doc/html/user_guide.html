@@ -77,7 +77,9 @@
 <li><a href="#configuring-a-channel">Configuring a channel</a></li>
 <li><a href="#multi-channel-collection">Multi-channel collection</a></li>
 <li><a href="#serving-to-downstream-replicas">Serving to downstream replicas</a></li>
+<li><a href="#per-user-channel-routing">Per-user channel routing</a></li>
 <li><a href="#system-variables">System variables</a></li>
+<li><a href="#udfs">UDFs</a></li>
 <li><a href="#stopping-and-restarting">Stopping and restarting</a></li>
 <li><a href="#resume-after-crash">Resume after crash</a></li>
 <li><a href="#day-2-operations">Day-2 operations</a></li>
@@ -349,6 +351,78 @@ between dump sessions, so they do not block each other.</p>
 <li>Once all historical events are sent, the session tail-follows the
    active file, polling for new data and sending heartbeats.</li>
 </ol>
+<h2 id="per-user-channel-routing">Per-user channel routing<a class="headerlink" href="#per-user-channel-routing" title="Permanent link">&#x00B6;</a></h2>
+<p>When the binlog server collects from multiple upstream sources, you
+can route different downstream replicas to different archives based on
+the MySQL user they connect as.</p>
+<h3 id="inline-csv-routing">Inline CSV routing<a class="headerlink" href="#inline-csv-routing" title="Permanent link">&#x00B6;</a></h3>
+<p>The simplest form maps users to channels directly:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">-- On the binlog-server node:</span>
+<span class="k">SET</span><span class="w"> </span><span class="k">GLOBAL</span><span class="w"> </span><span class="n">binlog_server</span><span class="p">.</span><span class="n">user_channel_map</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;repl_a=src_a,repl_b=src_b&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>When a downstream replica connects as <code>repl_a</code>, it will be served from
+the <code>src_a</code> archive. If a user is not in the map, the
+<code>default_serve_channel</code> is used as a fallback.</p>
+<h3 id="table-backed-routing">Table-backed routing<a class="headerlink" href="#table-backed-routing" title="Permanent link">&#x00B6;</a></h3>
+<p>For larger deployments, store the mapping in a table:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">-- Create the mapping table.</span>
+<span class="k">CREATE</span><span class="w"> </span><span class="k">DATABASE</span><span class="w"> </span><span class="k">IF</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">EXISTS</span><span class="w"> </span><span class="n">binlog_server</span><span class="p">;</span>
+<span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">binlog_server</span><span class="p">.</span><span class="n">user_routes</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="n">user_name</span><span class="w">    </span><span class="nb">VARCHAR</span><span class="p">(</span><span class="mi">64</span><span class="p">)</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span>
+<span class="w">    </span><span class="n">channel_name</span><span class="w"> </span><span class="nb">VARCHAR</span><span class="p">(</span><span class="mi">64</span><span class="p">)</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span>
+<span class="w">    </span><span class="k">PRIMARY</span><span class="w"> </span><span class="k">KEY</span><span class="w"> </span><span class="p">(</span><span class="n">user_name</span><span class="p">)</span>
+<span class="p">);</span>
+
+<span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">binlog_server</span><span class="p">.</span><span class="n">user_routes</span><span class="w"> </span><span class="k">VALUES</span>
+<span class="w">    </span><span class="p">(</span><span class="s1">&#39;repl_a&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">),</span>
+<span class="w">    </span><span class="p">(</span><span class="s1">&#39;repl_b&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;src_b&#39;</span><span class="p">);</span>
+
+<span class="c1">-- Grant access to the service user.</span>
+<span class="k">GRANT</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">binlog_server</span><span class="p">.</span><span class="n">user_routes</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="s1">&#39;mysql.session&#39;</span><span class="o">@</span><span class="s1">&#39;localhost&#39;</span><span class="p">;</span>
+
+<span class="c1">-- Point the sysvar at the table.</span>
+<span class="k">SET</span><span class="w"> </span><span class="k">GLOBAL</span><span class="w"> </span><span class="n">binlog_server</span><span class="p">.</span><span class="n">user_channel_map</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;table://binlog_server.user_routes&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>The <code>table://</code> shape is <em>deferred</em> when set via <code>SET GLOBAL</code> because
+the sysvar update callback cannot safely open a SQL session. To
+actually load the rows, call the reload UDF:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">binlog_server_reload_user_channel_map</span><span class="p">();</span>
+</code></pre></div>
+
+<p>The table is also loaded automatically at <code>INSTALL COMPONENT</code> time
+(when a SQL context is available).</p>
+<h3 id="routing-resolution-order">Routing resolution order<a class="headerlink" href="#routing-resolution-order" title="Permanent link">&#x00B6;</a></h3>
+<div class="diagram">
+<div class="mermaid">
+flowchart LR
+    USER["connecting user"] --> MAP{"user_channel_map<br/>lookup"}
+    MAP -->|"match"| CHANNEL["mapped channel"]
+    MAP -->|"no match"| FALLBACK{"default_serve_channel"}
+    FALLBACK -->|"set"| DEFAULT["default channel"]
+    FALLBACK -->|"empty"| PASSTHRU["fall through to<br/>standard Binlog_sender"]
+</div>
+</div>
+<h3 id="example-multi-source-with-per-user-routing">Example: multi-source with per-user routing<a class="headerlink" href="#example-multi-source-with-per-user-routing" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1">-- Collect from two sources:</span>
+<span class="n">CHANGE</span><span class="w"> </span><span class="n">REPLICATION</span><span class="w"> </span><span class="k">SOURCE</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="p">...</span><span class="w"> </span><span class="n">BINLOG_SERVER</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;prod_primary&#39;</span><span class="p">;</span>
+<span class="n">CHANGE</span><span class="w"> </span><span class="n">REPLICATION</span><span class="w"> </span><span class="k">SOURCE</span><span class="w"> </span><span class="k">TO</span><span class="w"> </span><span class="p">...</span><span class="w"> </span><span class="n">BINLOG_SERVER</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;prod_secondary&#39;</span><span class="p">;</span>
+
+<span class="k">START</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="n">IO_THREAD</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;prod_primary&#39;</span><span class="p">;</span>
+<span class="k">START</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="n">IO_THREAD</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;prod_secondary&#39;</span><span class="p">;</span>
+
+<span class="c1">-- Route downstream replicas:</span>
+<span class="k">SET</span><span class="w"> </span><span class="k">GLOBAL</span><span class="w"> </span><span class="n">binlog_server</span><span class="p">.</span><span class="n">user_channel_map</span><span class="w"> </span><span class="o">=</span>
+<span class="w">    </span><span class="s1">&#39;repl_primary=prod_primary,repl_secondary=prod_secondary&#39;</span><span class="p">;</span>
+<span class="k">SET</span><span class="w"> </span><span class="k">GLOBAL</span><span class="w"> </span><span class="n">binlog_server</span><span class="p">.</span><span class="n">default_serve_channel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;prod_primary&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>Downstream replicas connecting as <code>repl_primary</code> get events from
+<code>prod_primary</code>; those connecting as <code>repl_secondary</code> get events from
+<code>prod_secondary</code>. Any other user falls back to the default.</p>
 <h2 id="system-variables">System variables<a class="headerlink" href="#system-variables" title="Permanent link">&#x00B6;</a></h2>
 <table>
 <thead>
@@ -373,7 +447,31 @@ between dump sessions, so they do not block each other.</p>
 <td>GLOBAL</td>
 <td>String</td>
 <td><code>''</code></td>
-<td>Channel name whose archive is served to downstream replicas</td>
+<td>Channel name whose archive is served to downstream replicas when no user mapping matches</td>
+</tr>
+<tr>
+<td><code>binlog_server.user_channel_map</code></td>
+<td>GLOBAL</td>
+<td>String</td>
+<td><code>''</code></td>
+<td>User-to-channel routing. Two shapes: inline CSV (<code>user1=channel1,user2=channel2,...</code>) or table URI (<code>table://&lt;db&gt;.&lt;tbl&gt;</code>). See <a href="#per-user-channel-routing">Per-user channel routing</a>.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="udfs">UDFs<a class="headerlink" href="#udfs" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Returns</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>binlog_server_reload_user_channel_map()</code></td>
+<td>INT (mapping count) or NULL on failure</td>
+<td>Re-reads the current <code>user_channel_map</code> spec and rebuilds the live routing map. Required after setting a <code>table://</code> URI; also useful to pick up table row changes without re-setting the sysvar.</td>
 </tr>
 </tbody>
 </table>

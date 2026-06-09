@@ -38,6 +38,8 @@ class BinlogArchive;
 class UserChannelMap {
  public:
   bool set_from_csv(const char *csv);
+  bool set_from_pairs(
+      const std::vector<std::pair<std::string, std::string>> &pairs);
   std::string lookup(const char *user) const;
   std::size_t size() const;
   void clear();

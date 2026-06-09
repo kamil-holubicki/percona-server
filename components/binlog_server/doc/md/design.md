@@ -28,6 +28,7 @@
 - [Serve path: GTID position resolution](#serve-path-gtid-position-resolution)
 - [Serve path: event streaming and filtering](#serve-path-event-streaming-and-filtering)
 - [Serve path: tail-follow and heartbeat](#serve-path-tail-follow-and-heartbeat)
+- [User channel map loader](#user-channel-map-loader)
 - [Error code catalogue](#error-code-catalogue)
 - [Build wiring](#build-wiring)
 
@@ -42,6 +43,8 @@
 | `components/binlog_server/archive_sender.cc` | Implements `ArchiveSender`, `ArchiveDumpSession` (GTID resolution, event streaming, tail-follow). |
 | `components/binlog_server/gtid_set.h` | Declares `binlog_server::gtid::Gtid_set` (component-local GTID implementation). |
 | `components/binlog_server/gtid_set.cc` | Implements GTID text parsing, binary decoding, interval management, subset checks. |
+| `components/binlog_server/user_channel_map_loader.h` | Public API for the routing-map loader: `looks_like_table_uri()`, `parse_table_uri()`, `apply_spec()`, `apply_spec_no_sql()`. |
+| `components/binlog_server/user_channel_map_loader.cc` | Implementation: inline-CSV parsing, `table://` validation + `mysql_command_*`-based SELECT, live-map swap. |
 | `components/binlog_server/server_services.h` | Thin C++ aliases for `mysql_binlog_dump_handler_register`, `_io`, `mysql_thd_kill_handler`. |
 | `components/binlog_server/storage_backend.h` | Abstract `StorageBackend` interface. |
 | `components/binlog_server/file_storage.h` | `FileStorage` &mdash; concrete backend for `file://` URIs. |
@@ -608,6 +611,65 @@ archive where most GTIDs are already applied from a prior lifecycle).
 The `mysql_thd_kill_handler` service is used to register a callback
 on the THD so that `KILL <connection_id>` or server shutdown
 immediately sets a flag that the tail-follow loop checks.
+
+## User channel map loader
+
+The `user_channel_map_loader` module (`user_channel_map_loader.{h,cc}`)
+manages the lifecycle of the `UserChannelMap` from the operator-facing
+`binlog_server.user_channel_map` sysvar.
+
+### Two-shape spec
+
+The sysvar accepts two shapes:
+
+1. **Inline CSV**: `'user1=channel1,user2=channel2,...'` &mdash; parsed
+   and applied immediately.
+2. **Table URI**: `'table://<db>.<tbl>'` &mdash; deferred at SET GLOBAL
+   time; loaded by the UDF or at component_init.
+
+### Lock-safety contract
+
+The sysvar update callback runs while the server's LOCK_plugin is
+held. The `table://` branch opens an internal `Srv_session` via
+`mysql_command_*` services, which re-acquires LOCK_plugin through
+`plugin_thdvar_init()`. Calling `apply_spec()` directly from the
+update callback would deadlock.
+
+Solution: two entry points:
+
+- `apply_spec_no_sql()` &mdash; safe from the update callback. CSV and
+  clear branches apply immediately; `table://` returns `-2` (deferred).
+- `apply_spec()` &mdash; full implementation including the SELECT.
+  Called from `component_init()` and the UDF (no sysvar locks held).
+
+### Table-backed routing
+
+The `run_select()` helper opens a local-protocol connection as
+`'mysql.session'@'localhost'` via:
+
+```
+mysql_command_factory -> init, connect
+mysql_command_options -> MYSQL_COMMAND_PROTOCOL=nullptr, USER_NAME, HOST_NAME
+mysql_command_query   -> "SELECT user_name, channel_name FROM `<db>`.`<tbl>`"
+mysql_command_query_result -> store_result, fetch_row
+```
+
+Identifiers in the SQL are backtick-quoted defensively, but
+`parse_table_uri()` already restricts them to `[A-Za-z0-9_$]+` to
+prevent SQL injection.
+
+### Failure semantics
+
+On any failure the previously-loaded live map is preserved. This
+ensures a transient table-read failure (e.g. table dropped, ACL
+revoked) never silently empties replication routing mid-flight.
+
+### UDF: `binlog_server_reload_user_channel_map()`
+
+Registered at `component_init()`, unregistered at `component_deinit()`.
+Takes no arguments; returns the number of mappings loaded (or NULL on
+failure). Calls `apply_spec()` with the current sysvar value, which is
+safe because UDF execution holds no sysvar/plugin locks.
 
 ## Error code catalogue
 

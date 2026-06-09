@@ -1,0 +1,145 @@
+include/rpl/init.inc [topology=1->2->3, 2->4]
+
+# ============================================================
+# Configure server_2 as the binlog server
+# ============================================================
+[connection server_2]
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL PLUGIN binlog_server_relay SONAME 'BINLOG_SERVER_RELAY';
+
+# ---- Create replication user 'repl_a' on server_2
+CREATE USER 'repl_a'@'%' IDENTIFIED BY 'repl_a_pass';
+GRANT REPLICATION SLAVE ON *.* TO 'repl_a'@'%';
+
+# ---- Configure user_channel_map (inline CSV)
+SET GLOBAL binlog_server.user_channel_map = 'repl_a=src_a';
+SET GLOBAL binlog_server.default_serve_channel = 'src_a';
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = SOURCE_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1,
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORE/'
+  FOR CHANNEL 'src_a';
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA IO_THREAD FOR CHANNEL 'src_a';
+include/rpl/wait_for_receiver_to_start.inc [FOR CHANNEL 'src_a']
+
+# ============================================================
+# Configure server_3 (replica A) -- connects as 'repl_a'
+# ============================================================
+[connection server_3]
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = COLLECTOR_PORT,
+SOURCE_USER = 'repl_a',
+SOURCE_PASSWORD = 'repl_a_pass',
+SOURCE_AUTO_POSITION = 1;
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA;
+include/rpl/wait_for_replica_to_start.inc
+
+# ============================================================
+# Configure server_4 (replica B) -- connects as 'root' (unmapped)
+# ============================================================
+[connection server_4]
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = COLLECTOR_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1;
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA;
+include/rpl/wait_for_replica_to_start.inc
+
+# ============================================================
+# Generate traffic on server_1
+# ============================================================
+[connection server_1]
+CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(64)) ENGINE = InnoDB;
+INSERT INTO t1 VALUES (1, 'routed_alpha'), (2, 'routed_beta');
+INSERT INTO t1 VALUES (3, 'routed_gamma');
+
+# ---- Sync collection on server_2
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'src_a']
+
+# ---- Sync server_3 (replica A, user=repl_a, mapped to src_a)
+[connection server_1]
+include/rpl/sync_to_replica.inc
+
+# ---- Sync server_4 (replica B, user=root, fallback to default)
+[connection server_1]
+include/rpl/sync_to_replica.inc
+
+# ============================================================
+# Verify both replicas received the data
+# ============================================================
+# ---- server_3 (replica A, via user_channel_map routing)
+[connection server_3]
+SELECT COUNT(*) AS rows_on_replica_A FROM t1;
+rows_on_replica_A
+3
+# ---- server_4 (replica B, via default_serve_channel fallback)
+[connection server_4]
+SELECT COUNT(*) AS rows_on_replica_B FROM t1;
+rows_on_replica_B
+3
+
+# ============================================================
+# Test sysvar validation and UDF
+# ============================================================
+[connection server_2]
+# ---- Malformed CSV should be rejected
+SET GLOBAL binlog_server.user_channel_map = 'invalid_no_equals';
+ERROR 42000: Variable 'binlog_server.user_channel_map' can't be set to the value of 'invalid_no_equals'
+# ---- Empty value should clear the map (accepted)
+SET GLOBAL binlog_server.user_channel_map = '';
+# ---- table:// URI with valid shape should be accepted (deferred)
+SET GLOBAL binlog_server.user_channel_map = 'table://binlog_server.user_routes';
+# ---- table:// URI with invalid shape should be rejected
+SET GLOBAL binlog_server.user_channel_map = 'table://no_dot_here';
+ERROR 42000: Variable 'binlog_server.user_channel_map' can't be set to the value of 'table://no_dot_here'
+# ---- Restore CSV routing for UDF test
+SET GLOBAL binlog_server.user_channel_map = 'repl_a=src_a,another_user=another_channel';
+# ---- Test reload UDF
+SELECT binlog_server_reload_user_channel_map() AS mappings_loaded;
+mappings_loaded
+2
+
+# ============================================================
+# Tear down
+# ============================================================
+# Stop replica A
+[connection server_3]
+STOP REPLICA;
+include/rpl/wait_for_replica_to_stop.inc
+RESET REPLICA ALL;
+# Stop replica B
+[connection server_4]
+STOP REPLICA;
+include/rpl/wait_for_replica_to_stop.inc
+RESET REPLICA ALL;
+# Stop collector
+[connection server_2]
+STOP REPLICA IO_THREAD FOR CHANNEL 'src_a';
+include/rpl/wait_for_receiver_to_stop.inc [FOR CHANNEL 'src_a']
+RESET REPLICA ALL FOR CHANNEL 'src_a';
+SET GLOBAL binlog_server.user_channel_map = '';
+SET GLOBAL binlog_server.default_serve_channel = '';
+DROP USER 'repl_a'@'%';
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+[connection server_1]
+DROP TABLE t1;
+[connection server_3]
+DROP TABLE IF EXISTS t1;
+[connection server_4]
+DROP TABLE IF EXISTS t1;
+include/rpl/deinit.inc

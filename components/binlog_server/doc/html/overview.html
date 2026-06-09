@@ -273,10 +273,10 @@ as out-of-tree-ish loadables.</p>
 <li><strong>Not a transform engine.</strong> Events are forwarded byte-for-byte,
   modulo the deduplication watermark and the FDE handling that makes
   each archive file a valid standalone binlog.</li>
-<li><strong>Not a per-user router yet.</strong> Phase 2 serves a single configured
-  channel to all downstream replicas. Per-user routing (different
-  channels to different replicas based on the connecting user) is
-  planned for Phase 3.</li>
+<li><strong>Per-user routing is available.</strong> The <code>user_channel_map</code> sysvar
+  routes downstream replicas to different channels based on their
+  connecting MySQL user. Unmapped users fall back to
+  <code>default_serve_channel</code>.</li>
 </ul>
 <h2 id="continue-reading">Continue reading<a class="headerlink" href="#continue-reading" title="Permanent link">&#x00B6;</a></h2>
 <ul>

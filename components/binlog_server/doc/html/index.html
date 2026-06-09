@@ -208,7 +208,7 @@ flowchart LR
 </tr>
 </tbody>
 </table>
-<h2 id="current-status-phase-1-phase-2">Current status (Phase 1 + Phase 2)<a class="headerlink" href="#current-status-phase-1-phase-2" title="Permanent link">&#x00B6;</a></h2>
+<h2 id="current-status-phase-1-phase-2-phase-3">Current status (Phase 1 + Phase 2 + Phase 3)<a class="headerlink" href="#current-status-phase-1-phase-2-phase-3" title="Permanent link">&#x00B6;</a></h2>
 <p><strong>Phase 1</strong> — collection path:</p>
 <ul>
 <li>Receive binlogs from upstream sources via the IO thread</li>
@@ -227,12 +227,22 @@ flowchart LR
 <li>Multiple concurrent downstream replicas supported</li>
 <li><code>default_serve_channel</code> sysvar routes dump connections to a named channel archive</li>
 </ul>
+<p><strong>Phase 3</strong> — per-user channel routing:</p>
+<ul>
+<li><code>binlog_server.user_channel_map</code> sysvar for user-to-channel routing</li>
+<li>Two configuration shapes: inline CSV (<code>user1=ch1,user2=ch2</code>) and <code>table://&lt;db&gt;.&lt;tbl&gt;</code></li>
+<li><code>binlog_server_reload_user_channel_map()</code> UDF for on-demand table reload</li>
+<li><code>default_serve_channel</code> as fallback for unmapped users</li>
+<li>Multiple upstream sources collected simultaneously with independent per-channel archives</li>
+<li>Channel path sanitization (whitelist <code>[A-Za-z0-9_.-]</code>)</li>
+<li>Per-channel <code>BINLOG_SERVER_STORAGE_URI</code> override</li>
+</ul>
 <p><strong>Not yet implemented</strong> (planned for later phases):
-- Per-user channel routing (<code>user_channel_map</code> sysvar)
 - S3-compatible object storage backend
 - Performance Schema observability tables
 - Binlog purging
-- Local rotation / rewriting</p>
+- Local rotation / rewriting
+- Binlog metadata sidecars (per-file <code>.json</code> for faster GTID resolution)</p>
 <h2 id="license">License<a class="headerlink" href="#license" title="Permanent link">&#x00B6;</a></h2>
 <p>GPLv2, matching the rest of Percona Server.</p>
     <footer class="docfoot">

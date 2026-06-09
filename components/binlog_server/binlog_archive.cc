@@ -515,7 +515,7 @@ int BinlogArchive::configure_channel(const char *channel_name, int enabled,
   }
   if (!path.empty() && path.back() != '/') path += '/';
 
-  // Sanitize channel name for directory
+  // Sanitize channel name for directory (defense-in-depth against traversal)
   std::string dir_name;
   if (name.empty()) {
     dir_name = "_default";
@@ -527,6 +527,9 @@ int BinlogArchive::configure_channel(const char *channel_name, int enabled,
         dir_name.push_back(ch);
       else
         dir_name.push_back('_');
+    }
+    if (dir_name == "." || dir_name == "..") {
+      dir_name = "_" + dir_name + "_";
     }
   }
 
