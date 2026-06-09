@@ -6,21 +6,24 @@
 
 #include "archive_sender.h"
 #include "binlog_archive.h"
+#include "encryption.h"
 #include "file_storage.h"
 #include "gtid_set.h"
 #include "log_helpers.h"
 #include "s3_storage.h"
+
+#include <openssl/crypto.h>
+#include <openssl/rand.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <unistd.h>
+#include <vector>
 
 #include "mysqld_error.h"
 
@@ -193,75 +196,190 @@ std::string read_last_index_entry(const std::string &base_dir) {
 }
 
 bool sync_channel_to_disk(ChannelState &state, const char *channel_name) {
-  if (!state.out.is_open()) return true;
-  state.out.flush();
-  if (!state.out.good()) return false;
-  if (state.fsync_fd < 0) {
-    const std::string path = state.base_dir + state.current_log_name;
-    state.fsync_fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
-    if (state.fsync_fd < 0) {
-      bslog_code(WARNING_LEVEL, ER_BINLOG_SERVER_IO_FAILURE,
-                 "channel '%s' fsync open failed for '%s' (errno=%d: %s)",
-                 channel_name, path.c_str(), errno, strerror(errno));
-      return false;
-    }
-  }
-  if (::fsync(state.fsync_fd) != 0) {
+  if (!state.out) return true;
+  if (!state.out->sync()) {
     bslog_code(WARNING_LEVEL, ER_BINLOG_SERVER_IO_FAILURE,
-               "channel '%s' fsync failed on '%s%s' (errno=%d: %s)",
-               channel_name, state.base_dir.c_str(),
-               state.current_log_name.c_str(), errno, strerror(errno));
+               "channel '%s' sync failed on '%s%s'", channel_name,
+               state.base_dir.c_str(), state.current_log_name.c_str());
     return false;
   }
   return true;
 }
 
 void close_archive_file(ChannelState &state) {
-  if (state.out.is_open()) {
-    state.out.flush();
-    state.out.close();
+  if (state.out) {
+    state.out->flush();
+    state.out->close();
+    state.out.reset();
   }
-  state.out.clear();
-  if (state.fsync_fd >= 0) {
-    ::close(state.fsync_fd);
-    state.fsync_fd = -1;
+  state.encryptor.reset();
+}
+
+// Set up encryptor for an existing encrypted file (on re-open / append).
+static bool setup_encryptor_for_existing(ChannelState &state,
+                                         const std::string &log_name,
+                                         uint64_t file_size) {
+  if (!state.backend) return false;
+  auto reader = state.backend->open_read(state.base_dir, log_name);
+  if (!reader) return false;
+
+  unsigned char hdr_buf[kEncryptionHeaderSize];
+  if (!reader->read_at(0, hdr_buf, kEncryptionHeaderSize)) return false;
+  reader->close();
+
+  if (!EncryptionHeader::is_encrypted(hdr_buf)) return false;
+
+  EncryptionHeader hdr;
+  if (!hdr.deserialize(hdr_buf)) return false;
+
+  unsigned char password[kFilePasswordLen];
+  if (!decrypt_file_password(hdr.key_id, hdr.encrypted_password, hdr.iv,
+                             password)) {
+    OPENSSL_cleanse(password, sizeof(password));
+    return false;
   }
+
+  state.encryptor = std::make_unique<AesCtrCipher>();
+  if (!state.encryptor->open(password, kFilePasswordLen)) {
+    OPENSSL_cleanse(password, sizeof(password));
+    state.encryptor.reset();
+    return false;
+  }
+  OPENSSL_cleanse(password, sizeof(password));
+
+  // Position encryptor at end of file body (after header)
+  uint64_t body_offset = file_size - kEncryptionHeaderSize;
+  state.encryptor->set_offset(body_offset);
+  return true;
+}
+
+// Set up encryption for a brand new file.
+static bool setup_encryption_new_file(ChannelState &state,
+                                      const std::string &path,
+                                      const char *channel_name) {
+  if (!encryption_keyring_available()) {
+    bslog(ERROR_LEVEL,
+          "binlog_server: encryption enabled but keyring service not "
+          "available for channel '%s'",
+          channel_name);
+    return false;
+  }
+
+  std::string key_id = current_master_key_id(channel_name);
+  if (key_id.empty()) {
+    key_id = generate_master_key(channel_name);
+    if (key_id.empty()) {
+      bslog(ERROR_LEVEL,
+            "binlog_server: failed to generate master encryption key for "
+            "channel '%s'",
+            channel_name);
+      return false;
+    }
+  }
+
+  // Generate random per-file password
+  unsigned char password[kFilePasswordLen];
+  if (RAND_bytes(password, kFilePasswordLen) != 1) {
+    bslog(ERROR_LEVEL,
+          "binlog_server: failed to generate random file password for '%s'",
+          path.c_str());
+    return false;
+  }
+
+  // Encrypt file password with master key
+  EncryptionHeader hdr;
+  hdr.key_id = key_id;
+  if (!encrypt_file_password(key_id, password, hdr.encrypted_password,
+                             hdr.iv)) {
+    OPENSSL_cleanse(password, sizeof(password));
+    bslog(ERROR_LEVEL,
+          "binlog_server: failed to encrypt file password for '%s'",
+          path.c_str());
+    return false;
+  }
+
+  // Write 512-byte header
+  unsigned char hdr_buf[kEncryptionHeaderSize];
+  if (!hdr.serialize(hdr_buf)) {
+    OPENSSL_cleanse(password, sizeof(password));
+    return false;
+  }
+
+  if (!state.out->write(hdr_buf, kEncryptionHeaderSize) ||
+      !state.out->flush() || !state.out->good()) {
+    OPENSSL_cleanse(password, sizeof(password));
+    return false;
+  }
+
+  // Initialize encryptor
+  state.encryptor = std::make_unique<AesCtrCipher>();
+  if (!state.encryptor->open(password, kFilePasswordLen)) {
+    OPENSSL_cleanse(password, sizeof(password));
+    state.encryptor.reset();
+    return false;
+  }
+  OPENSSL_cleanse(password, sizeof(password));
+  return true;
 }
 
 bool open_archive_file(ChannelState &state, const std::string &log_name,
-                       const char *channel_name) {
+                       const char *channel_name, bool encrypt = false) {
   close_archive_file(state);
 
-  const std::string path = state.base_dir + log_name;
-  std::error_code ec;
-  std::uintmax_t existing_size = 0;
-  if (fs::exists(path, ec)) {
-    existing_size = fs::file_size(path, ec);
-    if (ec) existing_size = 0;
+  uint64_t existing_size = 0;
+  if (state.backend) {
+    existing_size = state.backend->file_size(state.base_dir, log_name);
+  } else {
+    const std::string path = state.base_dir + log_name;
+    std::error_code ec;
+    if (fs::exists(path, ec)) {
+      existing_size = fs::file_size(path, ec);
+      if (ec) existing_size = 0;
+    }
   }
   const bool file_already_has_content = (existing_size >= kBinlogMagicSize);
 
-  state.out.open(path, std::ios::binary | std::ios::out | std::ios::app);
-  if (!state.out.is_open()) {
+  if (state.backend) {
+    state.out = state.backend->open_write(state.base_dir, log_name);
+  }
+  if (!state.out) {
     bslog_code(ERROR_LEVEL, ER_BINLOG_SERVER_IO_FAILURE,
-               "failed to open archive file '%s' for channel '%s' "
-               "(errno=%d: %s)",
-               path.c_str(), channel_name, errno, strerror(errno));
+               "failed to open archive file '%s%s' for channel '%s'",
+               state.base_dir.c_str(), log_name.c_str(), channel_name);
     return false;
   }
 
   if (!file_already_has_content) {
-    state.out.write(kBinlogMagic, kBinlogMagicSize);
-    state.out.flush();
-    if (!state.out.good()) {
+    if (encrypt) {
+      if (!setup_encryption_new_file(state, state.base_dir + log_name,
+                                     channel_name)) {
+        bslog(ERROR_LEVEL,
+              "binlog_server: encryption setup failed for '%s%s'; "
+              "falling back to plaintext",
+              state.base_dir.c_str(), log_name.c_str());
+      }
+    }
+    {
+      unsigned char magic[kBinlogMagicSize];
+      std::memcpy(magic, kBinlogMagic, kBinlogMagicSize);
+      if (state.encryptor) {
+        state.encryptor->process(magic, kBinlogMagicSize);
+      }
+      state.out->write(magic, kBinlogMagicSize);
+    }
+    if (!state.out->flush() || !state.out->good()) {
       bslog_code(ERROR_LEVEL, ER_BINLOG_SERVER_IO_FAILURE,
-                 "failed to write magic to '%s' for channel '%s'",
-                 path.c_str(), channel_name);
-      state.out.close();
+                 "failed to write header to '%s%s' for channel '%s'",
+                 state.base_dir.c_str(), log_name.c_str(), channel_name);
+      state.out->close();
+      state.out.reset();
       return false;
     }
     state.wrote_fde = false;
   } else {
+    if (existing_size >= kEncryptionHeaderSize) {
+      setup_encryptor_for_existing(state, log_name, existing_size);
+    }
     state.wrote_fde = true;
   }
 
@@ -269,10 +387,11 @@ bool open_archive_file(ChannelState &state, const std::string &log_name,
   add_to_index(state, log_name);
 
   bslog(INFORMATION_LEVEL,
-        "binlog_server: channel '%s' opened archive file '%s' "
-        "(existing_bytes=%llu)",
-        channel_name, path.c_str(),
-        static_cast<unsigned long long>(existing_size));
+        "binlog_server: channel '%s' opened archive file '%s%s' "
+        "(existing_bytes=%llu, encrypted=%s)",
+        channel_name, state.base_dir.c_str(), log_name.c_str(),
+        static_cast<unsigned long long>(existing_size),
+        state.encryptor ? "yes" : "no");
   return true;
 }
 
@@ -302,24 +421,88 @@ void recover_state_from_archive(ChannelState &state,
   }
   if (last_name.empty()) return;
 
-  const std::string path = state.base_dir + last_name;
-  std::ifstream f(path, std::ios::binary);
-  if (!f.is_open()) {
+  if (!state.backend) return;
+  auto reader = state.backend->open_read(state.base_dir, last_name);
+  if (!reader) {
     bslog(WARNING_LEVEL,
-          "binlog_server: channel '%s' cannot open '%s' for recovery "
-          "(errno=%d: %s)",
-          channel_name, path.c_str(), errno, strerror(errno));
+          "binlog_server: channel '%s' cannot open '%s' for recovery",
+          channel_name, last_name.c_str());
     return;
   }
 
+  const uint64_t file_sz = reader->size();
+
+  // Detect encryption: check first bytes for encryption magic
+  unsigned char first_bytes[kEncryptionHeaderSize];
+  size_t probe_len = (file_sz >= kEncryptionHeaderSize)
+                         ? kEncryptionHeaderSize
+                         : static_cast<size_t>(file_sz);
+  if (probe_len < kBinlogMagicSize) return;
+  if (!reader->read_at(0, first_bytes, probe_len)) return;
+
+  std::unique_ptr<AesCtrCipher> decryptor;
+  uint64_t body_offset = 0;
+
+  if (EncryptionHeader::is_encrypted(first_bytes)) {
+    if (probe_len < kEncryptionHeaderSize) {
+      bslog(WARNING_LEVEL,
+            "binlog_server: channel '%s' encrypted file '%s' too short for "
+            "header",
+            channel_name, last_name.c_str());
+      return;
+    }
+    EncryptionHeader hdr;
+    if (!hdr.deserialize(first_bytes)) {
+      bslog(WARNING_LEVEL,
+            "binlog_server: channel '%s' failed to parse encryption header "
+            "in '%s'",
+            channel_name, last_name.c_str());
+      return;
+    }
+    unsigned char password[kFilePasswordLen];
+    if (!decrypt_file_password(hdr.key_id, hdr.encrypted_password, hdr.iv,
+                               password)) {
+      bslog(WARNING_LEVEL,
+            "binlog_server: channel '%s' failed to decrypt file password "
+            "for '%s' (key='%s')",
+            channel_name, last_name.c_str(), hdr.key_id.c_str());
+      OPENSSL_cleanse(password, sizeof(password));
+      return;
+    }
+    decryptor = std::make_unique<AesCtrCipher>();
+    if (!decryptor->open(password, kFilePasswordLen)) {
+      OPENSSL_cleanse(password, sizeof(password));
+      return;
+    }
+    OPENSSL_cleanse(password, sizeof(password));
+    body_offset = kEncryptionHeaderSize;
+  } else if (std::memcmp(first_bytes, kBinlogMagic, kBinlogMagicSize) == 0) {
+    body_offset = 0;
+  } else {
+    return;
+  }
+
+  auto read_decrypted = [&](uint64_t logical_off, char *buf,
+                            size_t len) -> bool {
+    uint64_t phys_off = body_offset + logical_off;
+    if (!reader->read_at(phys_off, reinterpret_cast<unsigned char *>(buf), len))
+      return false;
+    if (decryptor) {
+      decryptor->set_offset(logical_off);
+      if (!decryptor->process(reinterpret_cast<unsigned char *>(buf), len))
+        return false;
+    }
+    return true;
+  };
+
+  // Verify binlog magic (first 4 bytes of body)
   char magic[kBinlogMagicSize];
-  if (!f.read(magic, kBinlogMagicSize) ||
+  if (!read_decrypted(0, magic, kBinlogMagicSize) ||
       std::memcmp(magic, kBinlogMagic, kBinlogMagicSize) != 0) {
     return;
   }
 
   uint64_t last_good_offset = kBinlogMagicSize;
-  // Transaction-safe offset: advances only at FDE, Previous_gtids, Xid, XA
   uint64_t last_safe_offset = kBinlogMagicSize;
   uint64_t watermark = 0;
   uint64_t safe_watermark = 0;
@@ -328,9 +511,7 @@ void recover_state_from_archive(ChannelState &state,
 
   for (;;) {
     char hdr[kLogEventHeaderLen];
-    f.seekg(static_cast<std::streamoff>(last_good_offset), std::ios::beg);
-    f.read(hdr, kLogEventHeaderLen);
-    if (f.gcount() < static_cast<std::streamsize>(kLogEventHeaderLen)) break;
+    if (!read_decrypted(last_good_offset, hdr, kLogEventHeaderLen)) break;
 
     const unsigned char event_type =
         static_cast<unsigned char>(hdr[kEventTypeOffset]);
@@ -343,25 +524,18 @@ void recover_state_from_archive(ChannelState &state,
     if (event_type == kFormatDescriptionEventType &&
         event_len >= kLogEventHeaderLen + kBinlogChecksumAlgDescLen +
                          kBinlogChecksumLen) {
-      f.seekg(static_cast<std::streamoff>(last_good_offset) +
-                  static_cast<std::streamoff>(event_len) -
-                  static_cast<std::streamoff>(kBinlogChecksumAlgDescLen) -
-                  static_cast<std::streamoff>(kBinlogChecksumLen),
-              std::ios::beg);
+      uint64_t alg_off = last_good_offset + event_len -
+                         kBinlogChecksumAlgDescLen - kBinlogChecksumLen;
       char alg_byte = 0;
-      if (f.read(&alg_byte, 1) && f.gcount() == 1) {
+      if (read_decrypted(alg_off, &alg_byte, 1)) {
         const unsigned char alg = static_cast<unsigned char>(alg_byte);
         has_checksum = (alg != kChecksumAlgOff && alg != kChecksumAlgUndef);
       }
     }
 
-    f.clear();
-    f.seekg(static_cast<std::streamoff>(last_good_offset) +
-                static_cast<std::streamoff>(event_len) - 1,
-            std::ios::beg);
+    // Verify last byte of event is accessible (completeness check)
     char probe = 0;
-    if (!f.read(&probe, 1) || f.gcount() != 1) break;
-    f.clear();
+    if (!read_decrypted(last_good_offset + event_len - 1, &probe, 1)) break;
 
     last_good_offset += event_len;
     if (event_type == kFormatDescriptionEventType) has_fde = true;
@@ -369,7 +543,6 @@ void recover_state_from_archive(ChannelState &state,
       watermark = log_pos;
     }
 
-    // Advance safe offset at transaction boundaries and structural events
     if (event_type == kFormatDescriptionEventType ||
         event_type == kPreviousGtidsLogEventType ||
         event_type == kXidEventType ||
@@ -378,29 +551,27 @@ void recover_state_from_archive(ChannelState &state,
       safe_watermark = watermark;
     }
   }
-  f.close();
+  reader->close();
 
-  // Truncate to transaction boundary (discards partial transactions)
-  const uint64_t truncate_to = last_safe_offset;
-  std::error_code ec;
-  const uintmax_t physical_size = fs::file_size(path, ec);
-  if (!ec && physical_size > truncate_to) {
-    fs::resize_file(path, truncate_to, ec);
-    if (!ec) {
-      if (truncate_to < last_good_offset) {
+  // Truncate to transaction boundary (physical offset includes header)
+  const uint64_t truncate_to = body_offset + last_safe_offset;
+  if (file_sz > truncate_to) {
+    if (state.backend->truncate_file(state.base_dir, last_name, truncate_to)) {
+      if (last_safe_offset < last_good_offset) {
         bslog(WARNING_LEVEL,
               "binlog_server: channel '%s' truncated '%s' from %llu to %llu "
               "(discarded %llu bytes of incomplete transaction after crash)",
-              channel_name, path.c_str(),
-              static_cast<unsigned long long>(physical_size),
+              channel_name, last_name.c_str(),
+              static_cast<unsigned long long>(file_sz),
               static_cast<unsigned long long>(truncate_to),
-              static_cast<unsigned long long>(last_good_offset - truncate_to));
+              static_cast<unsigned long long>(last_good_offset -
+                                             last_safe_offset));
       } else {
         bslog(WARNING_LEVEL,
               "binlog_server: channel '%s' truncated partial tail of '%s' "
               "from %llu to %llu (recovered after crash)",
-              channel_name, path.c_str(),
-              static_cast<unsigned long long>(physical_size),
+              channel_name, last_name.c_str(),
+              static_cast<unsigned long long>(file_sz),
               static_cast<unsigned long long>(truncate_to));
       }
     }
@@ -411,11 +582,8 @@ void recover_state_from_archive(ChannelState &state,
   state.wrote_fde = has_fde;
   state.has_checksum = has_checksum;
 
-  // Load .meta sidecars for all indexed files (restores GTID state)
   load_file_metadata(state);
 
-  // If we have a sidecar for the last file, restore last_gtid_set as the
-  // recovery baseline for duplicate detection
   auto meta_it = state.file_metadata.find(last_name);
   if (meta_it != state.file_metadata.end() &&
       !meta_it->second.last_gtid_set.empty()) {
@@ -427,12 +595,28 @@ void recover_state_from_archive(ChannelState &state,
   bslog(INFORMATION_LEVEL,
         "binlog_server: channel '%s' recovered state from '%s' "
         "(truncated_to=%llu, watermark=%llu, has_fde=%d, has_checksum=%d, "
-        "discarded_partial_txn=%s)",
+        "discarded_partial_txn=%s, encrypted=%s)",
         channel_name, last_name.c_str(),
         static_cast<unsigned long long>(truncate_to),
         static_cast<unsigned long long>(safe_watermark),
         static_cast<int>(has_fde), static_cast<int>(has_checksum),
-        (truncate_to < last_good_offset) ? "yes" : "no");
+        (last_safe_offset < last_good_offset) ? "yes" : "no",
+        decryptor ? "yes" : "no");
+}
+
+// Write event data to archive, encrypting in-place if encryptor is active.
+bool write_event_data(ChannelState &state, const char *event_buf,
+                      unsigned long event_len) {
+  if (!state.out) return false;
+  if (state.encryptor) {
+    std::vector<unsigned char> buf(
+        reinterpret_cast<const unsigned char *>(event_buf),
+        reinterpret_cast<const unsigned char *>(event_buf) + event_len);
+    if (!state.encryptor->process(buf.data(), buf.size())) return false;
+    return state.out->write(buf.data(), event_len);
+  }
+  return state.out->write(reinterpret_cast<const unsigned char *>(event_buf),
+                          event_len);
 }
 
 void handle_rotate_event(ChannelState &state, const char *channel_name,
@@ -453,9 +637,9 @@ void handle_rotate_event(ChannelState &state, const char *channel_name,
   }
 
   // Real rotate: write it to the outgoing file before switching.
-  if (!is_artificial && state.out.is_open()) {
-    state.out.write(event_buf, event_len);
-    state.out.flush();
+  if (!is_artificial && state.out) {
+    write_event_data(state, event_buf, event_len);
+    state.out->flush();
     sync_channel_to_disk(state, channel_name);
   }
 
@@ -482,7 +666,8 @@ void handle_rotate_event(ChannelState &state, const char *channel_name,
 void handle_format_description_event(ChannelState &state,
                                      const char *channel_name,
                                      const char *event_buf,
-                                     unsigned long event_len) {
+                                     unsigned long event_len,
+                                     bool encrypt = false) {
   if (event_len >=
       kLogEventHeaderLen + kBinlogChecksumAlgDescLen + kBinlogChecksumLen) {
     const unsigned char alg = static_cast<unsigned char>(
@@ -500,8 +685,9 @@ void handle_format_description_event(ChannelState &state,
           channel_name, state.current_log_name.c_str());
   }
 
-  if (!state.out.is_open()) {
-    if (!open_archive_file(state, state.current_log_name, channel_name)) {
+  if (!state.out) {
+    if (!open_archive_file(state, state.current_log_name, channel_name,
+                           encrypt)) {
       return;
     }
   }
@@ -510,15 +696,14 @@ void handle_format_description_event(ChannelState &state,
     return;
   }
 
-  state.out.write(event_buf, event_len);
-  state.out.flush();
-  if (!state.out.good()) {
+  if (!write_event_data(state, event_buf, event_len)) {
     bslog(WARNING_LEVEL,
           "binlog_server: failed to write FDE for channel '%s' to '%s%s'",
           channel_name, state.base_dir.c_str(),
           state.current_log_name.c_str());
     return;
   }
+  state.out->flush();
 
   state.wrote_fde = true;
   ++state.events_appended;
@@ -859,14 +1044,61 @@ bool BinlogArchive::storage_uri_allowed(const std::string &uri,
   return true;
 }
 
+void BinlogArchive::set_encryption_enabled(bool enabled) {
+  m_encryption_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool BinlogArchive::encryption_enabled() const {
+  return m_encryption_enabled.load(std::memory_order_relaxed);
+}
+
+std::string BinlogArchive::active_file_path(const char *channel_name) const {
+  if (channel_name == nullptr) return {};
+  std::string lookup = channel_name;
+  // The default channel is stored under "" internally but users reference
+  // it as "_default" (the sanitized directory name).
+  if (lookup == "_default") lookup.clear();
+  std::lock_guard<std::mutex> lk(m_registry_mutex);
+  auto it = m_channels.find(lookup);
+  if (it == m_channels.end()) return {};
+  std::lock_guard<std::mutex> io_lk(it->second->io_mutex);
+  if (it->second->current_log_name.empty()) return {};
+  return it->second->base_dir + it->second->current_log_name;
+}
+
+std::string BinlogArchive::active_file_name(const char *channel_name) const {
+  if (channel_name == nullptr) return {};
+  std::string lookup = channel_name;
+  if (lookup == "_default") lookup.clear();
+  std::lock_guard<std::mutex> lk(m_registry_mutex);
+  auto it = m_channels.find(lookup);
+  if (it == m_channels.end()) return {};
+  std::lock_guard<std::mutex> io_lk(it->second->io_mutex);
+  return it->second->current_log_name;
+}
+
 std::string BinlogArchive::resolve_channel_base_dir(
     const char *channel_name) const {
-  if (channel_name == nullptr || channel_name[0] == '\0') return {};
+  if (channel_name == nullptr) return {};
+  std::string lookup = channel_name;
+  if (lookup == "_default") lookup.clear();
   std::lock_guard<std::mutex> lk(m_registry_mutex);
-  auto it = m_channels.find(channel_name);
+  auto it = m_channels.find(lookup);
   if (it == m_channels.end()) return {};
   std::lock_guard<std::mutex> io_lk(it->second->io_mutex);
   return it->second->base_dir;
+}
+
+StorageBackend *BinlogArchive::resolve_channel_backend(
+    const char *channel_name) const {
+  if (channel_name == nullptr) return nullptr;
+  std::string lookup = channel_name;
+  if (lookup == "_default") lookup.clear();
+  std::lock_guard<std::mutex> lk(m_registry_mutex);
+  auto it = m_channels.find(lookup);
+  if (it == m_channels.end()) return nullptr;
+  std::lock_guard<std::mutex> io_lk(it->second->io_mutex);
+  return it->second->backend;
 }
 
 std::string BinlogArchive::effective_uri(const std::string &channel_uri) {
@@ -1039,12 +1271,15 @@ int BinlogArchive::append_event(const char *channel_name,
     return 0;
   }
 
+  const bool encrypt = m_encryption_enabled.load(std::memory_order_relaxed);
+
   switch (event_type) {
     case kRotateEventType:
       handle_rotate_event(cs, name.c_str(), event_buf, event_len);
       return 0;
     case kFormatDescriptionEventType:
-      handle_format_description_event(cs, name.c_str(), event_buf, event_len);
+      handle_format_description_event(cs, name.c_str(), event_buf, event_len,
+                                      encrypt);
       return 0;
     default:
       break;
@@ -1052,7 +1287,7 @@ int BinlogArchive::append_event(const char *channel_name,
 
   if (is_artificial) return 0;
   if (!cs.wrote_fde) return 0;
-  if (!cs.out.is_open()) return 0;
+  if (!cs.out) return 0;
 
   // Deduplication: skip events already archived (watermark-based).
   if (log_pos != 0 && log_pos <= cs.last_source_log_pos) {
@@ -1060,8 +1295,7 @@ int BinlogArchive::append_event(const char *channel_name,
     return 0;
   }
 
-  cs.out.write(event_buf, event_len);
-  if (!cs.out.good()) {
+  if (!write_event_data(cs, event_buf, event_len)) {
     record_channel_error(
         cs, ER_BINLOG_SERVER_IO_FAILURE,
         std::string("write error on file '") + cs.current_log_name + "'");
@@ -1113,7 +1347,7 @@ int BinlogArchive::close_channel(const char *channel_name) {
 
   std::lock_guard<std::mutex> lk(cs_ptr->io_mutex);
 
-  if (!cs_ptr->out.is_open()) return 0;
+  if (!cs_ptr->out) return 0;
 
   sync_channel_to_disk(*cs_ptr, name.c_str());
 
@@ -1231,7 +1465,9 @@ std::vector<ChannelStatus> BinlogArchive::snapshot_status() const {
     std::string file_path;
     {
       std::lock_guard<std::mutex> lk(cs_ptr->io_mutex);
-      row.channel_name = cs_ptr->name;
+      row.channel_name = cs_ptr->name.empty()
+                             ? "_default"
+                             : cs_ptr->name;
       row.enabled = cs_ptr->enabled;
       row.storage_uri = cs_ptr->storage_uri;
       row.base_dir = cs_ptr->base_dir;
@@ -1276,7 +1512,9 @@ std::vector<ChannelStorage> BinlogArchive::snapshot_storage() const {
     std::string active_file_path;
     {
       std::lock_guard<std::mutex> lk(cs_ptr->io_mutex);
-      row.channel_name = cs_ptr->name;
+      row.channel_name = cs_ptr->name.empty()
+                             ? "_default"
+                             : cs_ptr->name;
       row.storage_type = "FILE";
       row.storage_uri = cs_ptr->storage_uri;
       row.base_path = cs_ptr->base_dir;
@@ -1293,7 +1531,7 @@ std::vector<ChannelStorage> BinlogArchive::snapshot_storage() const {
         row.status = "ERROR";
       else if (!cs_ptr->enabled)
         row.status = "DISABLED";
-      else if (cs_ptr->out.is_open())
+      else if (cs_ptr->out)
         row.status = "ACTIVE";
       else
         row.status = "IDLE";
@@ -1342,7 +1580,7 @@ std::vector<ChannelArchive> BinlogArchive::snapshot_archive() const {
       std::lock_guard<std::mutex> lk(cs_ptr->io_mutex);
       load_index_file(*cs_ptr);
       base_dir = cs_ptr->base_dir;
-      channel_name = cs_ptr->name;
+      channel_name = cs_ptr->name.empty() ? "_default" : cs_ptr->name;
       rows.reserve(cs_ptr->file_order.size());
       for (const auto &fname : cs_ptr->file_order) {
         LocalRow r;
@@ -1350,7 +1588,7 @@ std::vector<ChannelArchive> BinlogArchive::snapshot_archive() const {
         auto it = cs_ptr->file_metadata.find(fname);
         if (it != cs_ptr->file_metadata.end()) r.meta = it->second;
         r.is_active = (fname == cs_ptr->current_log_name &&
-                       cs_ptr->out.is_open());
+                       cs_ptr->out != nullptr);
         rows.push_back(std::move(r));
       }
     }

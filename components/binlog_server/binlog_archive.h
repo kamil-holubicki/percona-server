@@ -7,8 +7,8 @@
 #ifndef BINLOG_SERVER_BINLOG_ARCHIVE_H
 #define BINLOG_SERVER_BINLOG_ARCHIVE_H
 
+#include <atomic>
 #include <cstdint>
-#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "encryption.h"
 #include "storage_backend.h"
 
 namespace binlog_server {
@@ -39,8 +40,7 @@ struct ChannelState {
   StorageBackend *backend{nullptr};
 
   std::string current_log_name;
-  std::ofstream out;
-  int fsync_fd{-1};
+  std::unique_ptr<StorageWriteStream> out;
 
   uint64_t last_source_log_pos{0};
   bool wrote_fde{false};
@@ -63,6 +63,9 @@ struct ChannelState {
   bool index_loaded{false};
   std::set<std::string> indexed_files;
   std::vector<std::string> file_order;
+
+  // Encryption state for current file (nullptr if plaintext)
+  std::unique_ptr<AesCtrCipher> encryptor;
 };
 
 // Snapshot DTOs for PFS tables (read-only copies safe outside locks)
@@ -134,7 +137,17 @@ class BinlogArchive {
   bool storage_uri_allowed(const std::string &uri,
                            std::string *reason = nullptr) const;
 
+  void set_encryption_enabled(bool enabled);
+  bool encryption_enabled() const;
+
+  // Get the full path to the active (currently being written) file for a channel
+  std::string active_file_path(const char *channel_name) const;
+
+  // Get just the filename of the active file (no directory prefix)
+  std::string active_file_name(const char *channel_name) const;
+
   std::string resolve_channel_base_dir(const char *channel_name) const;
+  StorageBackend *resolve_channel_backend(const char *channel_name) const;
 
   // PFS snapshot methods
   std::vector<ChannelStatus> snapshot_status() const;
@@ -169,6 +182,8 @@ class BinlogArchive {
 
   mutable std::mutex m_root_mutex;
   std::string m_storage_root;
+
+  std::atomic<bool> m_encryption_enabled{false};
 };
 
 }  // namespace binlog_server

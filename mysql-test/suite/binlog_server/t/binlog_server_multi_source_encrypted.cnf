@@ -1,0 +1,47 @@
+!include ../my.cnf
+
+[mysqld.3]
+log-bin=                    master-bin
+relay-log=                  slave-relay-bin
+log-replica-updates
+skip-replica-start
+
+loose-innodb_write_io_threads=    2
+loose-innodb_read_io_threads=     2
+
+[mysqld.4]
+log-bin=                    master-bin
+relay-log=                  slave-relay-bin
+log-replica-updates
+skip-replica-start
+
+loose-innodb_write_io_threads=    2
+loose-innodb_read_io_threads=     2
+
+[mysqld.5]
+log-bin=                    master-bin
+relay-log=                  slave-relay-bin
+log-replica-updates
+skip-replica-start
+
+loose-innodb_write_io_threads=    2
+loose-innodb_read_io_threads=     2
+
+[mysqld.6]
+log-bin=                    master-bin
+relay-log=                  slave-relay-bin
+log-replica-updates
+skip-replica-start
+
+loose-innodb_write_io_threads=    2
+loose-innodb_read_io_threads=     2
+
+[ENV]
+SERVER_MYPORT_3=            @mysqld.3.port
+SERVER_MYSOCK_3=            @mysqld.3.socket
+SERVER_MYPORT_4=            @mysqld.4.port
+SERVER_MYSOCK_4=            @mysqld.4.socket
+SERVER_MYPORT_5=            @mysqld.5.port
+SERVER_MYSOCK_5=            @mysqld.5.socket
+SERVER_MYPORT_6=            @mysqld.6.port
+SERVER_MYSOCK_6=            @mysqld.6.socket

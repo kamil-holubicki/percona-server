@@ -19,16 +19,18 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
+#include <memory>
 #include <sstream>
 #include <thread>
 #include <vector>
+
+#include <openssl/crypto.h>
 
 #include <mysqld_error.h>
 #include <mysql/components/services/log_builtins.h>
 
 #include "components/binlog_server/binlog_archive.h"
+#include "components/binlog_server/encryption.h"
 #include "components/binlog_server/gtid_set.h"
 #include "components/binlog_server/log_helpers.h"
 #include "components/binlog_server/server_services.h"
@@ -135,27 +137,6 @@ void trim_inplace(std::string &s) {
   s = s.substr(start, end - start);
 }
 
-bool read_index_file(const std::string &base_dir,
-                     std::vector<std::string> &out) {
-  out.clear();
-  std::ifstream idx(base_dir + "binlog.index");
-  if (!idx.is_open()) return false;
-  std::string line;
-  while (std::getline(idx, line)) {
-    if (!line.empty() && line.back() == '\r') line.pop_back();
-    if (!line.empty()) out.push_back(line);
-  }
-  return true;
-}
-
-unsigned long long file_size_or_zero(const std::string &path) {
-  std::error_code ec;
-  if (!std::filesystem::exists(path, ec)) return 0;
-  const auto s = std::filesystem::file_size(path, ec);
-  if (ec) return 0;
-  return static_cast<unsigned long long>(s);
-}
-
 const char *event_type_name(unsigned char type) {
   switch (type) {
     case kQueryEventType: return "Query";
@@ -180,6 +161,7 @@ const char *event_type_name(unsigned char type) {
 class ArchiveDumpSession {
  public:
   ArchiveDumpSession(MYSQL_THD thd, std::string channel, std::string base_dir,
+                     const StorageBackend *backend,
                      const binlog_server::gtid::Gtid_set *excluded_gtids,
                      std::string start_file, my_off_t start_pos,
                      std::uint32_t flags, std::uint32_t source_server_id,
@@ -188,6 +170,7 @@ class ArchiveDumpSession {
         m_killed(thd),
         m_channel(std::move(channel)),
         m_base_dir(std::move(base_dir)),
+        m_backend(backend),
         m_excluded_gtids(excluded_gtids),
         m_requested_file(std::move(start_file)),
         m_requested_pos(start_pos),
@@ -231,10 +214,14 @@ class ArchiveDumpSession {
   bool is_active_file() const;
   bool should_skip_event(const std::vector<unsigned char> &buf);
 
+  // Read from current file at logical offset (binlog body), decrypt if needed.
+  bool read_at(my_off_t logical_pos, unsigned char *buf, size_t len);
+
   MYSQL_THD m_thd;
   server_services::kill_observer m_killed;
   std::string m_channel;
   std::string m_base_dir;
+  const StorageBackend *m_backend;
   const binlog_server::gtid::Gtid_set *m_excluded_gtids;
   std::string m_requested_file;
   my_off_t m_requested_pos;
@@ -244,7 +231,7 @@ class ArchiveDumpSession {
 
   std::string m_current_file;
   my_off_t m_current_pos{0};
-  std::ifstream m_in;
+  std::unique_ptr<StorageReadStream> m_in;
   bool m_has_checksum{false};
   int m_negotiated_checksum{-1};
   bool m_fde_seen{false};
@@ -261,10 +248,15 @@ class ArchiveDumpSession {
   unsigned long long m_events_skipped{0};
 
   std::string m_pinned_file;
+
+  // Encryption support: decrypt on-the-fly when serving encrypted files
+  std::unique_ptr<AesCtrCipher> m_decryptor;
+  my_off_t m_body_offset{0};  // 0 for plaintext, 512 for encrypted
 };
 
 bool ArchiveDumpSession::refresh_index_cache() {
-  return read_index_file(m_base_dir, m_index_cache);
+  m_index_cache.clear();
+  return m_backend->index_load(m_base_dir, m_index_cache);
 }
 
 int ArchiveDumpSession::current_file_index() const {
@@ -295,32 +287,29 @@ bool ArchiveDumpSession::resolve_starting_position() {
 
   if (gtid_mode && !explicit_start) {
     for (auto it = m_index_cache.rbegin(); it != m_index_cache.rend(); ++it) {
-      const std::string path = m_base_dir + *it;
-      std::ifstream f(path, std::ios::binary);
-      if (!f.is_open()) continue;
+      auto stream = m_backend->open_read(m_base_dir, *it);
+      if (!stream) continue;
 
-      f.seekg(kBinlogMagicSize, std::ios::beg);
       unsigned char header[kLogEventHeaderLen];
-      if (!f.read(reinterpret_cast<char *>(header), kLogEventHeaderLen))
+      if (!stream->read_at(kBinlogMagicSize, header, kLogEventHeaderLen))
         continue;
       const uint32_t fde_len = read_u32_le(header + kEventLenOffset);
       if (fde_len < kLogEventHeaderLen + 5) continue;
       std::vector<unsigned char> fde(fde_len);
-      f.seekg(kBinlogMagicSize, std::ios::beg);
-      if (!f.read(reinterpret_cast<char *>(fde.data()), fde_len)) continue;
+      if (!stream->read_at(kBinlogMagicSize, fde.data(), fde_len)) continue;
 
       const unsigned char alg = fde[fde_len - 5];
       const bool fde_has_checksum = (alg == kChecksumAlgCrc32);
 
+      const uint64_t pgev_offset = kBinlogMagicSize + fde_len;
       unsigned char pgev_hdr[kLogEventHeaderLen];
-      if (!f.read(reinterpret_cast<char *>(pgev_hdr), kLogEventHeaderLen))
+      if (!stream->read_at(pgev_offset, pgev_hdr, kLogEventHeaderLen))
         continue;
       if (pgev_hdr[kEventTypeOffset] != kPreviousGtidsLogEventType) continue;
       const uint32_t pgev_len = read_u32_le(pgev_hdr + kEventLenOffset);
       if (pgev_len < kLogEventHeaderLen) continue;
       std::vector<unsigned char> pgev(pgev_len);
-      f.seekg(-static_cast<std::streamoff>(kLogEventHeaderLen), std::ios::cur);
-      if (!f.read(reinterpret_cast<char *>(pgev.data()), pgev_len)) continue;
+      if (!stream->read_at(pgev_offset, pgev.data(), pgev_len)) continue;
 
       binlog_server::gtid::Gtid_set file_previous;
       if (!file_previous.assign_from_previous_gtids_event(
@@ -371,27 +360,84 @@ bool ArchiveDumpSession::open_current_file() {
     ArchiveSender::instance().unpin_file(m_channel, m_pinned_file);
     m_pinned_file.clear();
   }
-  m_in.close();
-  m_in.clear();
-  const std::string path = m_base_dir + m_current_file;
-  m_in.open(path, std::ios::binary);
-  if (!m_in.is_open()) {
+  m_in.reset();
+  m_decryptor.reset();
+  m_body_offset = 0;
+
+  m_in = m_backend->open_read(m_base_dir, m_current_file);
+  if (!m_in) {
     bslog_code(WARNING_LEVEL, ER_BINLOG_SERVER_IO_FAILURE,
-               "cannot open archive '%s' (errno=%d: %s)", path.c_str(), errno,
-               strerror(errno));
+               "cannot open archive '%s%s' via storage backend",
+               m_base_dir.c_str(), m_current_file.c_str());
     return false;
   }
+
+  unsigned char magic_check[4];
+  if (m_in->read_at(0, magic_check, 4) &&
+      EncryptionHeader::is_encrypted(magic_check)) {
+    unsigned char hdr_buf[kEncryptionHeaderSize];
+    if (!m_in->read_at(0, hdr_buf, kEncryptionHeaderSize)) {
+      bslog(WARNING_LEVEL,
+            "binlog_server: channel '%s' encrypted file '%s' header truncated",
+            m_channel.c_str(), m_current_file.c_str());
+      m_in.reset();
+      return false;
+    }
+
+    EncryptionHeader hdr;
+    if (!hdr.deserialize(hdr_buf)) {
+      bslog(WARNING_LEVEL,
+            "binlog_server: channel '%s' failed to parse encryption header "
+            "in '%s'",
+            m_channel.c_str(), m_current_file.c_str());
+      m_in.reset();
+      return false;
+    }
+
+    unsigned char password[kFilePasswordLen];
+    if (!decrypt_file_password(hdr.key_id, hdr.encrypted_password, hdr.iv,
+                               password)) {
+      bslog(WARNING_LEVEL,
+            "binlog_server: channel '%s' cannot decrypt file password for "
+            "'%s' (key='%s')",
+            m_channel.c_str(), m_current_file.c_str(), hdr.key_id.c_str());
+      OPENSSL_cleanse(password, sizeof(password));
+      m_in.reset();
+      return false;
+    }
+
+    m_decryptor = std::make_unique<AesCtrCipher>();
+    if (!m_decryptor->open(password, kFilePasswordLen)) {
+      OPENSSL_cleanse(password, sizeof(password));
+      m_decryptor.reset();
+      m_in.reset();
+      return false;
+    }
+    OPENSSL_cleanse(password, sizeof(password));
+    m_body_offset = kEncryptionHeaderSize;
+  }
+
   m_fde_seen = false;
   ArchiveSender::instance().pin_file(m_channel, m_current_file);
   m_pinned_file = m_current_file;
   return true;
 }
 
+bool ArchiveDumpSession::read_at(my_off_t logical_pos, unsigned char *buf,
+                                 size_t len) {
+  my_off_t phys_pos = m_body_offset + logical_pos;
+  if (!m_in || !m_in->read_at(static_cast<uint64_t>(phys_pos), buf, len))
+    return false;
+  if (m_decryptor) {
+    m_decryptor->set_offset(logical_pos);
+    if (!m_decryptor->process(buf, len)) return false;
+  }
+  return true;
+}
+
 bool ArchiveDumpSession::peek_fde_for_checksum() {
-  m_in.clear();
-  m_in.seekg(kBinlogMagicSize, std::ios::beg);
   unsigned char header[kLogEventHeaderLen];
-  if (!m_in.read(reinterpret_cast<char *>(header), kLogEventHeaderLen)) {
+  if (!read_at(kBinlogMagicSize, header, kLogEventHeaderLen)) {
     bslog_code(ERROR_LEVEL, ER_BINLOG_SERVER_IO_FAILURE,
                "channel '%s': cannot read FDE header from '%s'",
                m_channel.c_str(), m_current_file.c_str());
@@ -414,9 +460,8 @@ bool ArchiveDumpSession::peek_fde_for_checksum() {
     return false;
   }
 
-  m_in.seekg(kBinlogMagicSize + fde_len - 5, std::ios::beg);
   unsigned char alg = 0;
-  if (!m_in.read(reinterpret_cast<char *>(&alg), 1)) return false;
+  if (!read_at(kBinlogMagicSize + fde_len - 5, &alg, 1)) return false;
   m_has_checksum = (alg == kChecksumAlgCrc32);
 
   if (m_has_checksum && m_negotiated_checksum == -1) {
@@ -426,23 +471,17 @@ bool ArchiveDumpSession::peek_fde_for_checksum() {
                m_channel.c_str());
     return false;
   }
-
-  m_in.clear();
-  m_in.seekg(kBinlogMagicSize, std::ios::beg);
   return true;
 }
 
 bool ArchiveDumpSession::ship_current_files_fde() {
-  m_in.seekg(kBinlogMagicSize, std::ios::beg);
   unsigned char header[kLogEventHeaderLen];
-  if (!m_in.read(reinterpret_cast<char *>(header), kLogEventHeaderLen))
-    return false;
+  if (!read_at(kBinlogMagicSize, header, kLogEventHeaderLen)) return false;
   if (header[kEventTypeOffset] != kFormatDescriptionEventType) return false;
   const uint32_t fde_len = read_u32_le(header + kEventLenOffset);
   if (fde_len < kLogEventHeaderLen + 5) return false;
   std::vector<unsigned char> fde(fde_len);
-  m_in.seekg(kBinlogMagicSize, std::ios::beg);
-  if (!m_in.read(reinterpret_cast<char *>(fde.data()), fde_len)) return false;
+  if (!read_at(kBinlogMagicSize, fde.data(), fde_len)) return false;
 
   const unsigned char alg = fde[fde_len - 5];
   m_has_checksum = (alg == kChecksumAlgCrc32);
@@ -629,13 +668,9 @@ bool ArchiveDumpSession::advance_to_next_archive_file() {
   if (!open_current_file()) return false;
   if (!ship_current_files_fde()) return false;
 
-  m_in.clear();
-  m_in.seekg(kBinlogMagicSize, std::ios::beg);
   unsigned char fde_hdr[kLogEventHeaderLen];
-  if (!m_in.read(reinterpret_cast<char *>(fde_hdr), kLogEventHeaderLen))
-    return false;
+  if (!read_at(kBinlogMagicSize, fde_hdr, kLogEventHeaderLen)) return false;
   const uint32_t fde_len = read_u32_le(fde_hdr + kEventLenOffset);
-  m_in.seekg(kBinlogMagicSize + fde_len, std::ios::beg);
   m_current_pos = kBinlogMagicSize + fde_len;
   return true;
 }
@@ -645,16 +680,13 @@ bool ArchiveDumpSession::wait_for_more_data() {
   const auto deadline = steady_clock::now() + m_heartbeat_period;
   while (steady_clock::now() < deadline) {
     if (m_killed.killed()) return false;
-    const std::string path = m_base_dir + m_current_file;
-    const unsigned long long sz = file_size_or_zero(path);
-    if (static_cast<unsigned long long>(m_current_pos) < sz) {
-      m_in.clear();
+    const uint64_t sz = m_backend->file_size(m_base_dir, m_current_file);
+    if (static_cast<unsigned long long>(m_current_pos + m_body_offset) < sz) {
       return true;
     }
     if (refresh_index_cache()) {
       const int idx = current_file_index();
       if (idx >= 0 && idx + 1 < static_cast<int>(m_index_cache.size())) {
-        m_in.clear();
         return true;
       }
     }
@@ -665,16 +697,15 @@ bool ArchiveDumpSession::wait_for_more_data() {
 
 bool ArchiveDumpSession::send_event_loop() {
   while (!m_killed.killed()) {
-    m_in.clear();
-    m_in.seekg(m_current_pos, std::ios::beg);
     unsigned char header[kLogEventHeaderLen];
-    if (!m_in.read(reinterpret_cast<char *>(header), kLogEventHeaderLen)) {
+    if (!read_at(m_current_pos, header, kLogEventHeaderLen)) {
       if (!is_active_file()) {
         if (!advance_to_next_archive_file()) {
           if (!m_wait_new_events) return true;
           if (!wait_for_more_data()) return false;
-          if (file_size_or_zero(m_base_dir + m_current_file) <=
-              static_cast<unsigned long long>(m_current_pos)) {
+          if (m_backend->file_size(m_base_dir, m_current_file) <=
+              static_cast<unsigned long long>(m_current_pos +
+                                             m_body_offset)) {
             (void)send_heartbeat();
           }
         }
@@ -682,8 +713,8 @@ bool ArchiveDumpSession::send_event_loop() {
       }
       if (!m_wait_new_events) return true;
       if (!wait_for_more_data()) return false;
-      if (file_size_or_zero(m_base_dir + m_current_file) <=
-          static_cast<unsigned long long>(m_current_pos)) {
+      if (m_backend->file_size(m_base_dir, m_current_file) <=
+          static_cast<unsigned long long>(m_current_pos + m_body_offset)) {
         if (!is_active_file()) {
           if (!advance_to_next_archive_file()) (void)send_heartbeat();
         } else {
@@ -707,9 +738,7 @@ bool ArchiveDumpSession::send_event_loop() {
     }
 
     std::vector<unsigned char> ev(event_len);
-    m_in.clear();
-    m_in.seekg(m_current_pos, std::ios::beg);
-    if (!m_in.read(reinterpret_cast<char *>(ev.data()), event_len)) {
+    if (!read_at(m_current_pos, ev.data(), event_len)) {
       if (!m_wait_new_events) return true;
       if (!wait_for_more_data()) return false;
       continue;
@@ -735,10 +764,8 @@ bool ArchiveDumpSession::send_event_loop() {
         m_current_pos = kBinlogMagicSize;
         if (!open_current_file()) return false;
         if (!ship_current_files_fde()) return false;
-        m_in.clear();
-        m_in.seekg(kBinlogMagicSize, std::ios::beg);
         unsigned char fde_hdr[kLogEventHeaderLen];
-        if (!m_in.read(reinterpret_cast<char *>(fde_hdr), kLogEventHeaderLen))
+        if (!read_at(kBinlogMagicSize, fde_hdr, kLogEventHeaderLen))
           return false;
         const uint32_t fde_sz = read_u32_le(fde_hdr + kEventLenOffset);
         m_current_pos = kBinlogMagicSize + fde_sz;
@@ -755,11 +782,8 @@ bool ArchiveDumpSession::run() {
   if (!send_initial_fake_rotate()) return true;
   if (!ship_current_files_fde()) return true;
 
-  m_in.clear();
-  m_in.seekg(kBinlogMagicSize, std::ios::beg);
   unsigned char fde_hdr[kLogEventHeaderLen];
-  if (!m_in.read(reinterpret_cast<char *>(fde_hdr), kLogEventHeaderLen))
-    return true;
+  if (!read_at(kBinlogMagicSize, fde_hdr, kLogEventHeaderLen)) return true;
   const uint32_t fde_len = read_u32_le(fde_hdr + kEventLenOffset);
   const my_off_t after_fde =
       static_cast<my_off_t>(kBinlogMagicSize) + fde_len;
@@ -908,6 +932,18 @@ bool ArchiveSender::handle(MYSQL_THD thd, const char *log_ident,
     return false;
   }
 
+  StorageBackend *backend =
+      m_storage->resolve_channel_backend(channel.c_str());
+  if (backend == nullptr) {
+    bslog_code(WARNING_LEVEL, ER_BINLOG_SERVER_CONFIG_REJECTED,
+               "dump request from user='%s' server_id=%u resolved to "
+               "channel '%s' but no storage backend available; "
+               "falling through",
+               user, static_cast<unsigned>(replica_server_id),
+               channel.c_str());
+    return false;
+  }
+
   binlog_server::gtid::Gtid_set replica_executed;
   bool gtid_mode = false;
   if (replica_executed_gtids_text != nullptr &&
@@ -934,7 +970,7 @@ bool ArchiveSender::handle(MYSQL_THD thd, const char *log_ident,
         static_cast<unsigned long long>(pos), static_cast<unsigned>(flags));
 
   ArchiveDumpSession session(
-      thd, channel, base_dir, excluded_ptr,
+      thd, channel, base_dir, backend, excluded_ptr,
       log_ident == nullptr ? "" : log_ident, pos, flags, source_server_id,
       static_cast<int>(negotiated_checksum_alg), m_trace_send_path);
   const bool rc = session.run();

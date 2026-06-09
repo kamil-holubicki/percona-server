@@ -75,6 +75,8 @@
 <li><a href="#locking-discipline">Locking discipline</a></li>
 <li><a href="#channelstate-anatomy">ChannelState anatomy</a></li>
 <li><a href="#on-disk-archive-format">On-disk archive format</a></li>
+<li><a href="#encrypted-on-disk-format">Encrypted on-disk format</a></li>
+<li><a href="#key-hierarchy">Key hierarchy</a></li>
 <li><a href="#append-path">Append path</a></li>
 <li><a href="#deduplication-watermark">Deduplication watermark</a></li>
 <li><a href="#durability-boundaries">Durability boundaries</a></li>
@@ -92,6 +94,9 @@
 <li><a href="#serve-path-event-streaming-and-filtering">Serve path: event streaming and filtering</a></li>
 <li><a href="#serve-path-tail-follow-and-heartbeat">Serve path: tail-follow and heartbeat</a></li>
 <li><a href="#user-channel-map-loader">User channel map loader</a></li>
+<li><a href="#purge-operations">Purge operations</a></li>
+<li><a href="#s3-storage-backend-stub">S3 storage backend (stub)</a></li>
+<li><a href="#rewrite-mode-stub">Rewrite mode (stub)</a></li>
 <li><a href="#error-code-catalogue">Error code catalogue</a></li>
 <li><a href="#build-wiring">Build wiring</a></li>
 </ul>
@@ -146,7 +151,7 @@
 </tr>
 <tr>
 <td><code>components/binlog_server/storage_backend.h</code></td>
-<td>Abstract <code>StorageBackend</code> interface.</td>
+<td>Abstract <code>StorageBackend</code> interface + <code>StorageWriteStream</code> / <code>StorageReadStream</code> abstractions.</td>
 </tr>
 <tr>
 <td><code>components/binlog_server/file_storage.h</code></td>
@@ -154,7 +159,15 @@
 </tr>
 <tr>
 <td><code>components/binlog_server/file_storage.cc</code></td>
-<td>Directory creation, path resolution.</td>
+<td>Directory creation, path resolution, <code>FileWriteStream</code>, <code>FileReadStream</code>.</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/encryption.h</code></td>
+<td><code>AesCtrCipher</code>, <code>EncryptionHeader</code>, keyring helpers, key rotation.</td>
+</tr>
+<tr>
+<td><code>components/binlog_server/encryption.cc</code></td>
+<td>AES-256-CTR via OpenSSL EVP, TLV header serialization, keyring service calls.</td>
 </tr>
 <tr>
 <td><code>components/binlog_server/log_helpers.h</code></td>
@@ -235,9 +248,9 @@ contends with IO threads of other channels.</p>
 <div class="codehilite"><pre><span></span><code><span class="k">struct</span><span class="w"> </span><span class="nc">ChannelState</span><span class="w"> </span><span class="p">{</span>
 <span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="w"> </span><span class="n">mtx</span><span class="p">;</span>
 
-<span class="w">  </span><span class="c1">// On-disk I/O</span>
-<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">ofstream</span><span class="w"> </span><span class="n">out</span><span class="p">;</span>
-<span class="w">  </span><span class="kt">int</span><span class="w"> </span><span class="n">fsync_fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span>
+<span class="w">  </span><span class="c1">// On-disk I/O (storage-backend agnostic)</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">unique_ptr</span><span class="o">&lt;</span><span class="n">StorageWriteStream</span><span class="o">&gt;</span><span class="w"> </span><span class="n">out</span><span class="p">;</span>
+<span class="w">  </span><span class="n">StorageBackend</span><span class="w"> </span><span class="o">*</span><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">nullptr</span><span class="p">;</span>
 
 <span class="w">  </span><span class="c1">// Current file tracking</span>
 <span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">current_log_name</span><span class="p">;</span>
@@ -249,6 +262,9 @@ contends with IO threads of other channels.</p>
 <span class="w">  </span><span class="c1">// Protocol state</span>
 <span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="n">wrote_fde</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">false</span><span class="p">;</span>
 <span class="w">  </span><span class="kt">bool</span><span class="w"> </span><span class="n">has_checksum</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">false</span><span class="p">;</span>
+
+<span class="w">  </span><span class="c1">// Encryption</span>
+<span class="w">  </span><span class="n">std</span><span class="o">::</span><span class="n">unique_ptr</span><span class="o">&lt;</span><span class="n">AesCtrCipher</span><span class="o">&gt;</span><span class="w"> </span><span class="n">encryptor</span><span class="p">;</span><span class="w">  </span><span class="c1">// non-null when file is encrypted</span>
 
 <span class="w">  </span><span class="c1">// Counters</span>
 <span class="w">  </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">events_appended</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
@@ -263,9 +279,8 @@ contends with IO threads of other channels.</p>
 
 <p>Key invariants:</p>
 <ul>
-<li><code>out.is_open()</code> iff we are actively collecting into a file.</li>
-<li><code>fsync_fd</code> is a POSIX fd opened on the same path, used exclusively
-  for <code>fsync(2)</code> calls (the <code>std::ofstream</code> doesn't expose its fd).</li>
+<li><code>out != nullptr</code> iff we are actively collecting into a file.</li>
+<li><code>backend</code> is set during <code>configure_channel</code> and used for all I/O.</li>
 <li><code>current_log_name</code> is the basename (e.g. <code>binlog.000003</code>), not a
   full path.</li>
 <li><code>last_source_log_pos</code> is always the <code>log_pos</code> of the last
@@ -274,6 +289,9 @@ contends with IO threads of other channels.</p>
 <li><code>wrote_fde</code> is reset on every file rotation. It prevents writing
   a second FDE if the upstream re-sends one on reconnect within the
   same file.</li>
+<li><code>encryptor</code> is non-null when <code>binlog_server.encryption = ON</code> and
+  a file is open. All event data passes through <code>encryptor-&gt;process()</code>
+  before being written via <code>out-&gt;write()</code>.</li>
 </ul>
 <h2 id="on-disk-archive-format">On-disk archive format<a class="headerlink" href="#on-disk-archive-format" title="Permanent link">&#x00B6;</a></h2>
 <p>Each archived file is a <strong>byte-identical copy</strong> of the source's binlog
@@ -296,6 +314,39 @@ Bytes 17-18: flags (2 bytes, little-endian)
 
 <p>If <code>has_checksum</code> is true, each event has a 4-byte CRC32 appended
 after the declared <code>event_length - 4</code> payload bytes.</p>
+<h3 id="encrypted-on-disk-format">Encrypted on-disk format<a class="headerlink" href="#encrypted-on-disk-format" title="Permanent link">&#x00B6;</a></h3>
+<p>When <code>binlog_server.encryption = ON</code>, each archive file is written
+with a 512-byte cleartext header followed by AES-256-CTR encrypted
+body bytes:</p>
+<div class="codehilite"><pre><span></span><code>Offset 0:      fd 62 69 6e           (encryption magic: &quot;\xfdbin&quot;)
+Offset 4:      01                    (header version 1)
+Offset 5:      [TLV: key_id]        (type=1, len=N, value=key name string)
+Offset ...:    [TLV: encrypted_pw]  (type=2, len=32, value=encrypted file password)
+Offset ...:    [TLV: iv]            (type=3, len=16, value=AES IV for password decryption)
+Offset ...:    00 00 ...            (zero padding to offset 512)
+------- encrypted body (AES-256-CTR from stream offset 0) -------
+Offset 512:    encrypted(fe 62 69 6e)       (encrypted binlog magic)
+Offset 516:    encrypted([FDE])             (encrypted Format Description Event)
+Offset ...:    encrypted([event] [event] ...)
+</code></pre></div>
+
+<p>The encryption stream uses a per-file random password (32 bytes)
+that is itself encrypted by the channel's master key (stored in the
+keyring). The CTR counter starts at offset 0 for the first byte
+after the 512-byte header. The encrypted body has the same logical
+layout as a plaintext binlog (magic + FDE + events).</p>
+<h3 id="key-hierarchy">Key hierarchy<a class="headerlink" href="#key-hierarchy" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code>keyring
+  └── BinlogServerKey_&lt;channel&gt;_&lt;version&gt;  (master key, AES-256)
+        └── encrypts per-file password (random 32 bytes)
+              └── derives file_key + file_iv via EVP_BytesToKey(SHA-512)
+                    └── AES-256-CTR stream cipher for file body
+</code></pre></div>
+
+<p>Master key rotation (<code>binlog_server_rotate_encryption_key</code>) re-wraps
+the active file's password under the new master key and rewrites the
+512-byte header in-place. Existing data is not re-encrypted; only
+the header changes.</p>
 <h2 id="append-path">Append path<a class="headerlink" href="#append-path" title="Permanent link">&#x00B6;</a></h2>
 <p>The <code>append_event</code> method is the hot path, called once per event by
 the IO thread:</p>
@@ -750,6 +801,103 @@ revoked) never silently empties replication routing mid-flight.</p>
 Takes no arguments; returns the number of mappings loaded (or NULL on
 failure). Calls <code>apply_spec()</code> with the current sysvar value, which is
 safe because UDF execution holds no sysvar/plugin locks.</p>
+<h2 id="purge-operations">Purge operations<a class="headerlink" href="#purge-operations" title="Permanent link">&#x00B6;</a></h2>
+<p>Three purge UDFs share a common <code>commit_purge()</code> core and differ only
+in how they select victim files:</p>
+<h3 id="victim-selection-strategies">Victim selection strategies<a class="headerlink" href="#victim-selection-strategies" title="Permanent link">&#x00B6;</a></h3>
+<table>
+<thead>
+<tr>
+<th>UDF</th>
+<th>Strategy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>purge_channel(ch, file)</code></td>
+<td>Oldest → target (inclusive). Validates target exists in index and shares base name.</td>
+</tr>
+<tr>
+<td><code>purge_before_gtid(ch, set)</code></td>
+<td>Walk oldest → newest; include file if its <code>last_gtid_set</code> metadata is a subset of the given set. Stop at first non-contained file.</td>
+</tr>
+<tr>
+<td><code>purge_before_timestamp(ch, ts)</code></td>
+<td>Walk oldest → newest; include file if its <code>max_event_timestamp</code> metadata is below the given Unix timestamp. Stop at first file at or above threshold.</td>
+</tr>
+</tbody>
+</table>
+<p>All three enforce the <strong>tail-file invariant</strong>: at least one file must
+always remain in the index.</p>
+<h3 id="commit-algorithm-commit_purge">Commit algorithm (<code>commit_purge</code>)<a class="headerlink" href="#commit-algorithm-commit_purge" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code>commit_purge(ChannelState &amp;cs, victims, channel_name):
+  1. Pin check:
+     For each victim file, call ArchiveSender::is_file_pinned(channel, file).
+     If ANY victim is pinned → return -1 (entire purge refused).
+
+  2. Update in-memory state:
+     - Erase victims from cs.file_metadata, cs.indexed_files.
+     - Rebuild cs.file_order with remaining entries only.
+
+  3. Atomic index rewrite (commit point):
+     - backend-&gt;index_rewrite(dir, cs.file_order)
+       Implemented as: write to tmp file → fsync → rename over binlog.index.
+     - On failure: rollback in-memory state (re-insert victims), return -1.
+
+  4. Best-effort file deletion (after commit):
+     For each victim:
+       - fs::remove(base_dir + victim)
+       - fs::remove(base_dir + victim + &quot;.meta&quot;)  // sidecar, no warning on fail
+     If any removal fails, log a warning but still return the count.
+     (Index is authoritative; orphan files are harmless.)
+</code></pre></div>
+
+<h3 id="file-pin-mechanism">File pin mechanism<a class="headerlink" href="#file-pin-mechanism" title="Permanent link">&#x00B6;</a></h3>
+<p>The <code>ArchiveSender</code> tracks which files are actively being read by
+downstream dump sessions:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">// In ArchiveSender (singleton)</span>
+<span class="k">mutable</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">mutex</span><span class="w"> </span><span class="n">m_pin_mutex</span><span class="p">;</span>
+<span class="n">std</span><span class="o">::</span><span class="n">map</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="p">,</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">set</span><span class="o">&lt;</span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="n">m_pinned_files</span><span class="p">;</span><span class="w">  </span><span class="c1">// channel → files</span>
+
+<span class="kt">void</span><span class="w"> </span><span class="nf">pin_file</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="n">filename</span><span class="p">);</span><span class="w">    </span><span class="c1">// called when open_current_file() succeeds</span>
+<span class="kt">void</span><span class="w"> </span><span class="nf">unpin_file</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="n">filename</span><span class="p">);</span><span class="w">  </span><span class="c1">// called on file close or session end</span>
+<span class="kt">bool</span><span class="w"> </span><span class="nf">is_file_pinned</span><span class="p">(</span><span class="n">channel</span><span class="p">,</span><span class="w"> </span><span class="n">filename</span><span class="p">)</span><span class="w"> </span><span class="k">const</span><span class="p">;</span><span class="w">  </span><span class="c1">// checked by commit_purge</span>
+</code></pre></div>
+
+<p>Each <code>ArchiveDumpSession</code> pins at most one file at a time (the file
+currently being streamed). Unpinning happens when the session advances
+to the next file or terminates.</p>
+<h3 id="purge-validation-helpers">Purge validation helpers<a class="headerlink" href="#purge-validation-helpers" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code>is_valid_binlog_name(name):
+  - Must contain a &#39;.&#39; followed by ≥6 digits at end (e.g. &quot;binlog.000003&quot;)
+
+base_name_matches(target, file_order):
+  - Prefix before the last &#39;.&#39; must match between target and existing files
+  - Prevents cross-channel or malformed names from passing
+</code></pre></div>
+
+<h2 id="s3-storage-backend-stub">S3 storage backend (stub)<a class="headerlink" href="#s3-storage-backend-stub" title="Permanent link">&#x00B6;</a></h2>
+<p>The <code>S3Storage</code> class in <code>s3_storage.{h,cc}</code> implements the full
+<code>StorageBackend</code> interface (including <code>open_write</code>, <code>open_read</code>,
+<code>rewrite_header</code>, <code>truncate_file</code>) but every I/O method:</p>
+<ol>
+<li>Logs a message: <code>"S3 storage backend is not yet implemented"</code></li>
+<li>Returns failure (false / nullptr / 0)</li>
+</ol>
+<p>The factory recognizes <code>s3://</code> URIs and constructs an <code>S3Storage</code>
+instance, so configuration-time validation succeeds. Actual runtime
+I/O will fail with clear messages.</p>
+<h2 id="rewrite-mode-stub">Rewrite mode (stub)<a class="headerlink" href="#rewrite-mode-stub" title="Permanent link">&#x00B6;</a></h2>
+<p>Two system variables exist for future archive rotation:</p>
+<ul>
+<li><code>binlog_server.rewrite_file_size</code> (ULONGLONG, default 0)</li>
+<li><code>binlog_server.rewrite_base_name</code> (STRING, default '')</li>
+</ul>
+<p>Setting non-default values logs a warning and has no runtime effect.
+The <code>gtid_renumberer.{h,cc}</code> module provides a <code>LogicalClockState</code>
+struct for adjusting <code>sequence_number</code> / <code>last_committed</code> fields when
+coalescing multiple source segments. GTID identifiers (UUID:GNO) are
+never modified — only the logical clock is rebased.</p>
 <h2 id="error-code-catalogue">Error code catalogue<a class="headerlink" href="#error-code-catalogue" title="Permanent link">&#x00B6;</a></h2>
 <table>
 <thead>

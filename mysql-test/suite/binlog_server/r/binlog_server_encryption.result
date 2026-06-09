@@ -1,0 +1,99 @@
+include/rpl/init_source_replica.inc
+Warnings:
+Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	####	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+[connection master]
+[connection slave]
+[connection master]
+
+*** Setting up storage and keyring
+
+*** Setting up keyring on replica (server 2)
+[connection slave]
+# Creating local configuration file for keyring component: component_keyring_file
+# Creating manifest file for current MySQL server instance
+
+*** Restarting replica with keyring manifest
+include/rpl/restart_server.inc [server_number=2]
+[connection slave]
+
+*** Installing binlog server component and plugin
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL PLUGIN binlog_server_relay SONAME 'binlog_server_relay.so';
+
+*** Configuring channel (encryption OFF initially for plaintext baseline)
+CHANGE REPLICATION SOURCE TO
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORAGE_DIR/',
+SOURCE_AUTO_POSITION = 1;
+START REPLICA IO_THREAD;
+
+*** Write data with encryption OFF (plaintext archive)
+[connection master]
+CREATE TABLE t1 (id INT PRIMARY KEY AUTO_INCREMENT, data VARCHAR(100));
+INSERT INTO t1 (data) VALUES ('plaintext_row1'), ('plaintext_row2');
+
+*** Wait for replica to receive events
+[connection slave]
+
+*** Enable encryption
+SET GLOBAL binlog_server.encryption = ON;
+
+*** Force rotation on source to create a new encrypted file
+[connection master]
+FLUSH BINARY LOGS;
+INSERT INTO t1 (data) VALUES ('encrypted_row1'), ('encrypted_row2');
+INSERT INTO t1 (data) VALUES ('encrypted_row3');
+
+*** Wait for new events to be collected
+[connection slave]
+
+*** Verify encryption sysvar is ON
+SELECT @@GLOBAL.binlog_server.encryption;
+@@GLOBAL.binlog_server.encryption
+1
+
+*** Check archive directory has files
+master-bin.000001
+master-bin.000001.meta
+master-bin.000002
+
+*** Rotate encryption key
+SELECT binlog_server_rotate_encryption_key('_default');
+binlog_server_rotate_encryption_key('_default')
+BinlogServerKey__2
+
+*** Write more data after key rotation
+[connection master]
+INSERT INTO t1 (data) VALUES ('after_rotation_row1');
+FLUSH BINARY LOGS;
+INSERT INTO t1 (data) VALUES ('after_rotation_row2');
+
+*** Wait for collection after rotation
+[connection slave]
+
+*** Verify downstream replica can receive data (transparent decryption)
+*** (The binlog server serves plaintext to replicas regardless of at-rest encryption)
+[connection slave]
+SELECT COUNT(*) FROM performance_schema.replication_binlog_server_status
+WHERE CHANNEL_NAME = '_default' AND EVENTS_APPENDED > 0;
+COUNT(*)
+1
+
+*** Cleanup
+[connection slave]
+STOP REPLICA IO_THREAD;
+SET GLOBAL binlog_server.encryption = OFF;
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 0, SOURCE_AUTO_POSITION = 1;
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+include/rpl/start_replica.inc
+[connection master]
+DROP TABLE t1;
+include/rpl/sync_to_replica.inc
+# Removing manifest file for current MySQL server instance
+# Removing local keyring file for keyring component: component_keyring_file
+include/rpl/restart_server.inc [server_number=2]
+[connection slave]
+include/rpl/start_replica.inc
+include/rpl/deinit.inc

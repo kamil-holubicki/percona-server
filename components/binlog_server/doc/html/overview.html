@@ -262,6 +262,24 @@ as out-of-tree-ish loadables.</p>
 </tr>
 </tbody>
 </table>
+<h2 id="observability">Observability<a class="headerlink" href="#observability" title="Permanent link">&#x00B6;</a></h2>
+<p>The component exposes three <code>performance_schema</code> tables:</p>
+<ul>
+<li><strong><code>replication_binlog_server_status</code></strong> &mdash; per-channel
+  operational counters: events appended, bytes, write errors,
+  duplicates dropped, last error, timestamps.</li>
+<li><strong><code>replication_binlog_server_storage</code></strong> &mdash; per-channel storage
+  summary: file count, total size on disk, active/idle status, GTID
+  set covered.</li>
+<li><strong><code>replication_binlog_server_archive</code></strong> &mdash; per-file metadata:
+  size, event count, min/max timestamps, Previous_gtid and
+  accumulated GTID sets. Enables point-in-time lookups without
+  scanning the archive.</li>
+</ul>
+<p>Per-file metadata is persisted in <code>.meta</code> sidecar files alongside
+each archive file for fast recovery. See the
+<a href="user_guide.html#observability-performance-schema-tables">User guide &rarr; Observability</a>
+section for full column definitions and query examples.</p>
 <h2 id="what-it-explicitly-is-not">What it explicitly is NOT<a class="headerlink" href="#what-it-explicitly-is-not" title="Permanent link">&#x00B6;</a></h2>
 <ul>
 <li><strong>Not a replication group member.</strong> No group-replication semantics,

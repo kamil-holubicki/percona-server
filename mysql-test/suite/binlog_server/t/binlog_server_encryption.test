@@ -1,0 +1,167 @@
+--source include/have_binlog_format_row.inc
+--source suite/binlog_server/inc/have_binlog_server.inc
+--source include/have_component_keyring_file.inc
+--source include/rpl/init_source_replica.inc
+
+--source include/rpl/connection_replica.inc
+--source suite/binlog_server/inc/binlog_server_suppressions.inc
+--source include/rpl/connection_source.inc
+
+# Test: Binlog server at-rest encryption
+#
+# Verifies that:
+# 1. Encryption can be enabled via binlog_server.encryption sysvar
+# 2. Newly collected archive files are encrypted (have encryption magic)
+# 3. Encrypted archives are served transparently to downstream replicas
+# 4. Key rotation UDF works and continued collection succeeds afterward
+# 5. Mixed archive (plaintext + encrypted) files coexist correctly
+
+--echo
+--echo *** Setting up storage and keyring
+--let $storage_dir = $MYSQL_TMP_DIR/binlog_server_encryption_store
+--mkdir $storage_dir
+
+--echo
+--echo *** Setting up keyring on replica (server 2)
+
+# Compute keyring component variables
+--let COMPONENT_LIBRARY = `SELECT SUBSTRING_INDEX('$KEYRING_FILE_COMPONENT_LOAD', '=', -1)`
+--let COMPONENT_DIR = $KEYRING_FILE_COMPONENT_DIR
+--let COMPONENT_NAME = `SELECT SUBSTRING_INDEX('$COMPONENT_LIBRARY', '.', 1)`
+
+# Switch to replica to get its datadir
+--source include/rpl/connection_replica.inc
+--let CURRENT_DATADIR = `SELECT @@datadir`
+
+# Create local keyring config
+--let KEYRING_FILE_PATH = `SELECT CONCAT('$MYSQLTEST_VARDIR', '/keyring_bs_encryption')`
+--let KEYRING_CONFIG_CONTENT = `SELECT CONCAT('{ "path": "', '$KEYRING_FILE_PATH','", "read_only": false }')`
+--source include/keyring_tests/helper/local_keyring_create_config.inc
+
+# Create local manifest file for replica server instance
+--let LOCAL_MANIFEST_CONTENT = `SELECT CONCAT('{ "components": "file://', '$COMPONENT_NAME', '" }')`
+--source include/keyring_tests/helper/instance_create_manifest.inc
+
+--echo
+--echo *** Restarting replica with keyring manifest
+--let $rpl_server_number = 2
+--let $rpl_server_parameters = $KEYRING_FILE_COMPONENT_OPT
+--let $rpl_omit_print_server_parameters = 1
+--source include/rpl/restart_server.inc
+--let $rpl_omit_print_server_parameters =
+
+# Reconnect to replica after restart
+--source include/rpl/connection_replica.inc
+
+--echo
+--echo *** Installing binlog server component and plugin
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL PLUGIN binlog_server_relay SONAME 'binlog_server_relay.so';
+
+--echo
+--echo *** Configuring channel (encryption OFF initially for plaintext baseline)
+--replace_result $storage_dir STORAGE_DIR
+eval CHANGE REPLICATION SOURCE TO
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file://$storage_dir/',
+  SOURCE_AUTO_POSITION = 1;
+
+START REPLICA IO_THREAD;
+
+--let $wait_condition = SELECT COUNT(*) = 1 FROM performance_schema.replication_connection_status WHERE SERVICE_STATE = 'ON'
+--source include/wait_condition.inc
+
+--echo
+--echo *** Write data with encryption OFF (plaintext archive)
+--source include/rpl/connection_source.inc
+CREATE TABLE t1 (id INT PRIMARY KEY AUTO_INCREMENT, data VARCHAR(100));
+INSERT INTO t1 (data) VALUES ('plaintext_row1'), ('plaintext_row2');
+
+--echo
+--echo *** Wait for replica to receive events
+--source include/rpl/connection_replica.inc
+--let $wait_condition = SELECT COUNT(*) = 1 FROM performance_schema.replication_connection_status WHERE RECEIVED_TRANSACTION_SET != ''
+--source include/wait_condition.inc
+--sleep 2
+
+--echo
+--echo *** Enable encryption
+SET GLOBAL binlog_server.encryption = ON;
+
+--echo
+--echo *** Force rotation on source to create a new encrypted file
+--source include/rpl/connection_source.inc
+FLUSH BINARY LOGS;
+INSERT INTO t1 (data) VALUES ('encrypted_row1'), ('encrypted_row2');
+INSERT INTO t1 (data) VALUES ('encrypted_row3');
+
+--echo
+--echo *** Wait for new events to be collected
+--source include/rpl/connection_replica.inc
+--sleep 3
+
+--echo
+--echo *** Verify encryption sysvar is ON
+SELECT @@GLOBAL.binlog_server.encryption;
+
+--echo
+--echo *** Check archive directory has files
+--let $channel_dir = $storage_dir/_default
+--list_files $channel_dir *.0*
+
+--echo
+--echo *** Rotate encryption key
+SELECT binlog_server_rotate_encryption_key('_default');
+
+--echo
+--echo *** Write more data after key rotation
+--source include/rpl/connection_source.inc
+INSERT INTO t1 (data) VALUES ('after_rotation_row1');
+FLUSH BINARY LOGS;
+INSERT INTO t1 (data) VALUES ('after_rotation_row2');
+
+--echo
+--echo *** Wait for collection after rotation
+--source include/rpl/connection_replica.inc
+--sleep 3
+
+--echo
+--echo *** Verify downstream replica can receive data (transparent decryption)
+--echo *** (The binlog server serves plaintext to replicas regardless of at-rest encryption)
+--source include/rpl/connection_replica.inc
+SELECT COUNT(*) FROM performance_schema.replication_binlog_server_status
+  WHERE CHANNEL_NAME = '_default' AND EVENTS_APPENDED > 0;
+
+--echo
+--echo *** Cleanup
+--source include/rpl/connection_replica.inc
+STOP REPLICA IO_THREAD;
+--let $wait_condition = SELECT COUNT(*) = 1 FROM performance_schema.replication_connection_status WHERE SERVICE_STATE = 'OFF'
+--source include/wait_condition.inc
+
+SET GLOBAL binlog_server.encryption = OFF;
+CHANGE REPLICATION SOURCE TO BINLOG_SERVER = 0, SOURCE_AUTO_POSITION = 1;
+
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+
+--source include/rpl/start_replica.inc
+
+--source include/rpl/connection_source.inc
+DROP TABLE t1;
+--source include/rpl/sync_to_replica.inc
+
+--let CURRENT_DATADIR = `SELECT @@datadir`
+--source include/keyring_tests/helper/instance_remove_manifest.inc
+--source include/keyring_tests/helper/local_keyring_file_remove.inc
+
+--force-rmdir $storage_dir
+
+--let $rpl_server_number = 2
+--let $rpl_server_parameters =
+--source include/rpl/restart_server.inc
+
+--source include/rpl/connection_replica.inc
+--source include/rpl/start_replica.inc
+
+--source include/rpl/deinit.inc

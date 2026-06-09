@@ -96,8 +96,9 @@ SET GLOBAL binlog_server.default_serve_channel = 'src_a';
 | **GTID auto-position only** | `BINLOG_SERVER` requires `SOURCE_AUTO_POSITION=1`. |
 | **Crash-safe** | On startup, the archive walks the last file to find the last fully-written event, truncates any partial tail, and restores the watermark. |
 | **Durable at transaction boundaries** | Every `Xid` / `XA_prepare` event triggers an `fsync(2)`, ensuring committed transactions survive a power loss. |
+| **At-rest encryption** | Optional AES-256-CTR encryption with keyring-managed master keys. Online key rotation without stopping collection. Transparent decryption when serving to replicas. |
 
-## Current status (Phase 1–5)
+## Current status (Phase 1–6)
 
 **Phase 1** — collection path:
 
@@ -145,10 +146,20 @@ SET GLOBAL binlog_server.default_serve_channel = 'src_a';
 - Rewrite/rotation architecture stub (`rewrite_file_size`, `rewrite_base_name` sysvars)
 - GTID renumberer stub for logical-clock adjustment in rewrite mode
 
+**Phase 6** — at-rest encryption:
+
+- Per-channel at-rest encryption using AES-256-CTR
+- Two-tier key hierarchy: keyring-managed master key wraps a per-file random password
+- Transparent decryption when serving to downstream replicas
+- `binlog_server.encryption` sysvar (ON/OFF) to enable/disable
+- `binlog_server_rotate_encryption_key(channel)` UDF for online master key rotation
+- Keyring integration via `component_keyring_file` (any keyring component works)
+- `StorageWriteStream` / `StorageReadStream` abstractions for storage-agnostic I/O
+- Encryption operates above the storage backend: same logic works for file:// and future S3
+
 **Not yet implemented** (planned for later phases):
 - S3-compatible object storage backend (stubs in place)
 - Local rotation / rewriting (stubs in place)
-- At-rest encryption
 - Point-in-time search queries (`search_by_timestamp`, `search_by_gtid_set`)
 
 ## License

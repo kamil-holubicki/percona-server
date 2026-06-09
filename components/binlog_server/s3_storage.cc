@@ -131,6 +131,41 @@ bool S3Storage::sidecar_store(const std::string &dir, const std::string &name,
   return false;
 }
 
+std::unique_ptr<StorageWriteStream> S3Storage::open_write(
+    const std::string &dir, const std::string &name) {
+  (void)dir;
+  (void)name;
+  log_not_implemented("open_write");
+  return nullptr;
+}
+
+std::unique_ptr<StorageReadStream> S3Storage::open_read(
+    const std::string &dir, const std::string &name) const {
+  (void)dir;
+  (void)name;
+  log_not_implemented("open_read");
+  return nullptr;
+}
+
+bool S3Storage::rewrite_header(const std::string &dir, const std::string &name,
+                               const unsigned char *data, size_t len) {
+  (void)dir;
+  (void)name;
+  (void)data;
+  (void)len;
+  log_not_implemented("rewrite_header");
+  return false;
+}
+
+bool S3Storage::truncate_file(const std::string &dir, const std::string &name,
+                              uint64_t new_size) {
+  (void)dir;
+  (void)name;
+  (void)new_size;
+  log_not_implemented("truncate_file");
+  return false;
+}
+
 std::unique_ptr<StorageBackend> create_s3_storage() {
   return std::make_unique<S3Storage>();
 }

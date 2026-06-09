@@ -206,9 +206,13 @@ flowchart LR
 <td><strong>Durable at transaction boundaries</strong></td>
 <td>Every <code>Xid</code> / <code>XA_prepare</code> event triggers an <code>fsync(2)</code>, ensuring committed transactions survive a power loss.</td>
 </tr>
+<tr>
+<td><strong>At-rest encryption</strong></td>
+<td>Optional AES-256-CTR encryption with keyring-managed master keys. Online key rotation without stopping collection. Transparent decryption when serving to replicas.</td>
+</tr>
 </tbody>
 </table>
-<h2 id="current-status-phase-1-phase-2-phase-3">Current status (Phase 1 + Phase 2 + Phase 3)<a class="headerlink" href="#current-status-phase-1-phase-2-phase-3" title="Permanent link">&#x00B6;</a></h2>
+<h2 id="current-status-phase-16">Current status (Phase 1–6)<a class="headerlink" href="#current-status-phase-16" title="Permanent link">&#x00B6;</a></h2>
 <p><strong>Phase 1</strong> — collection path:</p>
 <ul>
 <li>Receive binlogs from upstream sources via the IO thread</li>
@@ -237,12 +241,39 @@ flowchart LR
 <li>Channel path sanitization (whitelist <code>[A-Za-z0-9_.-]</code>)</li>
 <li>Per-channel <code>BINLOG_SERVER_STORAGE_URI</code> override</li>
 </ul>
+<p><strong>Phase 4</strong> — observability + per-file metadata:</p>
+<ul>
+<li>Three Performance Schema tables: <code>replication_binlog_server_status</code>, <code>replication_binlog_server_storage</code>, <code>replication_binlog_server_archive</code></li>
+<li>Per-channel operational counters: events appended, bytes, duplicates dropped, write errors, timestamps, last error</li>
+<li>Per-channel storage summary: file count, total disk usage, active/idle status, GTID set covered</li>
+<li>Per-file metadata: size, event count, min/max timestamps, Previous_gtid and accumulated GTID sets</li>
+<li><code>.meta</code> sidecar files for fast metadata recovery (no full-archive rescan on startup)</li>
+<li><code>binlog_server_rebuild_archive_index()</code> UDF for backfilling missing metadata</li>
+</ul>
+<p><strong>Phase 5</strong> — binlog purge + architecture for rotation &amp; S3:</p>
+<ul>
+<li>Purge operations: by file, GTID set, or timestamp (UDFs)</li>
+<li>Atomic index-first commit order (tmp + fsync + rename before deletion)</li>
+<li>Pin-based safety: files actively served to a downstream replica cannot be purged</li>
+<li>S3 storage backend stub (<code>s3://</code> URIs recognized, all I/O returns "not implemented")</li>
+<li>Rewrite/rotation architecture stub (<code>rewrite_file_size</code>, <code>rewrite_base_name</code> sysvars)</li>
+<li>GTID renumberer stub for logical-clock adjustment in rewrite mode</li>
+</ul>
+<p><strong>Phase 6</strong> — at-rest encryption:</p>
+<ul>
+<li>Per-channel at-rest encryption using AES-256-CTR</li>
+<li>Two-tier key hierarchy: keyring-managed master key wraps a per-file random password</li>
+<li>Transparent decryption when serving to downstream replicas</li>
+<li><code>binlog_server.encryption</code> sysvar (ON/OFF) to enable/disable</li>
+<li><code>binlog_server_rotate_encryption_key(channel)</code> UDF for online master key rotation</li>
+<li>Keyring integration via <code>component_keyring_file</code> (any keyring component works)</li>
+<li><code>StorageWriteStream</code> / <code>StorageReadStream</code> abstractions for storage-agnostic I/O</li>
+<li>Encryption operates above the storage backend: same logic works for file:// and future S3</li>
+</ul>
 <p><strong>Not yet implemented</strong> (planned for later phases):
-- S3-compatible object storage backend
-- Performance Schema observability tables
-- Binlog purging
-- Local rotation / rewriting
-- Binlog metadata sidecars (per-file <code>.json</code> for faster GTID resolution)</p>
+- S3-compatible object storage backend (stubs in place)
+- Local rotation / rewriting (stubs in place)
+- Point-in-time search queries (<code>search_by_timestamp</code>, <code>search_by_gtid_set</code>)</p>
 <h2 id="license">License<a class="headerlink" href="#license" title="Permanent link">&#x00B6;</a></h2>
 <p>GPLv2, matching the rest of Percona Server.</p>
     <footer class="docfoot">

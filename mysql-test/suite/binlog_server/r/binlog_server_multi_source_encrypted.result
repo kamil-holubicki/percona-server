@@ -1,0 +1,285 @@
+include/rpl/init.inc [topology=1->2]
+
+# ============================================================
+# Setup: keyring on server_3 (collector)
+# ============================================================
+[connection server_3]
+# Creating local configuration file for keyring component: component_keyring_file
+# Creating manifest file for current MySQL server instance
+
+# ---- Restart server_3 with keyring
+include/rpl/restart_server.inc [server_number=3]
+[connection server_3]
+
+# ============================================================
+# Install component and plugin on server_3
+# ============================================================
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL PLUGIN binlog_server_relay SONAME 'BINLOG_SERVER_RELAY';
+
+# ---- Enable encryption
+SET GLOBAL binlog_server.encryption = ON;
+
+# ---- Create replication users
+CREATE USER 'repl_a'@'%' IDENTIFIED BY 'pass_a';
+GRANT REPLICATION SLAVE ON *.* TO 'repl_a'@'%';
+CREATE USER 'repl_b'@'%' IDENTIFIED BY 'pass_b';
+GRANT REPLICATION SLAVE ON *.* TO 'repl_b'@'%';
+
+# ---- Configure user-channel routing
+SET GLOBAL binlog_server.user_channel_map = 'repl_a=src_a,repl_b=src_b';
+
+# ---- Storage directory
+
+# ============================================================
+# Configure collection channels on server_3
+# ============================================================
+
+# ---- Channel src_a (from server_1)
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = SOURCE_A_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1,
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORE/'
+  FOR CHANNEL 'src_a';
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+
+# ---- Channel src_b (from server_2)
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = SOURCE_B_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1,
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORE/'
+  FOR CHANNEL 'src_b';
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+
+# ---- Start collection
+START REPLICA IO_THREAD FOR CHANNEL 'src_a';
+include/rpl/wait_for_receiver_to_start.inc [FOR CHANNEL 'src_a']
+START REPLICA IO_THREAD FOR CHANNEL 'src_b';
+include/rpl/wait_for_receiver_to_start.inc [FOR CHANNEL 'src_b']
+
+# ============================================================
+# Phase 1: Initial data on both sources
+# ============================================================
+[connection server_1]
+CREATE TABLE t_a (id INT PRIMARY KEY, val VARCHAR(64)) ENGINE=InnoDB;
+INSERT INTO t_a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3');
+[connection server_2]
+CREATE TABLE t_b (id INT PRIMARY KEY, val VARCHAR(64)) ENGINE=InnoDB;
+INSERT INTO t_b VALUES (1, 'b1'), (2, 'b2'), (3, 'b3');
+
+# ---- Wait for collection
+[connection server_3]
+
+# ============================================================
+# Phase 2: Source rotation + more data
+# ============================================================
+[connection server_1]
+FLUSH BINARY LOGS;
+INSERT INTO t_a VALUES (4, 'a4_after_rotate'), (5, 'a5_after_rotate');
+[connection server_2]
+FLUSH BINARY LOGS;
+INSERT INTO t_b VALUES (4, 'b4_after_rotate'), (5, 'b5_after_rotate');
+
+# ---- Wait for rotated data to be collected
+[connection server_3]
+
+# ============================================================
+# Phase 3: Master key rotation + more data
+# ============================================================
+[connection server_3]
+# ---- Rotate key for src_a
+SELECT binlog_server_rotate_encryption_key('src_a');
+binlog_server_rotate_encryption_key('src_a')
+BinlogServerKey_src_a_2
+# ---- Rotate key for src_b
+SELECT binlog_server_rotate_encryption_key('src_b');
+binlog_server_rotate_encryption_key('src_b')
+BinlogServerKey_src_b_2
+[connection server_1]
+INSERT INTO t_a VALUES (6, 'a6_after_key_rotate'), (7, 'a7_after_key_rotate');
+[connection server_2]
+INSERT INTO t_b VALUES (6, 'b6_after_key_rotate'), (7, 'b7_after_key_rotate');
+
+# ---- Another source rotation after key rotation
+[connection server_1]
+FLUSH BINARY LOGS;
+INSERT INTO t_a VALUES (8, 'a8_final');
+[connection server_2]
+FLUSH BINARY LOGS;
+INSERT INTO t_b VALUES (8, 'b8_final');
+
+# ---- Wait for all data to be collected
+[connection server_3]
+
+# ============================================================
+# Configure downstream replicas (server_4, server_5, server_6)
+# ============================================================
+
+# ---- server_4 (replica 1): connects as repl_a -> gets src_a
+[connection server_4]
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = COLLECTOR_PORT,
+SOURCE_USER = 'repl_a',
+SOURCE_PASSWORD = 'pass_a',
+SOURCE_AUTO_POSITION = 1;
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA;
+include/rpl/wait_for_replica_to_start.inc
+
+# ---- server_5 (replica 2): connects as repl_a -> gets src_a
+[connection server_5]
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = COLLECTOR_PORT,
+SOURCE_USER = 'repl_a',
+SOURCE_PASSWORD = 'pass_a',
+SOURCE_AUTO_POSITION = 1;
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA;
+include/rpl/wait_for_replica_to_start.inc
+
+# ---- server_6 (replica 3): connects as repl_b -> gets src_b
+[connection server_6]
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = COLLECTOR_PORT,
+SOURCE_USER = 'repl_b',
+SOURCE_PASSWORD = 'pass_b',
+SOURCE_AUTO_POSITION = 1;
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA;
+include/rpl/wait_for_replica_to_start.inc
+
+# ============================================================
+# Phase 4: Verify replicas received all data
+# ============================================================
+
+# ---- Wait for replicas to catch up
+[connection server_4]
+[connection server_5]
+[connection server_6]
+
+# ---- Verify server_4 (replica 1 - src_a data)
+[connection server_4]
+SELECT COUNT(*) AS row_count FROM t_a;
+row_count
+8
+SELECT id, val FROM t_a ORDER BY id;
+id	val
+1	a1
+2	a2
+3	a3
+4	a4_after_rotate
+5	a5_after_rotate
+6	a6_after_key_rotate
+7	a7_after_key_rotate
+8	a8_final
+
+# ---- Verify server_5 (replica 2 - src_a data, identical to replica 1)
+[connection server_5]
+SELECT COUNT(*) AS row_count FROM t_a;
+row_count
+8
+SELECT id, val FROM t_a ORDER BY id;
+id	val
+1	a1
+2	a2
+3	a3
+4	a4_after_rotate
+5	a5_after_rotate
+6	a6_after_key_rotate
+7	a7_after_key_rotate
+8	a8_final
+
+# ---- Verify server_6 (replica 3 - src_b data)
+[connection server_6]
+SELECT COUNT(*) AS row_count FROM t_b;
+row_count
+8
+SELECT id, val FROM t_b ORDER BY id;
+id	val
+1	b1
+2	b2
+3	b3
+4	b4_after_rotate
+5	b5_after_rotate
+6	b6_after_key_rotate
+7	b7_after_key_rotate
+8	b8_final
+
+# ---- Verify PFS shows both channels encrypted
+[connection server_3]
+SELECT CHANNEL_NAME, EVENTS_APPENDED > 0 AS has_events
+FROM performance_schema.replication_binlog_server_status
+WHERE CHANNEL_NAME IN ('src_a', 'src_b')
+ORDER BY CHANNEL_NAME;
+CHANNEL_NAME	has_events
+src_a	1
+src_b	1
+
+# ============================================================
+# Teardown
+# ============================================================
+# ---- Stop downstream replicas
+[connection server_4]
+STOP REPLICA;
+include/rpl/wait_for_replica_to_stop.inc
+RESET REPLICA ALL;
+[connection server_5]
+STOP REPLICA;
+include/rpl/wait_for_replica_to_stop.inc
+RESET REPLICA ALL;
+[connection server_6]
+STOP REPLICA;
+include/rpl/wait_for_replica_to_stop.inc
+RESET REPLICA ALL;
+# ---- Stop collection channels
+[connection server_3]
+STOP REPLICA IO_THREAD FOR CHANNEL 'src_a';
+include/rpl/wait_for_receiver_to_stop.inc [FOR CHANNEL 'src_a']
+STOP REPLICA IO_THREAD FOR CHANNEL 'src_b';
+include/rpl/wait_for_receiver_to_stop.inc [FOR CHANNEL 'src_b']
+RESET REPLICA ALL FOR CHANNEL 'src_a';
+RESET REPLICA ALL FOR CHANNEL 'src_b';
+SET GLOBAL binlog_server.user_channel_map = '';
+SET GLOBAL binlog_server.encryption = OFF;
+# ---- Kill dump threads
+DROP USER 'repl_a'@'%';
+DROP USER 'repl_b'@'%';
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+# ---- Drop tables on sources
+[connection server_1]
+DROP TABLE t_a;
+[connection server_2]
+DROP TABLE t_b;
+# ---- Drop tables on replicas (they have them from replication)
+[connection server_4]
+DROP TABLE IF EXISTS t_a;
+[connection server_5]
+DROP TABLE IF EXISTS t_a;
+[connection server_6]
+DROP TABLE IF EXISTS t_b;
+# ---- Cleanup keyring
+[connection server_3]
+# Removing manifest file for current MySQL server instance
+# Removing local keyring file for keyring component: component_keyring_file
+include/rpl/restart_server.inc [server_number=3]
+include/rpl/deinit.inc

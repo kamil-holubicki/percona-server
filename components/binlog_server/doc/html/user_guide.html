@@ -237,6 +237,15 @@ will not be stored until the component is loaded.</p>
 </code></pre></div>
 
 <p>File names mirror the source's binlog file names exactly.</p>
+<h3 id="storage-root-constraint">Storage root constraint<a class="headerlink" href="#storage-root-constraint" title="Permanent link">&#x00B6;</a></h3>
+<p>For production deployments, set <code>binlog_server.storage_root</code> to
+constrain all storage URIs to a specific directory tree:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SET</span><span class="w"> </span><span class="k">GLOBAL</span><span class="w"> </span><span class="n">binlog_server</span><span class="p">.</span><span class="n">storage_root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;/data/binlog-archive&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>Any <code>CHANGE REPLICATION SOURCE</code> with a <code>BINLOG_SERVER_STORAGE_URI</code>
+that resolves outside this directory will be rejected. This prevents
+accidental writes to system directories from misconfigured URIs.</p>
 <h2 id="multi-channel-collection">Multi-channel collection<a class="headerlink" href="#multi-channel-collection" title="Permanent link">&#x00B6;</a></h2>
 <p>Multiple channels can collect from different sources simultaneously:</p>
 <div class="codehilite"><pre><span></span><code><span class="n">CHANGE</span><span class="w"> </span><span class="n">REPLICATION</span><span class="w"> </span><span class="k">SOURCE</span><span class="w"> </span><span class="k">TO</span>
@@ -423,6 +432,321 @@ flowchart LR
 <p>Downstream replicas connecting as <code>repl_primary</code> get events from
 <code>prod_primary</code>; those connecting as <code>repl_secondary</code> get events from
 <code>prod_secondary</code>. Any other user falls back to the default.</p>
+<h2 id="observability-performance-schema-tables">Observability (Performance Schema tables)<a class="headerlink" href="#observability-performance-schema-tables" title="Permanent link">&#x00B6;</a></h2>
+<p>When the component is loaded, three read-only tables appear in
+<code>performance_schema</code>. They are populated automatically as channels
+operate; no additional configuration is needed.</p>
+<h3 id="replication_binlog_server_status">replication_binlog_server_status<a class="headerlink" href="#replication_binlog_server_status" title="Permanent link">&#x00B6;</a></h3>
+<p>Per-channel operational counters and error tracking.</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CHANNEL_NAME</code></td>
+<td>VARCHAR(64)</td>
+<td>Channel name</td>
+</tr>
+<tr>
+<td><code>STATE</code></td>
+<td>VARCHAR(32)</td>
+<td><code>RUNNING</code>, <code>STOPPED</code>, or <code>ERROR</code></td>
+</tr>
+<tr>
+<td><code>SOURCE_HOST</code></td>
+<td>VARCHAR(255)</td>
+<td>Upstream host</td>
+</tr>
+<tr>
+<td><code>SOURCE_PORT</code></td>
+<td>INT</td>
+<td>Upstream port</td>
+</tr>
+<tr>
+<td><code>SOURCE_UUID</code></td>
+<td>VARCHAR(36)</td>
+<td>Source server UUID</td>
+</tr>
+<tr>
+<td><code>CURRENT_FILE</code></td>
+<td>VARCHAR(512)</td>
+<td>Binlog file currently being written</td>
+</tr>
+<tr>
+<td><code>CURRENT_POSITION</code></td>
+<td>BIGINT</td>
+<td>Byte offset in the current file</td>
+</tr>
+<tr>
+<td><code>EVENTS_APPENDED</code></td>
+<td>BIGINT</td>
+<td>Total events written to the archive</td>
+</tr>
+<tr>
+<td><code>BYTES_APPENDED</code></td>
+<td>BIGINT</td>
+<td>Total bytes written</td>
+</tr>
+<tr>
+<td><code>DUPLICATES_DROPPED</code></td>
+<td>BIGINT</td>
+<td>Events skipped by watermark dedup</td>
+</tr>
+<tr>
+<td><code>WRITE_ERRORS</code></td>
+<td>BIGINT</td>
+<td>I/O errors encountered while writing</td>
+</tr>
+<tr>
+<td><code>RECONNECT_COUNT</code></td>
+<td>BIGINT</td>
+<td>Number of IO-thread reconnections</td>
+</tr>
+<tr>
+<td><code>LAST_ERROR_NUMBER</code></td>
+<td>INT</td>
+<td>Most recent error code (0 = none)</td>
+</tr>
+<tr>
+<td><code>LAST_ERROR_MESSAGE</code></td>
+<td>VARCHAR(1024)</td>
+<td>Most recent error description</td>
+</tr>
+<tr>
+<td><code>LAST_ERROR_TIMESTAMP</code></td>
+<td>TIMESTAMP(6)</td>
+<td>When the last error occurred</td>
+</tr>
+<tr>
+<td><code>LAST_EVENT_TIMESTAMP</code></td>
+<td>TIMESTAMP(6)</td>
+<td>Timestamp of the last appended event</td>
+</tr>
+<tr>
+<td><code>LAST_HEARTBEAT_TIMESTAMP</code></td>
+<td>TIMESTAMP(6)</td>
+<td>Last upstream heartbeat received</td>
+</tr>
+</tbody>
+</table>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">CHANNEL_NAME</span><span class="p">,</span><span class="w"> </span><span class="k">STATE</span><span class="p">,</span><span class="w"> </span><span class="n">EVENTS_APPENDED</span><span class="p">,</span><span class="w"> </span><span class="n">BYTES_APPENDED</span><span class="p">,</span>
+<span class="w">       </span><span class="n">WRITE_ERRORS</span><span class="p">,</span><span class="w"> </span><span class="n">LAST_ERROR_MESSAGE</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">performance_schema</span><span class="p">.</span><span class="n">replication_binlog_server_status</span><span class="p">;</span>
+</code></pre></div>
+
+<h3 id="replication_binlog_server_storage">replication_binlog_server_storage<a class="headerlink" href="#replication_binlog_server_storage" title="Permanent link">&#x00B6;</a></h3>
+<p>Per-channel storage backend summary.</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CHANNEL_NAME</code></td>
+<td>VARCHAR(64)</td>
+<td>Channel name</td>
+</tr>
+<tr>
+<td><code>STORAGE_TYPE</code></td>
+<td>VARCHAR(32)</td>
+<td>Backend type (<code>FILE</code>)</td>
+</tr>
+<tr>
+<td><code>STORAGE_URI</code></td>
+<td>VARCHAR(1024)</td>
+<td>Resolved <code>file://</code> URI</td>
+</tr>
+<tr>
+<td><code>STATUS</code></td>
+<td>VARCHAR(32)</td>
+<td><code>ACTIVE</code>, <code>IDLE</code>, or <code>FAILED</code></td>
+</tr>
+<tr>
+<td><code>FILE_COUNT</code></td>
+<td>BIGINT</td>
+<td>Number of archive files (from binlog.index)</td>
+</tr>
+<tr>
+<td><code>TOTAL_BYTES_ON_DISK</code></td>
+<td>BIGINT</td>
+<td>Aggregate size of all archive files</td>
+</tr>
+<tr>
+<td><code>OLDEST_FILE</code></td>
+<td>VARCHAR(512)</td>
+<td>First file in the index</td>
+</tr>
+<tr>
+<td><code>NEWEST_FILE</code></td>
+<td>VARCHAR(512)</td>
+<td>Last file in the index</td>
+</tr>
+<tr>
+<td><code>OLDEST_TIMESTAMP</code></td>
+<td>TIMESTAMP(6)</td>
+<td>Earliest event timestamp across all files</td>
+</tr>
+<tr>
+<td><code>NEWEST_TIMESTAMP</code></td>
+<td>TIMESTAMP(6)</td>
+<td>Latest event timestamp across all files</td>
+</tr>
+<tr>
+<td><code>GTID_SET_COVERED</code></td>
+<td>TEXT</td>
+<td>Union of all GTIDs stored in this channel</td>
+</tr>
+</tbody>
+</table>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">CHANNEL_NAME</span><span class="p">,</span><span class="w"> </span><span class="n">STORAGE_TYPE</span><span class="p">,</span><span class="w"> </span><span class="n">FILE_COUNT</span><span class="p">,</span>
+<span class="w">       </span><span class="n">TOTAL_BYTES_ON_DISK</span><span class="p">,</span><span class="w"> </span><span class="n">STATUS</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">performance_schema</span><span class="p">.</span><span class="n">replication_binlog_server_storage</span><span class="p">;</span>
+</code></pre></div>
+
+<h3 id="replication_binlog_server_archive">replication_binlog_server_archive<a class="headerlink" href="#replication_binlog_server_archive" title="Permanent link">&#x00B6;</a></h3>
+<p>Per-file metadata for each binlog file in the archive. Enables
+answering "which file contains events from time T?" or "which file
+has GTID X?" without scanning the archive.</p>
+<table>
+<thead>
+<tr>
+<th>Column</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CHANNEL_NAME</code></td>
+<td>VARCHAR(64)</td>
+<td>Channel name</td>
+</tr>
+<tr>
+<td><code>FILE_NAME</code></td>
+<td>VARCHAR(512)</td>
+<td>Binlog archive file name</td>
+</tr>
+<tr>
+<td><code>FILE_SIZE</code></td>
+<td>BIGINT</td>
+<td>Size in bytes</td>
+</tr>
+<tr>
+<td><code>EVENT_COUNT</code></td>
+<td>BIGINT</td>
+<td>Number of events in this file</td>
+</tr>
+<tr>
+<td><code>MIN_TIMESTAMP</code></td>
+<td>TIMESTAMP(6)</td>
+<td>Earliest event timestamp</td>
+</tr>
+<tr>
+<td><code>MAX_TIMESTAMP</code></td>
+<td>TIMESTAMP(6)</td>
+<td>Latest event timestamp</td>
+</tr>
+<tr>
+<td><code>PREVIOUS_GTID_SET</code></td>
+<td>TEXT</td>
+<td>GTIDs already committed before this file</td>
+</tr>
+<tr>
+<td><code>LAST_GTID_SET</code></td>
+<td>TEXT</td>
+<td>GTIDs contained within this file</td>
+</tr>
+<tr>
+<td><code>IS_ACTIVE</code></td>
+<td>VARCHAR(3)</td>
+<td><code>YES</code> if this is the file currently being written</td>
+</tr>
+</tbody>
+</table>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">CHANNEL_NAME</span><span class="p">,</span><span class="w"> </span><span class="n">FILE_NAME</span><span class="p">,</span><span class="w"> </span><span class="n">FILE_SIZE</span><span class="p">,</span><span class="w"> </span><span class="n">EVENT_COUNT</span><span class="p">,</span>
+<span class="w">       </span><span class="n">MIN_TIMESTAMP</span><span class="p">,</span><span class="w"> </span><span class="n">MAX_TIMESTAMP</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">performance_schema</span><span class="p">.</span><span class="n">replication_binlog_server_archive</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">CHANNEL_NAME</span><span class="p">,</span><span class="w"> </span><span class="n">FILE_NAME</span><span class="p">;</span>
+</code></pre></div>
+
+<h3 id="per-file-meta-sidecars">Per-file .meta sidecars<a class="headerlink" href="#per-file-meta-sidecars" title="Permanent link">&#x00B6;</a></h3>
+<p>The component persists per-file metadata as <code>.meta</code> sidecar files
+alongside each binlog archive file:</p>
+<div class="codehilite"><pre><span></span><code>/data/archive/src_a/
+├── binlog.index
+├── binlog.000001
+├── binlog.000001.meta    ← timestamp + GTID metadata
+├── binlog.000002
+├── binlog.000002.meta
+└── ...
+</code></pre></div>
+
+<p>These files are written automatically when a binlog file is rotated
+or the channel is stopped. They are loaded on recovery so that
+<code>replication_binlog_server_archive</code> is populated without rescanning
+the full archive.</p>
+<p>If <code>.meta</code> files are missing (e.g., after manual file manipulation),
+use the <code>binlog_server_rebuild_archive_index()</code> UDF to regenerate
+them.</p>
+<h2 id="at-rest-encryption">At-rest encryption<a class="headerlink" href="#at-rest-encryption" title="Permanent link">&#x00B6;</a></h2>
+<p>The binlog server supports transparent at-rest encryption for archived
+binlog files. When enabled, all new archive files are encrypted using
+AES-256-CTR with a per-file random password, wrapped by a master key
+stored in the MySQL keyring.</p>
+<h3 id="enabling-encryption">Enabling encryption<a class="headerlink" href="#enabling-encryption" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1">-- 1) Ensure a keyring component is loaded (e.g., component_keyring_file).</span>
+<span class="c1">--    The keyring must be configured before the server starts (manifest file).</span>
+
+<span class="c1">-- 2) Enable encryption on the binlog server.</span>
+<span class="k">SET</span><span class="w"> </span><span class="k">GLOBAL</span><span class="w"> </span><span class="n">binlog_server</span><span class="p">.</span><span class="n">encryption</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">ON</span><span class="p">;</span>
+</code></pre></div>
+
+<p>All subsequently opened archive files will be encrypted. Existing
+plaintext files remain readable; the <code>ArchiveSender</code> auto-detects
+the format when serving to downstream replicas.</p>
+<h3 id="master-key-rotation">Master key rotation<a class="headerlink" href="#master-key-rotation" title="Permanent link">&#x00B6;</a></h3>
+<p>Rotate the master encryption key for a channel without stopping
+collection or disconnecting downstream replicas:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">binlog_server_rotate_encryption_key</span><span class="p">(</span><span class="s1">&#39;src_a&#39;</span><span class="p">);</span>
+<span class="c1">-- Returns the new key name, e.g. &#39;BinlogServerKey_src_a_2&#39;</span>
+</code></pre></div>
+
+<p>This generates a new master key in the keyring and re-wraps the
+active file's password under the new key (header rewrite). Previously
+rotated files retain their original key references; the keyring must
+retain old keys for those files to remain readable.</p>
+<h3 id="keyring-setup-example">Keyring setup example<a class="headerlink" href="#keyring-setup-example" title="Permanent link">&#x00B6;</a></h3>
+<p>Using <code>component_keyring_file</code>:</p>
+<ol>
+<li>
+<p>Create a keyring configuration JSON file (e.g.,
+   <code>/var/lib/mysql-keyring/keyring.json</code>):
+   <code>json
+   { "path": "/var/lib/mysql-keyring/keyring_data", "read_only": false }</code></p>
+</li>
+<li>
+<p>Create a manifest file at <code>&lt;mysqld_binary_dir&gt;/mysqld.my</code>:
+   <code>json
+   { "components": "file://component_keyring_file" }</code></p>
+</li>
+<li>
+<p>Restart <code>mysqld</code>. The keyring is now available for encryption
+   operations.</p>
+</li>
+</ol>
+<h3 id="decryption-during-serving">Decryption during serving<a class="headerlink" href="#decryption-during-serving" title="Permanent link">&#x00B6;</a></h3>
+<p>Downstream replicas receive plaintext events — decryption happens
+transparently inside the <code>ArchiveSender</code>. The replica does not need
+a keyring or any special configuration.</p>
 <h2 id="system-variables">System variables<a class="headerlink" href="#system-variables" title="Permanent link">&#x00B6;</a></h2>
 <table>
 <thead>
@@ -456,6 +780,41 @@ flowchart LR
 <td><code>''</code></td>
 <td>User-to-channel routing. Two shapes: inline CSV (<code>user1=channel1,user2=channel2,...</code>) or table URI (<code>table://&lt;db&gt;.&lt;tbl&gt;</code>). See <a href="#per-user-channel-routing">Per-user channel routing</a>.</td>
 </tr>
+<tr>
+<td><code>binlog_server.storage_root</code></td>
+<td>GLOBAL</td>
+<td>String</td>
+<td><code>''</code></td>
+<td>When non-empty, all <code>file://</code> storage URIs must resolve under this directory. Prevents path-traversal misconfiguration.</td>
+</tr>
+<tr>
+<td><code>binlog_server.encryption</code></td>
+<td>GLOBAL</td>
+<td>Boolean</td>
+<td><code>OFF</code></td>
+<td>When ON, new archive files are encrypted with AES-256-CTR. Requires a keyring component to be loaded. Existing plaintext files remain readable.</td>
+</tr>
+<tr>
+<td><code>binlog_server.trace_send_path</code></td>
+<td>GLOBAL</td>
+<td>Boolean</td>
+<td><code>OFF</code></td>
+<td>When enabled, the <code>ArchiveSender</code> logs detailed trace messages for each dump session (file opens, GTID skips, heartbeats). Useful for debugging per-user routing issues.</td>
+</tr>
+<tr>
+<td><code>binlog_server.rewrite_file_size</code></td>
+<td>GLOBAL</td>
+<td>ULONGLONG</td>
+<td><code>0</code></td>
+<td>Target archive file size for local rewrite rotation (bytes). <strong>Not yet implemented</strong> -- setting a non-zero value logs a warning and has no effect.</td>
+</tr>
+<tr>
+<td><code>binlog_server.rewrite_base_name</code></td>
+<td>GLOBAL</td>
+<td>String</td>
+<td><code>''</code></td>
+<td>Base filename pattern for rewritten archives. <strong>Not yet implemented</strong> -- setting a value logs a warning and has no effect.</td>
+</tr>
 </tbody>
 </table>
 <h2 id="udfs">UDFs<a class="headerlink" href="#udfs" title="Permanent link">&#x00B6;</a></h2>
@@ -473,8 +832,74 @@ flowchart LR
 <td>INT (mapping count) or NULL on failure</td>
 <td>Re-reads the current <code>user_channel_map</code> spec and rebuilds the live routing map. Required after setting a <code>table://</code> URI; also useful to pick up table row changes without re-setting the sysvar.</td>
 </tr>
+<tr>
+<td><code>binlog_server_rotate_encryption_key(channel)</code></td>
+<td>VARCHAR (new key name) or NULL on error</td>
+<td>Generates a new master key in the keyring for the given channel and re-wraps the active file's password under the new key. The channel continues collecting without interruption.</td>
+</tr>
+<tr>
+<td><code>binlog_server_rebuild_archive_index(channel)</code></td>
+<td>INT (files processed) or -1 on error</td>
+<td>Scans every binlog file in the named channel's archive, extracts timestamps and GTID sets, and writes/updates <code>.meta</code> sidecar files. Use after manual file moves or if <code>.meta</code> files are missing. Pass the channel name as the single argument.</td>
+</tr>
+<tr>
+<td><code>binlog_server_purge_channel(channel, up_to_file)</code></td>
+<td>INT (files purged) or NULL on error</td>
+<td>Removes archive files from the oldest up to and including the named file. The active (tail) file can never be purged.</td>
+</tr>
+<tr>
+<td><code>binlog_server_purge_before_gtid(channel, gtid_set)</code></td>
+<td>INT (files purged) or NULL on error</td>
+<td>Removes archive files whose accumulated GTID set is fully contained in the given set. Files are processed from oldest to newest; stops at the first file not fully contained.</td>
+</tr>
+<tr>
+<td><code>binlog_server_purge_before_timestamp(channel, unix_ts)</code></td>
+<td>INT (files purged) or NULL on error</td>
+<td>Removes archive files whose <code>max_event_timestamp</code> is below the given Unix timestamp (seconds).</td>
+</tr>
 </tbody>
 </table>
+<h3 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1">-- Reload user routing after editing the table.</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">binlog_server_reload_user_channel_map</span><span class="p">();</span>
+
+<span class="c1">-- Rebuild metadata sidecars for a channel.</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">binlog_server_rebuild_archive_index</span><span class="p">(</span><span class="s1">&#39;prod_primary&#39;</span><span class="p">);</span>
+
+<span class="c1">-- Purge archive files up to a specific file.</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">binlog_server_purge_channel</span><span class="p">(</span><span class="s1">&#39;prod_primary&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;binlog.000005&#39;</span><span class="p">);</span>
+
+<span class="c1">-- Purge files older than a specific time (1 day ago).</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">binlog_server_purge_before_timestamp</span><span class="p">(</span><span class="s1">&#39;prod_primary&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">UNIX_TIMESTAMP</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">86400</span><span class="p">);</span>
+
+<span class="c1">-- Purge files whose GTIDs are fully contained in the replica&#39;s executed set.</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">binlog_server_purge_before_gtid</span><span class="p">(</span><span class="s1">&#39;prod_primary&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="s1">&#39;aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-100&#39;</span><span class="p">);</span>
+</code></pre></div>
+
+<h3 id="purge-safety-rules">Purge safety rules<a class="headerlink" href="#purge-safety-rules" title="Permanent link">&#x00B6;</a></h3>
+<ul>
+<li>The <strong>tail file</strong> (last entry in the index) can never be purged,
+  regardless of whether the IO thread is running. At least one file
+  must always remain. Attempts return NULL.</li>
+<li>Purge is <strong>channel-scoped</strong>: it never touches other channels' data.</li>
+<li><strong>Index-first commit order</strong>: the <code>binlog.index</code> is atomically
+  rewritten (via tmp + fsync + rename) <em>before</em> any files are deleted.
+  A crash after commit leaves orphan files (safe) rather than a
+  corrupt index.</li>
+<li>If the atomic index rewrite fails, the purge is <strong>aborted</strong> and
+  in-memory state is rolled back. No files are deleted.</li>
+<li>Files being <strong>actively served</strong> to a downstream replica cannot be
+  purged. The purge UDF returns NULL if any victim file is pinned by
+  a dump session.</li>
+<li><strong>Input validation</strong>: the target file must look like a valid binlog
+  filename (<code>base.NNNNNN</code>) and share the same base name as existing
+  archive files. Invalid names return NULL.</li>
+<li>Corresponding <code>.meta</code> sidecar files are removed alongside binlog
+  files (best-effort; cleanup failures are logged as warnings).</li>
+<li>If file deletion fails after the index commit, a warning is logged
+  but the purge is considered successful (the index is authoritative).</li>
+</ul>
 <h2 id="stopping-and-restarting">Stopping and restarting<a class="headerlink" href="#stopping-and-restarting" title="Permanent link">&#x00B6;</a></h2>
 <div class="codehilite"><pre><span></span><code><span class="c1">-- Stop collection for a specific channel.</span>
 <span class="n">STOP</span><span class="w"> </span><span class="n">REPLICA</span><span class="w"> </span><span class="n">IO_THREAD</span><span class="w"> </span><span class="k">FOR</span><span class="w"> </span><span class="n">CHANNEL</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
@@ -492,17 +917,36 @@ recovered on the next <code>configure_channel</code> call (triggered by
 <code>CHANGE REPLICATION SOURCE</code> or server restart with persisted channels):</p>
 <ol>
 <li>The index file (<code>binlog.index</code>) is read to discover existing files.</li>
-<li>The last file is opened and walked event-by-event to find the last
-   fully-written event.</li>
-<li>Any partial tail (incomplete event) is truncated.</li>
+<li>The last file is opened and walked event-by-event.</li>
+<li>The file is truncated to the last <strong>transaction boundary</strong> (Xid or
+   XA_prepare event), not just the last complete event. This discards
+   any partial in-flight transaction that was interrupted by the crash.</li>
 <li>The watermark (<code>last_source_log_pos</code>) is restored from the last
-   complete event's <code>log_pos</code>.</li>
+   transaction-safe offset.</li>
 <li>The FDE flag and checksum flag are re-derived from the file header.</li>
+<li><code>.meta</code> sidecar files are loaded for all indexed files, restoring
+   per-file GTID sets and timestamps without rescanning the archive.</li>
 </ol>
-<p>This guarantees that collection can resume seamlessly after any crash.</p>
+<p>This guarantees that collection can resume seamlessly after any crash
+without orphaned partial transactions in the archive.</p>
 <h2 id="day-2-operations">Day-2 operations<a class="headerlink" href="#day-2-operations" title="Permanent link">&#x00B6;</a></h2>
 <h3 id="checking-channel-status">Checking channel status<a class="headerlink" href="#checking-channel-status" title="Permanent link">&#x00B6;</a></h3>
-<div class="codehilite"><pre><span></span><code><span class="c1">-- Standard replication status.</span>
+<div class="codehilite"><pre><span></span><code><span class="c1">-- Binlog server operational counters.</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">performance_schema</span><span class="p">.</span><span class="n">replication_binlog_server_status</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">CHANNEL_NAME</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="err">\</span><span class="k">G</span>
+
+<span class="c1">-- Storage summary (file count, total size).</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">performance_schema</span><span class="p">.</span><span class="n">replication_binlog_server_storage</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">CHANNEL_NAME</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="err">\</span><span class="k">G</span>
+
+<span class="c1">-- Per-file archive listing with timestamps and GTIDs.</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">FILE_NAME</span><span class="p">,</span><span class="w"> </span><span class="n">FILE_SIZE</span><span class="p">,</span><span class="w"> </span><span class="n">MIN_TIMESTAMP</span><span class="p">,</span><span class="w"> </span><span class="n">MAX_TIMESTAMP</span><span class="p">,</span>
+<span class="w">       </span><span class="n">PREVIOUS_GTID_SET</span><span class="p">,</span><span class="w"> </span><span class="n">LAST_GTID_SET</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">performance_schema</span><span class="p">.</span><span class="n">replication_binlog_server_archive</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">CHANNEL_NAME</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">FILE_NAME</span><span class="p">;</span>
+
+<span class="c1">-- Standard replication status.</span>
 <span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">performance_schema</span><span class="p">.</span><span class="n">replication_connection_status</span>
 <span class="k">WHERE</span><span class="w"> </span><span class="n">CHANNEL_NAME</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;src_a&#39;</span><span class="p">;</span>
 
@@ -556,6 +1000,34 @@ sequenceDiagram
     Component-->>Server: unpublishes binlog_server_storage service
 </div>
 </div>
+<h2 id="planned-features-not-yet-implemented">Planned features (not yet implemented)<a class="headerlink" href="#planned-features-not-yet-implemented" title="Permanent link">&#x00B6;</a></h2>
+<p>The following features are architecturally prepared with stub code and
+system variables, but their runtime logic is not yet active:</p>
+<h3 id="s3-storage-backend">S3 storage backend<a class="headerlink" href="#s3-storage-backend" title="Permanent link">&#x00B6;</a></h3>
+<p>The <code>s3://</code> URI scheme is recognized by the storage backend factory.
+Configuring a channel with <code>BINLOG_SERVER_STORAGE_URI = 's3://...'</code>
+will currently fail with a clear error:</p>
+<blockquote>
+<p>S3 storage backend is not yet implemented. Use file:// storage URIs for now.</p>
+</blockquote>
+<p>The <code>S3Storage</code> class implements the full <code>StorageBackend</code> interface so
+that future implementation can be dropped in without interface changes.</p>
+<h3 id="archive-rewrite-mode">Archive rewrite mode<a class="headerlink" href="#archive-rewrite-mode" title="Permanent link">&#x00B6;</a></h3>
+<p>System variables <code>binlog_server.rewrite_file_size</code> and
+<code>binlog_server.rewrite_base_name</code> exist and can be set, but non-default
+values produce a warning and are ignored:</p>
+<blockquote>
+<p>archive rewrite is not yet implemented; rewrite_file_size=N will be
+ignored until a future release</p>
+</blockquote>
+<p>When implemented, rewrite mode will:
+- Rotate archive files at a configurable size boundary
+- Rename archive files using a custom base name pattern
+- Synthesize <code>PREVIOUS_GTIDS_LOG</code> events at each local file boundary
+  from the accumulated GTID set (GTID identifiers are never modified)
+- Fix <code>sequence_number</code> / <code>last_committed</code> logical clock fields when
+  coalescing multiple source segments into a single local file
+- Respect transaction boundaries (never split mid-transaction)</p>
 <h2 id="troubleshooting">Troubleshooting<a class="headerlink" href="#troubleshooting" title="Permanent link">&#x00B6;</a></h2>
 <table>
 <thead>
@@ -610,6 +1082,21 @@ sequenceDiagram
 <td>Downstream shows <code>Got fatal error 1236</code></td>
 <td>Archive files may have been manually deleted or purged</td>
 <td>Rebuild the replica or ensure the archive contains the required GTID range</td>
+</tr>
+<tr>
+<td><code>append_event failed</code> warning in error log</td>
+<td>Transient disk full or I/O error during archive write</td>
+<td>The IO thread continues (does not abort); the warning is rate-limited. Fix the underlying storage issue; collection resumes automatically on the next event.</td>
+</tr>
+<tr>
+<td><code>storage_root</code> rejection on CHANGE REPLICATION SOURCE</td>
+<td>The configured URI resolves outside <code>binlog_server.storage_root</code></td>
+<td>Either adjust the URI to point under the storage root, or clear the root: <code>SET GLOBAL binlog_server.storage_root = ''</code></td>
+</tr>
+<tr>
+<td><code>purge refused: file is being served</code></td>
+<td>A downstream replica is actively reading the file you tried to purge</td>
+<td>Wait for the replica to advance past that file, or disconnect it first</td>
 </tr>
 </tbody>
 </table>

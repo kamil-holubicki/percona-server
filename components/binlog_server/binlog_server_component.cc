@@ -25,6 +25,7 @@
 
 #include "archive_sender.h"
 #include "binlog_archive.h"
+#include "encryption.h"
 #include "log_helpers.h"
 #include "pfs_archive_table.h"
 #include "pfs_status_table.h"
@@ -80,6 +81,7 @@ static unsigned long long sysvar_rewrite_file_size = 0;
 static char *sysvar_rewrite_base_name = nullptr;
 static char *sysvar_storage_root = nullptr;
 static bool sysvar_trace_send_path = false;
+static bool sysvar_encryption = false;
 
 static void default_storage_uri_update(MYSQL_THD, SYS_VAR *, void *var_ptr,
                                        const void *save) {
@@ -198,6 +200,22 @@ static void trace_send_path_update(MYSQL_THD, SYS_VAR *, void *var_ptr,
   const bool new_val = *static_cast<const bool *>(save);
   *static_cast<bool *>(var_ptr) = new_val;
   binlog_server::ArchiveSender::instance().set_trace_send_path(new_val);
+}
+
+static void encryption_update(MYSQL_THD, SYS_VAR *, void *var_ptr,
+                              const void *save) {
+  const bool new_val = *static_cast<const bool *>(save);
+  *static_cast<bool *>(var_ptr) = new_val;
+  if (g_archive) {
+    g_archive->set_encryption_enabled(new_val);
+    if (new_val && !binlog_server::encryption_keyring_available()) {
+      binlog_server::bslog(
+          WARNING_LEVEL,
+          "binlog_server: encryption enabled but keyring service is "
+          "not available; newly created archive files will fail to encrypt "
+          "until keyring is loaded");
+    }
+  }
 }
 
 // =====================================================
@@ -417,6 +435,76 @@ static long long binlog_server_purge_ts_func(UDF_INIT *, UDF_ARGS *args,
 
 static void binlog_server_purge_ts_deinit(UDF_INIT *) {}
 
+// =====================================================
+// UDF: binlog_server_rotate_encryption_key(channel)
+// =====================================================
+
+static bool binlog_server_rotate_key_init(UDF_INIT *initid, UDF_ARGS *args,
+                                          char *message) {
+  if (args->arg_count != 1 || args->arg_type[0] != STRING_RESULT) {
+    std::snprintf(message, MYSQL_ERRMSG_SIZE,
+                  "binlog_server_rotate_encryption_key(channel_name) "
+                  "requires one string argument");
+    return true;
+  }
+  initid->maybe_null = true;
+  initid->max_length = 256;
+  return false;
+}
+
+static char *binlog_server_rotate_key_func(UDF_INIT *, UDF_ARGS *args,
+                                           char *result,
+                                           unsigned long *length,
+                                           unsigned char *is_null,
+                                           unsigned char *error) {
+  if (!g_archive || args->args[0] == nullptr) {
+    *is_null = 1;
+    *error = 0;
+    return nullptr;
+  }
+
+  const char *channel = args->args[0];
+  // Normalize: "_default" maps to "" internally (MySQL's default channel name)
+  std::string internal_channel =
+      (std::strcmp(channel, "_default") == 0) ? std::string{} : channel;
+
+  std::string file_name = g_archive->active_file_name(channel);
+  if (file_name.empty()) {
+    binlog_server::bslog(
+        WARNING_LEVEL,
+        "binlog_server: rotate_encryption_key('%s') failed: "
+        "no active file for channel",
+        channel);
+    *is_null = 1;
+    *error = 0;
+    return nullptr;
+  }
+
+  auto *backend = g_archive->resolve_channel_backend(channel);
+  std::string base_dir = g_archive->resolve_channel_base_dir(channel);
+  std::string new_key_id = binlog_server::rotate_master_key(
+      internal_channel, backend, base_dir, file_name);
+  if (new_key_id.empty()) {
+    binlog_server::bslog(
+        WARNING_LEVEL,
+        "binlog_server: rotate_encryption_key('%s') failed: "
+        "key rotation error (keyring unavailable or file not encrypted)",
+        channel);
+    *is_null = 1;
+    *error = 0;
+    return nullptr;
+  }
+
+  *is_null = 0;
+  *error = 0;
+  *length = static_cast<unsigned long>(new_key_id.size());
+  if (*length > 255) *length = 255;
+  std::memcpy(result, new_key_id.c_str(), *length);
+  return result;
+}
+
+static void binlog_server_rotate_key_deinit(UDF_INIT *) {}
+
 }  // extern "C"
 
 static bool archive_sender_dispatch(void *user_data, MYSQL_THD thd,
@@ -487,6 +575,8 @@ static mysql_service_status_t component_init() {
 
   g_archive = new (std::nothrow) binlog_server::BinlogArchive();
   if (!g_archive) return 1;
+
+  binlog_server::encryption_keyring_init();
 
   // Register system variable: binlog_server.default_storage_uri
   STR_CHECK_ARG(str) str_arg;
@@ -632,6 +722,23 @@ static mysql_service_status_t component_init() {
     }
   }
 
+  // Register system variable: binlog_server.encryption
+  {
+    BOOL_CHECK_ARG(bool) enc_arg;
+    enc_arg.def_val = false;
+    if (mysql_service_component_sys_variable_register->register_variable(
+            "binlog_server", "encryption",
+            PLUGIN_VAR_BOOL | PLUGIN_VAR_RQCMDARG,
+            "Enable at-rest encryption for newly created archive files. "
+            "Requires a keyring component to be loaded. Default OFF.",
+            nullptr, encryption_update, (void *)&enc_arg,
+            (void *)&sysvar_encryption)) {
+      binlog_server::bslog(WARNING_LEVEL,
+                           "binlog_server: failed to register "
+                           "encryption system variable");
+    }
+  }
+
   // Wire up ArchiveSender with storage and persisted default_serve_channel
   binlog_server::ArchiveSender::instance().set_storage(g_archive);
   binlog_server::ArchiveSender::instance().set_default_channel(
@@ -717,6 +824,17 @@ static mysql_service_status_t component_init() {
     binlog_server::bslog(WARNING_LEVEL,
                          "binlog_server: failed to register "
                          "binlog_server_purge_before_timestamp() UDF");
+  }
+
+  // Register encryption key rotation UDF
+  if (udf_registration_srv->udf_register(
+          "binlog_server_rotate_encryption_key", STRING_RESULT,
+          reinterpret_cast<Udf_func_any>(binlog_server_rotate_key_func),
+          binlog_server_rotate_key_init,
+          binlog_server_rotate_key_deinit)) {
+    binlog_server::bslog(WARNING_LEVEL,
+                         "binlog_server: failed to register "
+                         "binlog_server_rotate_encryption_key() UDF");
   }
 
   // Apply initial user_channel_map spec (CSV applies; table:// may fail
@@ -811,12 +929,23 @@ static mysql_service_status_t component_deinit() {
       if (was_present == 0) break;
     }
   }
+  {
+    int was_present = 0;
+    for (int i = 0; i < 10; ++i) {
+      if (!udf_registration_srv->udf_unregister(
+              "binlog_server_rotate_encryption_key", &was_present))
+        break;
+      if (was_present == 0) break;
+    }
+  }
 
   // Unregister PFS tables (reverse order)
   binlog_server::unregister_pfs_archive_table();
   binlog_server::unregister_pfs_storage_table();
   binlog_server::unregister_pfs_status_table();
 
+  mysql_service_component_sys_variable_unregister->unregister_variable(
+      "binlog_server", "encryption");
   mysql_service_component_sys_variable_unregister->unregister_variable(
       "binlog_server", "trace_send_path");
   mysql_service_component_sys_variable_unregister->unregister_variable(
@@ -831,6 +960,8 @@ static mysql_service_status_t component_deinit() {
       "binlog_server", "default_serve_channel");
   mysql_service_component_sys_variable_unregister->unregister_variable(
       "binlog_server", "default_storage_uri");
+
+  binlog_server::encryption_keyring_deinit();
 
   delete g_archive;
   g_archive = nullptr;

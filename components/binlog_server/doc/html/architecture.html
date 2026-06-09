@@ -243,8 +243,11 @@ not know about files, directories, or binlog event formats.</p>
 │   ├── archive_sender.h / .cc       # ArchiveSender + ArchiveDumpSession (serving)
 │   ├── gtid_set.h / .cc             # component-local GTID set implementation
 │   ├── server_services.h            # thin aliases for acquired server services
-│   ├── storage_backend.h            # StorageBackend abstract interface
-│   ├── file_storage.h / .cc         # FileStorage (file:// implementation)
+│   ├── storage_backend.h            # StorageBackend + StorageWriteStream + StorageReadStream
+│   ├── file_storage.h / .cc         # FileStorage (file:// full implementation)
+│   ├── s3_storage.h / .cc           # S3Storage (stub -- not yet implemented)
+│   ├── encryption.h / .cc           # AesCtrCipher, EncryptionHeader, keyring helpers, key rotation
+│   ├── gtid_renumberer.h / .cc      # GTID renumbering stub for rewrite mode
 │   ├── log_helpers.h / .cc          # bslog / bslog_code logging wrappers
 │   └── doc/                          # this documentation
 │
@@ -270,7 +273,12 @@ not know about files, directories, or binlog event formats.</p>
     │   ├── binlog_server_multi_replica.test   # Phase 2: multi-downstream
     │   ├── binlog_server_multi_replica.cnf
     │   ├── binlog_server_xa_rotation.test     # Phase 2: XA + rotation + STOP suppression
-    │   └── binlog_server_xa_rotation.cnf
+    │   ├── binlog_server_xa_rotation.cnf
+    │   ├── binlog_server_encryption.test        # Phase 6: encryption + key rotation
+    │   ├── binlog_server_user_routing.test      # Phase 3: per-user channel routing
+    │   ├── binlog_server_user_routing.cnf
+    │   ├── binlog_server_multi_source_encrypted.test  # Phase 6: multi-source + encryption + key rotation
+    │   └── binlog_server_multi_source_encrypted.cnf
     └── r/
         ├── basic_collect.result
         ├── multi_channel.result
@@ -278,7 +286,10 @@ not know about files, directories, or binlog event formats.</p>
         ├── syntax.result
         ├── binlog_server_chained.result
         ├── binlog_server_multi_replica.result
-        └── binlog_server_xa_rotation.result
+        ├── binlog_server_xa_rotation.result
+        ├── binlog_server_encryption.result
+        ├── binlog_server_user_routing.result
+        └── binlog_server_multi_source_encrypted.result
 </code></pre></div>
 
 <h3 id="hook-lifetimes">Hook lifetimes<a class="headerlink" href="#hook-lifetimes" title="Permanent link">&#x00B6;</a></h3>
@@ -538,7 +549,27 @@ and <code>mysql_binlog_dump_handler_io.h</code>:</p>
 <tr>
 <td><code>udf_registration</code></td>
 <td>Component init/deinit</td>
-<td>Register/unregister <code>binlog_server_reload_user_channel_map()</code></td>
+<td>Register/unregister UDFs (<code>binlog_server_reload_user_channel_map</code>, <code>binlog_server_rotate_encryption_key</code>, purge UDFs)</td>
+</tr>
+<tr>
+<td><code>keyring_aes</code></td>
+<td><code>encryption.cc</code></td>
+<td>Encrypt/decrypt the per-file password with the master key</td>
+</tr>
+<tr>
+<td><code>keyring_generator</code></td>
+<td><code>encryption.cc</code></td>
+<td>Generate new master keys in the keyring</td>
+</tr>
+<tr>
+<td><code>keyring_reader_with_status</code></td>
+<td><code>encryption.cc</code></td>
+<td>Read master key material from the keyring</td>
+</tr>
+<tr>
+<td><code>keyring_writer</code></td>
+<td><code>encryption.cc</code></td>
+<td>Store/remove master keys during rotation</td>
 </tr>
 </tbody>
 </table>
@@ -546,32 +577,64 @@ and <code>mysql_binlog_dump_handler_io.h</code>:</p>
 <div class="diagram">
 <div class="mermaid">
 classDiagram
+    class StorageWriteStream {
+        <<abstract>>
+        +write(data, len) bool
+        +flush() bool
+        +sync() bool
+        +close() void
+        +good() bool
+    }
+    class StorageReadStream {
+        <<abstract>>
+        +read_at(offset, buf, len) bool
+        +size() uint64
+        +close() void
+    }
     class StorageBackend {
         <<abstract>>
-        +open_or_create(path) int
-        +close() int
-        +sync() int
+        +type_tag() const char*
+        +uri_allowed(uri, reason) bool
+        +resolve_channel_dir(base_uri, channel) string
+        +ensure_channel_dir(dir) bool
+        +wipe_channel_dir(dir) bool
+        +file_exists(dir, name) bool
+        +file_size(dir, name) uint64
+        +remove_file(dir, name) bool
+        +total_bytes(dir) uint64
+        +index_load(dir, out) bool
+        +index_append(dir, entry) bool
+        +index_rewrite(dir, entries) bool
+        +sidecar_load(dir, name, out) bool
+        +sidecar_store(dir, name, data) bool
+        +open_write(dir, name) unique_ptr~StorageWriteStream~
+        +open_read(dir, name) unique_ptr~StorageReadStream~
+        +rewrite_header(dir, name, data, len) bool
+        +truncate_file(dir, name, new_size) bool
     }
     class FileStorage {
-        +open_or_create(path) int
-        +close() int
-        +sync() int
+        +type_tag() "file"
     }
     class S3Storage {
-        <<future>>
-        +open_or_create(path) int
-        +close() int
-        +sync() int
+        <<stub -- not yet implemented>>
+        +type_tag() "s3"
     }
 
     StorageBackend <|-- FileStorage
     StorageBackend <|-- S3Storage
+    StorageBackend ..> StorageWriteStream : creates
+    StorageBackend ..> StorageReadStream : creates
 </div>
 </div>
-<p>Phase 1 implements <code>FileStorage</code> only. The <code>S3Storage</code> backend is a
-placeholder for future phases. The <code>BinlogArchive</code> dispatches every
-I/O operation through the <code>StorageBackend</code> interface, so adding new
-backends requires no changes to the binlog protocol logic.</p>
+<p><code>FileStorage</code> implements the full interface using <code>std::filesystem</code>,
+<code>std::ofstream</code> (<code>FileWriteStream</code>), and <code>std::ifstream</code>
+(<code>FileReadStream</code>). <code>S3Storage</code> is a stub: it recognizes <code>s3://</code> URIs
+but all I/O methods return failure with a logged message.</p>
+<p>All file I/O — collection writes, crash recovery reads, dump session
+reads, header rewrites for key rotation — routes through the
+<code>StorageBackend</code> stream abstractions. This means encryption operates
+<em>above</em> the storage layer: the same encryption logic works identically
+whether the backend is local filesystem or (future) S3.</p>
 <h2 id="module-map">Module map<a class="headerlink" href="#module-map" title="Permanent link">&#x00B6;</a></h2>
 <table>
 <thead>
@@ -584,18 +647,38 @@ backends requires no changes to the binlog protocol logic.</p>
 <tbody>
 <tr>
 <td><code>binlog_server_component.cc</code></td>
-<td>Component lifecycle (init/deinit), service registration, sysvar management</td>
+<td>Component lifecycle (init/deinit), service registration, sysvar management, UDF registration</td>
 <td><code>log_bi</code>, <code>log_bs</code>, <code>sysvar_default_serve_channel</code></td>
 </tr>
 <tr>
 <td><code>binlog_archive.{h,cc}</code></td>
-<td>Per-channel state management, event parsing, rotation, crash recovery, watermark</td>
-<td><code>BinlogArchive</code> singleton, <code>ChannelState</code> map</td>
+<td>Per-channel state management, event parsing, rotation, crash recovery, watermark, metadata tracking</td>
+<td><code>BinlogArchive</code> singleton, <code>ChannelState</code> map, <code>FileMetadata</code> map</td>
 </tr>
 <tr>
 <td><code>archive_sender.{h,cc}</code></td>
 <td>Dump handler dispatch, dump session lifecycle, GTID-based serving</td>
 <td><code>ArchiveSender</code> singleton, <code>ArchiveDumpSession</code> per connection</td>
+</tr>
+<tr>
+<td><code>pfs_status_table.{h,cc}</code></td>
+<td>PFS table: <code>replication_binlog_server_status</code> (per-channel counters)</td>
+<td>Snapshot from <code>BinlogArchive::snapshot_status()</code></td>
+</tr>
+<tr>
+<td><code>pfs_storage_table.{h,cc}</code></td>
+<td>PFS table: <code>replication_binlog_server_storage</code> (per-channel storage summary)</td>
+<td>Snapshot from <code>BinlogArchive::snapshot_storage()</code></td>
+</tr>
+<tr>
+<td><code>pfs_archive_table.{h,cc}</code></td>
+<td>PFS table: <code>replication_binlog_server_archive</code> (per-file metadata)</td>
+<td>Snapshot from <code>BinlogArchive::snapshot_archive()</code></td>
+</tr>
+<tr>
+<td><code>user_channel_map_loader.{h,cc}</code></td>
+<td>Parses inline CSV and <code>table://</code> URIs into a user&rarr;channel map</td>
+<td>&mdash;</td>
 </tr>
 <tr>
 <td><code>gtid_set.{h,cc}</code></td>
@@ -608,13 +691,28 @@ backends requires no changes to the binlog protocol logic.</p>
 <td>Service placeholders</td>
 </tr>
 <tr>
+<td><code>encryption.{h,cc}</code></td>
+<td>AES-256-CTR cipher, TLV header format, keyring integration, master key rotation</td>
+<td><code>AesCtrCipher</code>, <code>EncryptionHeader</code>, keyring service handles</td>
+</tr>
+<tr>
 <td><code>file_storage.{h,cc}</code></td>
-<td>File I/O abstraction for <code>file://</code> URIs</td>
-<td>Directory creation, path management</td>
+<td>File I/O abstraction for <code>file://</code> URIs: dir management, index, sidecars, stream I/O</td>
+<td><code>FileWriteStream</code>, <code>FileReadStream</code>, <code>std::filesystem</code> operations</td>
+</tr>
+<tr>
+<td><code>s3_storage.{h,cc}</code></td>
+<td>S3 storage stub (<code>s3://</code> URIs recognized but not implemented)</td>
+<td>Returns failure with logged message</td>
+</tr>
+<tr>
+<td><code>gtid_renumberer.{h,cc}</code></td>
+<td>Logical-clock rewriter stub for archive rewrite mode (not yet active). Fixes <code>sequence_number</code>/<code>last_committed</code> when coalescing; GTID identifiers are never modified.</td>
+<td><code>rewrite::LogicalClockState</code></td>
 </tr>
 <tr>
 <td><code>storage_backend.h</code></td>
-<td>Abstract interface for storage backends</td>
+<td>Abstract interface for storage backends (15 virtual methods)</td>
 <td>&mdash;</td>
 </tr>
 <tr>

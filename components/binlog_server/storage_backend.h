@@ -9,10 +9,31 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace binlog_server {
+
+/// Abstract append-only write stream returned by StorageBackend::open_write.
+class StorageWriteStream {
+ public:
+  virtual ~StorageWriteStream() = default;
+  virtual bool write(const unsigned char *data, size_t len) = 0;
+  virtual bool flush() = 0;
+  virtual bool sync() = 0;
+  virtual void close() = 0;
+  virtual bool good() const = 0;
+};
+
+/// Abstract random-read stream returned by StorageBackend::open_read.
+class StorageReadStream {
+ public:
+  virtual ~StorageReadStream() = default;
+  virtual bool read_at(uint64_t offset, unsigned char *buf, size_t len) = 0;
+  virtual uint64_t size() const = 0;
+  virtual void close() = 0;
+};
 
 class StorageBackend {
  public:
@@ -54,6 +75,24 @@ class StorageBackend {
 
   virtual bool sidecar_store(const std::string &dir, const std::string &name,
                              const std::string &data) = 0;
+
+  // --- Streaming file I/O (used by archive write/read/encryption) ---
+
+  /// Open a file for append-only writing. Creates the file if it doesn't exist.
+  virtual std::unique_ptr<StorageWriteStream> open_write(
+      const std::string &dir, const std::string &name) = 0;
+
+  /// Open a file for random-access reading.
+  virtual std::unique_ptr<StorageReadStream> open_read(
+      const std::string &dir, const std::string &name) const = 0;
+
+  /// Overwrite the first `len` bytes of a file (for encryption header rewrite).
+  virtual bool rewrite_header(const std::string &dir, const std::string &name,
+                              const unsigned char *data, size_t len) = 0;
+
+  /// Truncate a file to the given size (for crash recovery).
+  virtual bool truncate_file(const std::string &dir, const std::string &name,
+                             uint64_t new_size) = 0;
 };
 
 }  // namespace binlog_server

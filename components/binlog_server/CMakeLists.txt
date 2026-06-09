@@ -1,6 +1,7 @@
 MYSQL_ADD_COMPONENT(binlog_server
   binlog_server_component.cc
   binlog_archive.cc
+  encryption.cc
   file_storage.cc
   s3_storage.cc
   gtid_renumberer.cc
@@ -12,4 +13,5 @@ MYSQL_ADD_COMPONENT(binlog_server
   pfs_storage_table.cc
   pfs_archive_table.cc
   MODULE_ONLY
+  LINK_LIBRARIES OpenSSL::Crypto
 )

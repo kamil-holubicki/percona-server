@@ -193,4 +193,117 @@ bool FileStorage::sidecar_store(const std::string &dir, const std::string &name,
   return true;
 }
 
+// --- Streaming I/O implementations ---
+
+namespace {
+
+class FileWriteStream final : public StorageWriteStream {
+ public:
+  explicit FileWriteStream(const std::string &path)
+      : m_path(path), m_fd(-1) {
+    m_out.open(path, std::ios::binary | std::ios::out | std::ios::app);
+    if (m_out.is_open()) {
+      m_fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    }
+  }
+  ~FileWriteStream() override { close(); }
+
+  bool write(const unsigned char *data, size_t len) override {
+    m_out.write(reinterpret_cast<const char *>(data),
+                static_cast<std::streamsize>(len));
+    return m_out.good();
+  }
+  bool flush() override {
+    m_out.flush();
+    return m_out.good();
+  }
+  bool sync() override {
+    m_out.flush();
+    if (!m_out.good()) return false;
+    if (m_fd >= 0) ::fdatasync(m_fd);
+    return true;
+  }
+  void close() override {
+    if (m_out.is_open()) {
+      m_out.flush();
+      m_out.close();
+    }
+    if (m_fd >= 0) {
+      ::close(m_fd);
+      m_fd = -1;
+    }
+  }
+  bool good() const override { return m_out.good(); }
+
+ private:
+  std::string m_path;
+  std::ofstream m_out;
+  int m_fd;
+};
+
+class FileReadStream final : public StorageReadStream {
+ public:
+  explicit FileReadStream(const std::string &path) : m_path(path) {
+    m_in.open(path, std::ios::binary);
+    if (m_in.is_open()) {
+      m_in.seekg(0, std::ios::end);
+      m_size = static_cast<uint64_t>(m_in.tellg());
+    }
+  }
+  ~FileReadStream() override { close(); }
+
+  bool read_at(uint64_t offset, unsigned char *buf, size_t len) override {
+    m_in.clear();
+    m_in.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    m_in.read(reinterpret_cast<char *>(buf),
+              static_cast<std::streamsize>(len));
+    return m_in.gcount() == static_cast<std::streamsize>(len);
+  }
+  uint64_t size() const override { return m_size; }
+  void close() override {
+    if (m_in.is_open()) m_in.close();
+  }
+
+ private:
+  std::string m_path;
+  std::ifstream m_in;
+  uint64_t m_size{0};
+};
+
+}  // anonymous namespace
+
+std::unique_ptr<StorageWriteStream> FileStorage::open_write(
+    const std::string &dir, const std::string &name) {
+  auto s = std::make_unique<FileWriteStream>(dir + name);
+  if (!s->good()) return nullptr;
+  return s;
+}
+
+std::unique_ptr<StorageReadStream> FileStorage::open_read(
+    const std::string &dir, const std::string &name) const {
+  auto s = std::make_unique<FileReadStream>(dir + name);
+  if (s->size() == 0 && !fs::exists(dir + name)) return nullptr;
+  return s;
+}
+
+bool FileStorage::rewrite_header(const std::string &dir,
+                                 const std::string &name,
+                                 const unsigned char *data, size_t len) {
+  std::string path = dir + name;
+  FILE *f = std::fopen(path.c_str(), "r+b");
+  if (!f) return false;
+  size_t written = std::fwrite(data, 1, len, f);
+  std::fflush(f);
+  std::fclose(f);
+  return written == len;
+}
+
+bool FileStorage::truncate_file(const std::string &dir,
+                                const std::string &name,
+                                uint64_t new_size) {
+  std::error_code ec;
+  fs::resize_file(dir + name, new_size, ec);
+  return !ec;
+}
+
 }  // namespace binlog_server

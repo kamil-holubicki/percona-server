@@ -116,9 +116,10 @@ percona-server/
 │   ├── archive_sender.h / .cc       # ArchiveSender + ArchiveDumpSession (serving)
 │   ├── gtid_set.h / .cc             # component-local GTID set implementation
 │   ├── server_services.h            # thin aliases for acquired server services
-│   ├── storage_backend.h            # StorageBackend abstract interface (15 methods)
+│   ├── storage_backend.h            # StorageBackend + StorageWriteStream + StorageReadStream
 │   ├── file_storage.h / .cc         # FileStorage (file:// full implementation)
 │   ├── s3_storage.h / .cc           # S3Storage (stub -- not yet implemented)
+│   ├── encryption.h / .cc           # AesCtrCipher, EncryptionHeader, keyring helpers, key rotation
 │   ├── gtid_renumberer.h / .cc      # GTID renumbering stub for rewrite mode
 │   ├── log_helpers.h / .cc          # bslog / bslog_code logging wrappers
 │   └── doc/                          # this documentation
@@ -145,7 +146,12 @@ percona-server/
     │   ├── binlog_server_multi_replica.test   # Phase 2: multi-downstream
     │   ├── binlog_server_multi_replica.cnf
     │   ├── binlog_server_xa_rotation.test     # Phase 2: XA + rotation + STOP suppression
-    │   └── binlog_server_xa_rotation.cnf
+    │   ├── binlog_server_xa_rotation.cnf
+    │   ├── binlog_server_encryption.test        # Phase 6: encryption + key rotation
+    │   ├── binlog_server_user_routing.test      # Phase 3: per-user channel routing
+    │   ├── binlog_server_user_routing.cnf
+    │   ├── binlog_server_multi_source_encrypted.test  # Phase 6: multi-source + encryption + key rotation
+    │   └── binlog_server_multi_source_encrypted.cnf
     └── r/
         ├── basic_collect.result
         ├── multi_channel.result
@@ -153,7 +159,10 @@ percona-server/
         ├── syntax.result
         ├── binlog_server_chained.result
         ├── binlog_server_multi_replica.result
-        └── binlog_server_xa_rotation.result
+        ├── binlog_server_xa_rotation.result
+        ├── binlog_server_encryption.result
+        ├── binlog_server_user_routing.result
+        └── binlog_server_multi_source_encrypted.result
 ```
 
 ### Hook lifetimes
@@ -333,12 +342,30 @@ END_SERVICE_DEFINITION(mysql_binlog_dump_handler_io)
 | `mysql_command_field_info` | `user_channel_map_loader` | Verify column count of the mapping table |
 | `mysql_command_error_info` | `user_channel_map_loader` | Surface SQL errors to the operator |
 | `mysql_current_thread_reader` | `user_channel_map_loader` | Detect missing SQL context at startup |
-| `udf_registration` | Component init/deinit | Register/unregister `binlog_server_reload_user_channel_map()` |
+| `udf_registration` | Component init/deinit | Register/unregister UDFs (`binlog_server_reload_user_channel_map`, `binlog_server_rotate_encryption_key`, purge UDFs) |
+| `keyring_aes` | `encryption.cc` | Encrypt/decrypt the per-file password with the master key |
+| `keyring_generator` | `encryption.cc` | Generate new master keys in the keyring |
+| `keyring_reader_with_status` | `encryption.cc` | Read master key material from the keyring |
+| `keyring_writer` | `encryption.cc` | Store/remove master keys during rotation |
 
 ## Storage backend abstraction
 
 ```mermaid
 classDiagram
+    class StorageWriteStream {
+        <<abstract>>
+        +write(data, len) bool
+        +flush() bool
+        +sync() bool
+        +close() void
+        +good() bool
+    }
+    class StorageReadStream {
+        <<abstract>>
+        +read_at(offset, buf, len) bool
+        +size() uint64
+        +close() void
+    }
     class StorageBackend {
         <<abstract>>
         +type_tag() const char*
@@ -355,6 +382,10 @@ classDiagram
         +index_rewrite(dir, entries) bool
         +sidecar_load(dir, name, out) bool
         +sidecar_store(dir, name, data) bool
+        +open_write(dir, name) unique_ptr~StorageWriteStream~
+        +open_read(dir, name) unique_ptr~StorageReadStream~
+        +rewrite_header(dir, name, data, len) bool
+        +truncate_file(dir, name, new_size) bool
     }
     class FileStorage {
         +type_tag() "file"
@@ -366,14 +397,20 @@ classDiagram
 
     StorageBackend <|-- FileStorage
     StorageBackend <|-- S3Storage
+    StorageBackend ..> StorageWriteStream : creates
+    StorageBackend ..> StorageReadStream : creates
 ```
 
-`FileStorage` implements the full interface using `std::filesystem`.
-`S3Storage` is a stub: it recognizes `s3://` URIs but all I/O methods
-return failure with a logged message. The `BinlogArchive` dispatches
-purge, index, and sidecar operations through the `StorageBackend`
-interface, so adding new backends requires no changes to the binlog
-protocol or purge logic.
+`FileStorage` implements the full interface using `std::filesystem`,
+`std::ofstream` (`FileWriteStream`), and `std::ifstream`
+(`FileReadStream`). `S3Storage` is a stub: it recognizes `s3://` URIs
+but all I/O methods return failure with a logged message.
+
+All file I/O — collection writes, crash recovery reads, dump session
+reads, header rewrites for key rotation — routes through the
+`StorageBackend` stream abstractions. This means encryption operates
+*above* the storage layer: the same encryption logic works identically
+whether the backend is local filesystem or (future) S3.
 
 ## Module map
 
@@ -388,7 +425,8 @@ protocol or purge logic.
 | `user_channel_map_loader.{h,cc}` | Parses inline CSV and `table://` URIs into a user&rarr;channel map | &mdash; |
 | `gtid_set.{h,cc}` | Component-local GTID set: parsing, binary decode, interval management, subset checks | `binlog_server::gtid::Gtid_set` |
 | `server_services.h` | Thin C++ aliases for acquired server services (`dump_handler_register`, `_io`, `thd_kill_handler`) | Service placeholders |
-| `file_storage.{h,cc}` | File I/O abstraction for `file://` URIs: dir management, index, sidecars, remove | `std::filesystem` operations |
+| `encryption.{h,cc}` | AES-256-CTR cipher, TLV header format, keyring integration, master key rotation | `AesCtrCipher`, `EncryptionHeader`, keyring service handles |
+| `file_storage.{h,cc}` | File I/O abstraction for `file://` URIs: dir management, index, sidecars, stream I/O | `FileWriteStream`, `FileReadStream`, `std::filesystem` operations |
 | `s3_storage.{h,cc}` | S3 storage stub (`s3://` URIs recognized but not implemented) | Returns failure with logged message |
 | `gtid_renumberer.{h,cc}` | Logical-clock rewriter stub for archive rewrite mode (not yet active). Fixes `sequence_number`/`last_committed` when coalescing; GTID identifiers are never modified. | `rewrite::LogicalClockState` |
 | `storage_backend.h` | Abstract interface for storage backends (15 virtual methods) | &mdash; |

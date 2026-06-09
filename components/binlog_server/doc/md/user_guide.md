@@ -468,6 +468,66 @@ If `.meta` files are missing (e.g., after manual file manipulation),
 use the `binlog_server_rebuild_archive_index()` UDF to regenerate
 them.
 
+## At-rest encryption
+
+The binlog server supports transparent at-rest encryption for archived
+binlog files. When enabled, all new archive files are encrypted using
+AES-256-CTR with a per-file random password, wrapped by a master key
+stored in the MySQL keyring.
+
+### Enabling encryption
+
+```sql
+-- 1) Ensure a keyring component is loaded (e.g., component_keyring_file).
+--    The keyring must be configured before the server starts (manifest file).
+
+-- 2) Enable encryption on the binlog server.
+SET GLOBAL binlog_server.encryption = ON;
+```
+
+All subsequently opened archive files will be encrypted. Existing
+plaintext files remain readable; the `ArchiveSender` auto-detects
+the format when serving to downstream replicas.
+
+### Master key rotation
+
+Rotate the master encryption key for a channel without stopping
+collection or disconnecting downstream replicas:
+
+```sql
+SELECT binlog_server_rotate_encryption_key('src_a');
+-- Returns the new key name, e.g. 'BinlogServerKey_src_a_2'
+```
+
+This generates a new master key in the keyring and re-wraps the
+active file's password under the new key (header rewrite). Previously
+rotated files retain their original key references; the keyring must
+retain old keys for those files to remain readable.
+
+### Keyring setup example
+
+Using `component_keyring_file`:
+
+1. Create a keyring configuration JSON file (e.g.,
+   `/var/lib/mysql-keyring/keyring.json`):
+   ```json
+   { "path": "/var/lib/mysql-keyring/keyring_data", "read_only": false }
+   ```
+
+2. Create a manifest file at `<mysqld_binary_dir>/mysqld.my`:
+   ```json
+   { "components": "file://component_keyring_file" }
+   ```
+
+3. Restart `mysqld`. The keyring is now available for encryption
+   operations.
+
+### Decryption during serving
+
+Downstream replicas receive plaintext events — decryption happens
+transparently inside the `ArchiveSender`. The replica does not need
+a keyring or any special configuration.
+
 ## System variables
 
 | Variable | Scope | Type | Default | Description |
@@ -476,6 +536,7 @@ them.
 | `binlog_server.default_serve_channel` | GLOBAL | String | `''` | Channel name whose archive is served to downstream replicas when no user mapping matches |
 | `binlog_server.user_channel_map` | GLOBAL | String | `''` | User-to-channel routing. Two shapes: inline CSV (`user1=channel1,user2=channel2,...`) or table URI (`table://<db>.<tbl>`). See [Per-user channel routing](#per-user-channel-routing). |
 | `binlog_server.storage_root` | GLOBAL | String | `''` | When non-empty, all `file://` storage URIs must resolve under this directory. Prevents path-traversal misconfiguration. |
+| `binlog_server.encryption` | GLOBAL | Boolean | `OFF` | When ON, new archive files are encrypted with AES-256-CTR. Requires a keyring component to be loaded. Existing plaintext files remain readable. |
 | `binlog_server.trace_send_path` | GLOBAL | Boolean | `OFF` | When enabled, the `ArchiveSender` logs detailed trace messages for each dump session (file opens, GTID skips, heartbeats). Useful for debugging per-user routing issues. |
 | `binlog_server.rewrite_file_size` | GLOBAL | ULONGLONG | `0` | Target archive file size for local rewrite rotation (bytes). **Not yet implemented** -- setting a non-zero value logs a warning and has no effect. |
 | `binlog_server.rewrite_base_name` | GLOBAL | String | `''` | Base filename pattern for rewritten archives. **Not yet implemented** -- setting a value logs a warning and has no effect. |
@@ -485,6 +546,7 @@ them.
 | Function | Returns | Description |
 | --- | --- | --- |
 | `binlog_server_reload_user_channel_map()` | INT (mapping count) or NULL on failure | Re-reads the current `user_channel_map` spec and rebuilds the live routing map. Required after setting a `table://` URI; also useful to pick up table row changes without re-setting the sysvar. |
+| `binlog_server_rotate_encryption_key(channel)` | VARCHAR (new key name) or NULL on error | Generates a new master key in the keyring for the given channel and re-wraps the active file's password under the new key. The channel continues collecting without interruption. |
 | `binlog_server_rebuild_archive_index(channel)` | INT (files processed) or -1 on error | Scans every binlog file in the named channel's archive, extracts timestamps and GTID sets, and writes/updates `.meta` sidecar files. Use after manual file moves or if `.meta` files are missing. Pass the channel name as the single argument. |
 | `binlog_server_purge_channel(channel, up_to_file)` | INT (files purged) or NULL on error | Removes archive files from the oldest up to and including the named file. The active (tail) file can never be purged. |
 | `binlog_server_purge_before_gtid(channel, gtid_set)` | INT (files purged) or NULL on error | Removes archive files whose accumulated GTID set is fully contained in the given set. Files are processed from oldest to newest; stops at the first file not fully contained. |

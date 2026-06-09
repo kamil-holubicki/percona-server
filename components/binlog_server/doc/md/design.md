@@ -12,6 +12,8 @@
 - [Locking discipline](#locking-discipline)
 - [ChannelState anatomy](#channelstate-anatomy)
 - [On-disk archive format](#on-disk-archive-format)
+  - [Encrypted on-disk format](#encrypted-on-disk-format)
+  - [Key hierarchy](#key-hierarchy)
 - [Append path](#append-path)
 - [Deduplication watermark](#deduplication-watermark)
 - [Durability boundaries](#durability-boundaries)
@@ -49,9 +51,11 @@
 | `components/binlog_server/user_channel_map_loader.h` | Public API for the routing-map loader: `looks_like_table_uri()`, `parse_table_uri()`, `apply_spec()`, `apply_spec_no_sql()`. |
 | `components/binlog_server/user_channel_map_loader.cc` | Implementation: inline-CSV parsing, `table://` validation + `mysql_command_*`-based SELECT, live-map swap. |
 | `components/binlog_server/server_services.h` | Thin C++ aliases for `mysql_binlog_dump_handler_register`, `_io`, `mysql_thd_kill_handler`. |
-| `components/binlog_server/storage_backend.h` | Abstract `StorageBackend` interface. |
+| `components/binlog_server/storage_backend.h` | Abstract `StorageBackend` interface + `StorageWriteStream` / `StorageReadStream` abstractions. |
 | `components/binlog_server/file_storage.h` | `FileStorage` &mdash; concrete backend for `file://` URIs. |
-| `components/binlog_server/file_storage.cc` | Directory creation, path resolution. |
+| `components/binlog_server/file_storage.cc` | Directory creation, path resolution, `FileWriteStream`, `FileReadStream`. |
+| `components/binlog_server/encryption.h` | `AesCtrCipher`, `EncryptionHeader`, keyring helpers, key rotation. |
+| `components/binlog_server/encryption.cc` | AES-256-CTR via OpenSSL EVP, TLV header serialization, keyring service calls. |
 | `components/binlog_server/log_helpers.h` | `bslog()`, `bslog_code()` declarations. |
 | `components/binlog_server/log_helpers.cc` | Logging implementation using `LogComponentErr`. |
 | `plugin/binlog_server_relay/binlog_server_relay.cc` | Plugin: `Binlog_relay_IO_observer` callbacks, RAII service acquisition. |
@@ -96,9 +100,9 @@ contends with IO threads of other channels.
 struct ChannelState {
   std::mutex mtx;
 
-  // On-disk I/O
-  std::ofstream out;
-  int fsync_fd = -1;
+  // On-disk I/O (storage-backend agnostic)
+  std::unique_ptr<StorageWriteStream> out;
+  StorageBackend *backend = nullptr;
 
   // Current file tracking
   std::string current_log_name;
@@ -110,6 +114,9 @@ struct ChannelState {
   // Protocol state
   bool wrote_fde = false;
   bool has_checksum = false;
+
+  // Encryption
+  std::unique_ptr<AesCtrCipher> encryptor;  // non-null when file is encrypted
 
   // Counters
   uint64_t events_appended = 0;
@@ -124,9 +131,8 @@ struct ChannelState {
 
 Key invariants:
 
-- `out.is_open()` iff we are actively collecting into a file.
-- `fsync_fd` is a POSIX fd opened on the same path, used exclusively
-  for `fsync(2)` calls (the `std::ofstream` doesn't expose its fd).
+- `out != nullptr` iff we are actively collecting into a file.
+- `backend` is set during `configure_channel` and used for all I/O.
 - `current_log_name` is the basename (e.g. `binlog.000003`), not a
   full path.
 - `last_source_log_pos` is always the `log_pos` of the last
@@ -135,6 +141,9 @@ Key invariants:
 - `wrote_fde` is reset on every file rotation. It prevents writing
   a second FDE if the upstream re-sends one on reconnect within the
   same file.
+- `encryptor` is non-null when `binlog_server.encryption = ON` and
+  a file is open. All event data passes through `encryptor->process()`
+  before being written via `out->write()`.
 
 ## On-disk archive format
 
@@ -162,6 +171,46 @@ Bytes 17-18: flags (2 bytes, little-endian)
 
 If `has_checksum` is true, each event has a 4-byte CRC32 appended
 after the declared `event_length - 4` payload bytes.
+
+### Encrypted on-disk format
+
+When `binlog_server.encryption = ON`, each archive file is written
+with a 512-byte cleartext header followed by AES-256-CTR encrypted
+body bytes:
+
+```
+Offset 0:      fd 62 69 6e           (encryption magic: "\xfdbin")
+Offset 4:      01                    (header version 1)
+Offset 5:      [TLV: key_id]        (type=1, len=N, value=key name string)
+Offset ...:    [TLV: encrypted_pw]  (type=2, len=32, value=encrypted file password)
+Offset ...:    [TLV: iv]            (type=3, len=16, value=AES IV for password decryption)
+Offset ...:    00 00 ...            (zero padding to offset 512)
+------- encrypted body (AES-256-CTR from stream offset 0) -------
+Offset 512:    encrypted(fe 62 69 6e)       (encrypted binlog magic)
+Offset 516:    encrypted([FDE])             (encrypted Format Description Event)
+Offset ...:    encrypted([event] [event] ...)
+```
+
+The encryption stream uses a per-file random password (32 bytes)
+that is itself encrypted by the channel's master key (stored in the
+keyring). The CTR counter starts at offset 0 for the first byte
+after the 512-byte header. The encrypted body has the same logical
+layout as a plaintext binlog (magic + FDE + events).
+
+### Key hierarchy
+
+```
+keyring
+  └── BinlogServerKey_<channel>_<version>  (master key, AES-256)
+        └── encrypts per-file password (random 32 bytes)
+              └── derives file_key + file_iv via EVP_BytesToKey(SHA-512)
+                    └── AES-256-CTR stream cipher for file body
+```
+
+Master key rotation (`binlog_server_rotate_encryption_key`) re-wraps
+the active file's password under the new master key and rewrites the
+512-byte header in-place. Existing data is not re-encrypted; only
+the header changes.
 
 ## Append path
 

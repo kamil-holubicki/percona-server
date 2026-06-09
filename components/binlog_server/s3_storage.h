@@ -48,6 +48,15 @@ class S3Storage final : public StorageBackend {
                     std::string &out) const override;
   bool sidecar_store(const std::string &dir, const std::string &name,
                      const std::string &data) override;
+
+  std::unique_ptr<StorageWriteStream> open_write(
+      const std::string &dir, const std::string &name) override;
+  std::unique_ptr<StorageReadStream> open_read(
+      const std::string &dir, const std::string &name) const override;
+  bool rewrite_header(const std::string &dir, const std::string &name,
+                      const unsigned char *data, size_t len) override;
+  bool truncate_file(const std::string &dir, const std::string &name,
+                     uint64_t new_size) override;
 };
 
 /// Factory function used by BinlogArchive::create_backend for s3:// URIs.
