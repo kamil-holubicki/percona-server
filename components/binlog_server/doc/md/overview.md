@@ -170,6 +170,26 @@ as out-of-tree-ish loadables.
 | **`ArchiveDumpSession`** | The per-connection serving session. Resolves the GTID start position, walks archive files sending events, filters by GTID, and tail-follows the active file with heartbeats. |
 | **Dump handler dispatch slot** | An atomic function-pointer slot in `sql/binlog_dump_handler.{h,cc}` that the component installs at load time. If set, `mysql_binlog_send()` delegates to the component instead of the built-in `Binlog_sender`. |
 
+## Observability
+
+The component exposes three `performance_schema` tables:
+
+- **`replication_binlog_server_status`** &mdash; per-channel
+  operational counters: events appended, bytes, write errors,
+  duplicates dropped, last error, timestamps.
+- **`replication_binlog_server_storage`** &mdash; per-channel storage
+  summary: file count, total size on disk, active/idle status, GTID
+  set covered.
+- **`replication_binlog_server_archive`** &mdash; per-file metadata:
+  size, event count, min/max timestamps, Previous_gtid and
+  accumulated GTID sets. Enables point-in-time lookups without
+  scanning the archive.
+
+Per-file metadata is persisted in `.meta` sidecar files alongside
+each archive file for fast recovery. See the
+[User guide &rarr; Observability](user_guide.md#observability-performance-schema-tables)
+section for full column definitions and query examples.
+
 ## What it explicitly is NOT
 
 - **Not a replication group member.** No group-replication semantics,

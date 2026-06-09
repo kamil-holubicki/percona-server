@@ -9,6 +9,7 @@
 #include "log_helpers.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -41,6 +42,9 @@ constexpr unsigned char kRotateEventType = 4;
 constexpr unsigned char kFormatDescriptionEventType = 15;
 constexpr unsigned char kXidEventType = 16;
 constexpr unsigned char kXaPrepareEventType = 38;
+constexpr unsigned char kPreviousGtidsLogEventType = 35;
+constexpr unsigned char kGtidLogEventType = 33;
+constexpr unsigned char kGtidTaggedLogEventType = 42;
 constexpr unsigned char kChecksumAlgOff = 0;
 constexpr unsigned char kChecksumAlgUndef = 255;
 
@@ -234,6 +238,15 @@ bool open_archive_file(ChannelState &state, const std::string &log_name,
   return true;
 }
 
+// Forward declarations for metadata helpers defined below
+void load_file_metadata(ChannelState &state);
+void flush_file_metadata(ChannelState &state, const std::string &log_name);
+void note_event_timestamp(ChannelState &state, const char *event_buf);
+void note_gtid_event(ChannelState &state, const char *event_buf,
+                     unsigned long event_len);
+void record_channel_error(ChannelState &state, int code,
+                          const std::string &msg);
+
 // Crash recovery: walk events in the last archive file, restore watermark,
 // truncate partial tail.
 void recover_state_from_archive(ChannelState &state,
@@ -327,6 +340,9 @@ void recover_state_from_archive(ChannelState &state,
   state.wrote_fde = has_fde;
   state.has_checksum = has_checksum;
 
+  // Load .meta sidecars for all indexed files
+  load_file_metadata(state);
+
   bslog(INFORMATION_LEVEL,
         "binlog_server: channel '%s' recovered state from '%s' "
         "(file_size=%llu, watermark=%llu, has_fde=%d, has_checksum=%d)",
@@ -358,6 +374,15 @@ void handle_rotate_event(ChannelState &state, const char *channel_name,
     state.out.write(event_buf, event_len);
     state.out.flush();
     sync_channel_to_disk(state, channel_name);
+  }
+
+  // Flush per-file metadata sidecar for the file being rotated away
+  if (!state.current_log_name.empty()) {
+    auto &fm = state.file_metadata[state.current_log_name];
+    std::error_code ec;
+    auto sz = fs::file_size(state.base_dir + state.current_log_name, ec);
+    if (!ec) fm.size_bytes = sz;
+    flush_file_metadata(state, state.current_log_name);
   }
 
   close_archive_file(state);
@@ -419,6 +444,238 @@ void handle_format_description_event(ChannelState &state,
   const uint32_t fde_log_pos = read_u32_le(event_buf + kLogPosOffset);
   if (fde_log_pos > state.last_source_log_pos) {
     state.last_source_log_pos = fde_log_pos;
+  }
+}
+
+// --- Per-file metadata helpers (Phase 4) ---
+
+uint64_t now_microseconds() {
+  using namespace std::chrono;
+  return static_cast<uint64_t>(
+      duration_cast<microseconds>(system_clock::now().time_since_epoch())
+          .count());
+}
+
+bool should_log_io_failure(ChannelState &state) {
+  const unsigned long count = ++state.io_failure_count;
+  return count <= 5 || count % 10000 == 0;
+}
+
+void record_channel_error(ChannelState &state, int code,
+                          const std::string &msg) {
+  state.last_error_code = code;
+  state.last_error_message = msg;
+  state.last_error_timestamp_us = now_microseconds();
+  ++state.write_errors;
+}
+
+void note_event_timestamp(ChannelState &state, const char *event_buf) {
+  const uint32_t ts = read_u32_le(event_buf);
+  if (ts == 0) return;
+  state.last_event_timestamp_us =
+      static_cast<uint64_t>(ts) * 1000000ULL;
+
+  auto &fm = state.file_metadata[state.current_log_name];
+  if (fm.min_event_timestamp == 0 || ts < fm.min_event_timestamp)
+    fm.min_event_timestamp = ts;
+  if (ts > fm.max_event_timestamp) fm.max_event_timestamp = ts;
+  ++fm.event_count;
+}
+
+// Extract GTID text from a Gtid_log_event payload.
+// Layout: flags(1) + uuid(16) + gno(8) [+ ts_type(1) + ...].
+// We format as "uuid:gno".
+std::string extract_gtid_text(const char *event_buf, unsigned long event_len) {
+  constexpr unsigned kGtidPostHeaderLen = 42;
+  if (event_len < kLogEventHeaderLen + kGtidPostHeaderLen) return {};
+  const unsigned char *p =
+      reinterpret_cast<const unsigned char *>(event_buf) + kLogEventHeaderLen;
+  // p[0] = commit_flag, p[1..16] = uuid, p[17..24] = gno (LE 8 bytes)
+  const unsigned char *uuid = p + 1;
+  char buf[64];
+  std::snprintf(buf, sizeof(buf),
+                "%02x%02x%02x%02x-%02x%02x-%02x%02x-"
+                "%02x%02x-%02x%02x%02x%02x%02x%02x",
+                uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5],
+                uuid[6], uuid[7], uuid[8], uuid[9], uuid[10], uuid[11],
+                uuid[12], uuid[13], uuid[14], uuid[15]);
+  uint64_t gno = 0;
+  for (int i = 0; i < 8; ++i)
+    gno |= static_cast<uint64_t>(p[17 + i]) << (i * 8);
+  char result[128];
+  std::snprintf(result, sizeof(result), "%s:%llu", buf,
+                static_cast<unsigned long long>(gno));
+  return result;
+}
+
+// Format a 16-byte UUID into canonical "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+std::string format_uuid(const unsigned char *uuid) {
+  char buf[37];
+  std::snprintf(buf, sizeof(buf),
+                "%02x%02x%02x%02x-%02x%02x-%02x%02x-"
+                "%02x%02x-%02x%02x%02x%02x%02x%02x",
+                uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5],
+                uuid[6], uuid[7], uuid[8], uuid[9], uuid[10], uuid[11],
+                uuid[12], uuid[13], uuid[14], uuid[15]);
+  return buf;
+}
+
+uint64_t read_u64_le(const unsigned char *p) {
+  uint64_t v = 0;
+  for (int i = 0; i < 8; ++i) v |= static_cast<uint64_t>(p[i]) << (i * 8);
+  return v;
+}
+
+// Extract Previous_gtids_log_event text. The event payload is either:
+// - FLAG_ENCODING (flag byte 0x01): remaining bytes are raw GTID text
+// - SID_ENCODING (flag byte 0x00): binary n_sids + (uuid + n_intervals +
+//   intervals[]) pairs
+std::string extract_previous_gtids_text(const char *event_buf,
+                                        unsigned long event_len,
+                                        bool has_checksum) {
+  const unsigned overhead =
+      kLogEventHeaderLen + (has_checksum ? kBinlogChecksumLen : 0);
+  if (event_len <= overhead) return {};
+  const unsigned char *p =
+      reinterpret_cast<const unsigned char *>(event_buf) + kLogEventHeaderLen;
+  const unsigned payload_len = event_len - overhead;
+  if (payload_len < 1) return {};
+
+  // Flag-encoding (0x01 byte): remaining bytes are raw GTID text
+  if (p[0] == 0x01 && payload_len > 1) {
+    return std::string(reinterpret_cast<const char *>(p + 1), payload_len - 1);
+  }
+
+  // SID-encoding (flag byte absent or 0x00): binary format
+  // Layout: n_sids (8 bytes) + for each SID: uuid (16) + n_intervals (8) +
+  //          intervals (n_intervals * 16 bytes: start(8) + end(8))
+  const unsigned char *cursor = p;
+  const unsigned char *end_ptr = p + payload_len;
+
+  // Check if first byte is 0x00 (explicit flag) vs direct n_sids
+  // MySQL uses flag encoding when the byte is 0x01; otherwise the
+  // payload starts directly with n_sids (8 bytes LE).
+  if (payload_len < 8) return {};
+
+  uint64_t n_sids = read_u64_le(cursor);
+  cursor += 8;
+
+  if (n_sids == 0) return {};
+  if (n_sids > 100000) return {};  // sanity limit
+
+  std::string result;
+  for (uint64_t s = 0; s < n_sids; ++s) {
+    if (cursor + 16 + 8 > end_ptr) break;
+    std::string uuid_str = format_uuid(cursor);
+    cursor += 16;
+    uint64_t n_intervals = read_u64_le(cursor);
+    cursor += 8;
+    if (n_intervals == 0 || n_intervals > 1000000) break;
+    if (cursor + n_intervals * 16 > end_ptr) break;
+
+    if (!result.empty()) result += ',';
+    result += uuid_str;
+    result += ':';
+
+    for (uint64_t i = 0; i < n_intervals; ++i) {
+      uint64_t iv_start = read_u64_le(cursor);
+      cursor += 8;
+      uint64_t iv_end = read_u64_le(cursor);
+      cursor += 8;
+      if (i > 0) result += ':';
+      if (iv_end == iv_start + 1) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%llu",
+                      static_cast<unsigned long long>(iv_start));
+        result += buf;
+      } else {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%llu-%llu",
+                      static_cast<unsigned long long>(iv_start),
+                      static_cast<unsigned long long>(iv_end - 1));
+        result += buf;
+      }
+    }
+  }
+  return result;
+}
+
+void note_gtid_event(ChannelState &state, const char *event_buf,
+                     unsigned long event_len) {
+  const unsigned char event_type =
+      static_cast<unsigned char>(event_buf[kEventTypeOffset]);
+  auto &fm = state.file_metadata[state.current_log_name];
+
+  if (event_type == kPreviousGtidsLogEventType) {
+    std::string text =
+        extract_previous_gtids_text(event_buf, event_len, state.has_checksum);
+    if (!text.empty()) {
+      fm.previous_gtid_set = text;
+      fm.last_gtid_set = std::move(text);
+    }
+  } else if (event_type == kGtidLogEventType ||
+             event_type == kGtidTaggedLogEventType) {
+    std::string gtid = extract_gtid_text(event_buf, event_len);
+    if (!gtid.empty()) {
+      if (!fm.last_gtid_set.empty()) fm.last_gtid_set += ',';
+      fm.last_gtid_set += gtid;
+    }
+  }
+}
+
+void flush_file_metadata(ChannelState &state, const std::string &log_name) {
+  auto it = state.file_metadata.find(log_name);
+  if (it == state.file_metadata.end()) return;
+  auto &fm = it->second;
+  // Update size_bytes from the actual file on disk
+  {
+    std::error_code ec;
+    auto sz = fs::file_size(state.base_dir + log_name, ec);
+    if (!ec && sz > 0) fm.size_bytes = sz;
+  }
+  const std::string path = state.base_dir + log_name + ".meta";
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out.is_open()) return;
+  out << "version=1\n";
+  out << "min_event_timestamp=" << fm.min_event_timestamp << "\n";
+  out << "max_event_timestamp=" << fm.max_event_timestamp << "\n";
+  out << "event_count=" << fm.event_count << "\n";
+  out << "size_bytes=" << fm.size_bytes << "\n";
+  if (!fm.previous_gtid_set.empty())
+    out << "previous_gtid_set=" << fm.previous_gtid_set << "\n";
+  if (!fm.last_gtid_set.empty())
+    out << "last_gtid_set=" << fm.last_gtid_set << "\n";
+  out.flush();
+}
+
+void load_file_metadata(ChannelState &state) {
+  for (const auto &fname : state.file_order) {
+    const std::string path = state.base_dir + fname + ".meta";
+    std::ifstream in(path);
+    if (!in.is_open()) continue;
+    auto &fm = state.file_metadata[fname];
+    std::string line;
+    while (std::getline(in, line)) {
+      auto eq = line.find('=');
+      if (eq == std::string::npos) continue;
+      std::string key = line.substr(0, eq);
+      std::string val = line.substr(eq + 1);
+      try {
+        if (key == "min_event_timestamp")
+          fm.min_event_timestamp = static_cast<uint32_t>(std::stoul(val));
+        else if (key == "max_event_timestamp")
+          fm.max_event_timestamp = static_cast<uint32_t>(std::stoul(val));
+        else if (key == "event_count")
+          fm.event_count = std::stoull(val);
+        else if (key == "size_bytes")
+          fm.size_bytes = std::stoull(val);
+        else if (key == "previous_gtid_set")
+          fm.previous_gtid_set = val;
+        else if (key == "last_gtid_set")
+          fm.last_gtid_set = val;
+      } catch (const std::exception &) {
+      }
+    }
   }
 }
 
@@ -619,20 +876,38 @@ int BinlogArchive::append_event(const char *channel_name,
   if (!cs.out.is_open()) return 0;
 
   // Deduplication: skip events already archived (watermark-based).
-  if (log_pos != 0 && log_pos <= cs.last_source_log_pos) return 0;
+  if (log_pos != 0 && log_pos <= cs.last_source_log_pos) {
+    ++cs.duplicates_dropped;
+    return 0;
+  }
 
   cs.out.write(event_buf, event_len);
   if (!cs.out.good()) {
-    bslog_code(ERROR_LEVEL, ER_BINLOG_SERVER_IO_FAILURE,
-               "write error on channel '%s', file '%s%s'",
-               name.c_str(), cs.base_dir.c_str(),
-               cs.current_log_name.c_str());
+    record_channel_error(
+        cs, ER_BINLOG_SERVER_IO_FAILURE,
+        std::string("write error on file '") + cs.current_log_name + "'");
+    if (should_log_io_failure(cs)) {
+      bslog_code(ERROR_LEVEL, ER_BINLOG_SERVER_IO_FAILURE,
+                 "write error on channel '%s', file '%s%s' "
+                 "(io_failure_count=%lu)",
+                 name.c_str(), cs.base_dir.c_str(),
+                 cs.current_log_name.c_str(), cs.io_failure_count);
+    }
     return 1;
   }
 
+  cs.io_failure_count = 0;
   if (log_pos > 0) cs.last_source_log_pos = log_pos;
   ++cs.events_appended;
   cs.bytes_appended += event_len;
+
+  // Track per-file metadata (timestamps + GTIDs)
+  note_event_timestamp(cs, event_buf);
+  if (event_type == kGtidLogEventType ||
+      event_type == kGtidTaggedLogEventType ||
+      event_type == kPreviousGtidsLogEventType) {
+    note_gtid_event(cs, event_buf, event_len);
+  }
 
   // Fsync at transaction boundaries (Xid / XA_prepare).
   if (event_type == kXidEventType || event_type == kXaPrepareEventType) {
@@ -661,6 +936,16 @@ int BinlogArchive::close_channel(const char *channel_name) {
   if (!cs_ptr->out.is_open()) return 0;
 
   sync_channel_to_disk(*cs_ptr, name.c_str());
+
+  // Flush per-file metadata sidecar before closing
+  if (!cs_ptr->current_log_name.empty()) {
+    auto &fm = cs_ptr->file_metadata[cs_ptr->current_log_name];
+    std::error_code ec;
+    auto sz = fs::file_size(cs_ptr->base_dir + cs_ptr->current_log_name, ec);
+    if (!ec) fm.size_bytes = sz;
+    flush_file_metadata(*cs_ptr, cs_ptr->current_log_name);
+  }
+
   close_archive_file(*cs_ptr);
 
   // Preserve wrote_fde so reconnect to same file won't re-write FDE.
@@ -698,6 +983,13 @@ int BinlogArchive::reset_channel(const char *channel_name) {
   cs_ptr->has_checksum = false;
   cs_ptr->events_appended = 0;
   cs_ptr->bytes_appended = 0;
+  cs_ptr->duplicates_dropped = 0;
+  cs_ptr->write_errors = 0;
+  cs_ptr->last_error_code = 0;
+  cs_ptr->last_error_message.clear();
+  cs_ptr->last_error_timestamp_us = 0;
+  cs_ptr->last_event_timestamp_us = 0;
+  cs_ptr->file_metadata.clear();
   cs_ptr->index_loaded = false;
   cs_ptr->indexed_files.clear();
   cs_ptr->file_order.clear();
@@ -724,12 +1016,334 @@ int BinlogArchive::rotate_channel(const char *channel_name,
   std::lock_guard<std::mutex> lk(cs_ptr->io_mutex);
 
   sync_channel_to_disk(*cs_ptr, name.c_str());
+
+  // Flush per-file metadata sidecar before rotating away
+  if (!cs_ptr->current_log_name.empty()) {
+    auto &fm = cs_ptr->file_metadata[cs_ptr->current_log_name];
+    std::error_code ec;
+    auto sz =
+        fs::file_size(cs_ptr->base_dir + cs_ptr->current_log_name, ec);
+    if (!ec) fm.size_bytes = sz;
+    flush_file_metadata(*cs_ptr, cs_ptr->current_log_name);
+  }
+
   close_archive_file(*cs_ptr);
 
   cs_ptr->current_log_name = new_log_name;
   cs_ptr->wrote_fde = false;
   cs_ptr->last_source_log_pos = 0;
   return 0;
+}
+
+// --- PFS snapshot methods (Phase 4) ---
+
+std::vector<ChannelStatus> BinlogArchive::snapshot_status() const {
+  std::vector<ChannelStatus> result;
+  std::vector<std::shared_ptr<ChannelState>> channels;
+  {
+    std::lock_guard<std::mutex> lk(m_registry_mutex);
+    channels.reserve(m_channels.size());
+    for (auto &kv : m_channels) channels.push_back(kv.second);
+  }
+
+  for (auto &cs_ptr : channels) {
+    ChannelStatus row;
+    std::string file_path;
+    {
+      std::lock_guard<std::mutex> lk(cs_ptr->io_mutex);
+      row.channel_name = cs_ptr->name;
+      row.enabled = cs_ptr->enabled;
+      row.storage_uri = cs_ptr->storage_uri;
+      row.base_dir = cs_ptr->base_dir;
+      row.current_log_name = cs_ptr->current_log_name;
+      row.has_checksum = cs_ptr->has_checksum;
+      row.events_appended = cs_ptr->events_appended;
+      row.bytes_appended = cs_ptr->bytes_appended;
+      row.last_source_log_pos = cs_ptr->last_source_log_pos;
+      row.duplicates_dropped = cs_ptr->duplicates_dropped;
+      row.indexed_files = cs_ptr->indexed_files.size();
+      row.last_event_timestamp_us = cs_ptr->last_event_timestamp_us;
+      row.last_error_code = cs_ptr->last_error_code;
+      row.last_error_message = cs_ptr->last_error_message;
+      row.last_error_timestamp_us = cs_ptr->last_error_timestamp_us;
+      row.write_errors = cs_ptr->write_errors;
+      if (!row.base_dir.empty() && !row.current_log_name.empty())
+        file_path = row.base_dir + row.current_log_name;
+    }
+    // stat() outside lock
+    if (!file_path.empty()) {
+      std::error_code ec;
+      auto sz = fs::file_size(file_path, ec);
+      if (!ec) row.current_file_size_bytes = sz;
+    }
+    result.push_back(std::move(row));
+  }
+  return result;
+}
+
+std::vector<ChannelStorage> BinlogArchive::snapshot_storage() const {
+  std::vector<ChannelStorage> result;
+  std::vector<std::shared_ptr<ChannelState>> channels;
+  {
+    std::lock_guard<std::mutex> lk(m_registry_mutex);
+    channels.reserve(m_channels.size());
+    for (auto &kv : m_channels) channels.push_back(kv.second);
+  }
+
+  for (auto &cs_ptr : channels) {
+    ChannelStorage row;
+    std::string base_dir;
+    std::string active_file_path;
+    {
+      std::lock_guard<std::mutex> lk(cs_ptr->io_mutex);
+      row.channel_name = cs_ptr->name;
+      row.storage_type = "FILE";
+      row.storage_uri = cs_ptr->storage_uri;
+      row.base_path = cs_ptr->base_dir;
+      row.file_count = cs_ptr->indexed_files.size();
+      row.active_file = cs_ptr->current_log_name;
+      row.last_error_code = cs_ptr->last_error_code;
+      row.last_error_message = cs_ptr->last_error_message;
+      row.last_error_timestamp_us = cs_ptr->last_error_timestamp_us;
+      base_dir = cs_ptr->base_dir;
+      if (!base_dir.empty() && !cs_ptr->current_log_name.empty())
+        active_file_path = base_dir + cs_ptr->current_log_name;
+
+      if (cs_ptr->last_error_code != 0)
+        row.status = "ERROR";
+      else if (!cs_ptr->enabled)
+        row.status = "DISABLED";
+      else if (cs_ptr->out.is_open())
+        row.status = "ACTIVE";
+      else
+        row.status = "IDLE";
+    }
+    // Filesystem operations outside lock
+    if (!active_file_path.empty()) {
+      std::error_code ec;
+      auto sz = fs::file_size(active_file_path, ec);
+      if (!ec) row.active_file_bytes = sz;
+    }
+    if (!base_dir.empty()) {
+      uint64_t total = 0;
+      std::error_code ec;
+      for (auto &entry : fs::directory_iterator(base_dir, ec)) {
+        if (entry.is_regular_file()) {
+          auto sz = entry.file_size(ec);
+          if (!ec) total += sz;
+        }
+      }
+      row.total_bytes_on_disk = total;
+    }
+    result.push_back(std::move(row));
+  }
+  return result;
+}
+
+std::vector<ChannelArchive> BinlogArchive::snapshot_archive() const {
+  std::vector<ChannelArchive> result;
+  std::vector<std::shared_ptr<ChannelState>> channels;
+  {
+    std::lock_guard<std::mutex> lk(m_registry_mutex);
+    channels.reserve(m_channels.size());
+    for (auto &kv : m_channels) channels.push_back(kv.second);
+  }
+
+  for (auto &cs_ptr : channels) {
+    struct LocalRow {
+      std::string file_name;
+      FileMetadata meta;
+      bool is_active;
+    };
+    std::vector<LocalRow> rows;
+    std::string base_dir;
+    std::string channel_name;
+    {
+      std::lock_guard<std::mutex> lk(cs_ptr->io_mutex);
+      load_index_file(*cs_ptr);
+      base_dir = cs_ptr->base_dir;
+      channel_name = cs_ptr->name;
+      rows.reserve(cs_ptr->file_order.size());
+      for (const auto &fname : cs_ptr->file_order) {
+        LocalRow r;
+        r.file_name = fname;
+        auto it = cs_ptr->file_metadata.find(fname);
+        if (it != cs_ptr->file_metadata.end()) r.meta = it->second;
+        r.is_active = (fname == cs_ptr->current_log_name &&
+                       cs_ptr->out.is_open());
+        rows.push_back(std::move(r));
+      }
+    }
+    // Filesystem stat outside lock
+    for (auto &lr : rows) {
+      ChannelArchive row;
+      row.channel_name = channel_name;
+      row.file_name = lr.file_name;
+      row.is_active = lr.is_active;
+      row.min_event_timestamp_us =
+          static_cast<uint64_t>(lr.meta.min_event_timestamp) * 1000000ULL;
+      row.max_event_timestamp_us =
+          static_cast<uint64_t>(lr.meta.max_event_timestamp) * 1000000ULL;
+      row.event_count = lr.meta.event_count;
+      row.previous_gtid_set = std::move(lr.meta.previous_gtid_set);
+      row.last_gtid_set = std::move(lr.meta.last_gtid_set);
+      if (!base_dir.empty()) {
+        std::error_code ec;
+        auto sz = fs::file_size(base_dir + lr.file_name, ec);
+        row.size_bytes = (!ec && sz > 0) ? sz : lr.meta.size_bytes;
+      } else {
+        row.size_bytes = lr.meta.size_bytes;
+      }
+      result.push_back(std::move(row));
+    }
+  }
+  return result;
+}
+
+long long BinlogArchive::rebuild_archive_index(const char *channel_name) {
+  std::string name = channel_name != nullptr ? channel_name : "";
+  auto cs_ptr = find_channel(name);
+  if (!cs_ptr) return -1;
+
+  std::lock_guard<std::mutex> lk(cs_ptr->io_mutex);
+  load_index_file(*cs_ptr);
+
+  long long rebuilt = 0;
+  for (const auto &fname : cs_ptr->file_order) {
+    // Skip files that already have a credible .meta on disk
+    {
+      const std::string meta_path = cs_ptr->base_dir + fname + ".meta";
+      std::ifstream mf(meta_path);
+      if (mf.is_open()) {
+        FileMetadata on_disk{};
+        std::string line;
+        while (std::getline(mf, line)) {
+          auto eq = line.find('=');
+          if (eq == std::string::npos) continue;
+          std::string key = line.substr(0, eq);
+          std::string val = line.substr(eq + 1);
+          try {
+            if (key == "event_count") on_disk.event_count = std::stoull(val);
+            else if (key == "min_event_timestamp")
+              on_disk.min_event_timestamp = static_cast<uint32_t>(std::stoul(val));
+            else if (key == "max_event_timestamp")
+              on_disk.max_event_timestamp = static_cast<uint32_t>(std::stoul(val));
+            else if (key == "size_bytes") on_disk.size_bytes = std::stoull(val);
+            else if (key == "previous_gtid_set") on_disk.previous_gtid_set = val;
+            else if (key == "last_gtid_set") on_disk.last_gtid_set = val;
+          } catch (...) {}
+        }
+        if (on_disk.event_count != 0 || on_disk.min_event_timestamp != 0 ||
+            on_disk.max_event_timestamp != 0 || on_disk.size_bytes != 0 ||
+            !on_disk.previous_gtid_set.empty() ||
+            !on_disk.last_gtid_set.empty()) {
+          cs_ptr->file_metadata[fname] = std::move(on_disk);
+          continue;
+        }
+      }
+    }
+
+    const std::string path = cs_ptr->base_dir + fname;
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) continue;
+
+    char magic[kBinlogMagicSize];
+    if (!f.read(magic, kBinlogMagicSize) ||
+        std::memcmp(magic, kBinlogMagic, kBinlogMagicSize) != 0)
+      continue;
+
+    FileMetadata fm;
+    bool file_has_checksum = cs_ptr->has_checksum;
+    uint64_t offset = kBinlogMagicSize;
+
+    for (;;) {
+      char hdr[kLogEventHeaderLen];
+      f.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+      f.read(hdr, kLogEventHeaderLen);
+      if (f.gcount() < static_cast<std::streamsize>(kLogEventHeaderLen)) break;
+
+      const uint32_t ts = read_u32_le(hdr);
+      const unsigned char etype =
+          static_cast<unsigned char>(hdr[kEventTypeOffset]);
+      const uint32_t elen = read_u32_le(hdr + kEventLenOffset);
+      const uint16_t eflags = read_u16_le(hdr + kFlagsOffset);
+      if (elen < kLogEventHeaderLen || elen > (64ULL << 20)) break;
+
+      // Verify we can read the full event
+      f.seekg(static_cast<std::streamoff>(offset) +
+                  static_cast<std::streamoff>(elen) - 1,
+              std::ios::beg);
+      char probe = 0;
+      if (!f.read(&probe, 1) || f.gcount() != 1) break;
+      f.clear();
+
+      // Exclude artificial events and FDE from timestamp accounting
+      if (ts > 0 && !(eflags & kLogEventArtificialF) &&
+          etype != kFormatDescriptionEventType) {
+        if (fm.min_event_timestamp == 0 || ts < fm.min_event_timestamp)
+          fm.min_event_timestamp = ts;
+        if (ts > fm.max_event_timestamp) fm.max_event_timestamp = ts;
+        ++fm.event_count;
+      }
+
+      // Detect checksum from FDE
+      if (etype == kFormatDescriptionEventType &&
+          elen >= kLogEventHeaderLen + kBinlogChecksumAlgDescLen +
+                      kBinlogChecksumLen) {
+        f.seekg(static_cast<std::streamoff>(offset) +
+                    static_cast<std::streamoff>(elen) -
+                    static_cast<std::streamoff>(kBinlogChecksumAlgDescLen) -
+                    static_cast<std::streamoff>(kBinlogChecksumLen),
+                std::ios::beg);
+        char alg_byte = 0;
+        if (f.read(&alg_byte, 1) && f.gcount() == 1) {
+          const unsigned char alg = static_cast<unsigned char>(alg_byte);
+          file_has_checksum =
+              (alg != kChecksumAlgOff && alg != kChecksumAlgUndef);
+        }
+        f.clear();
+      }
+
+      // Extract GTID info
+      if (etype == kPreviousGtidsLogEventType ||
+          etype == kGtidLogEventType ||
+          etype == kGtidTaggedLogEventType) {
+        std::vector<char> ev(elen);
+        f.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        f.read(ev.data(), elen);
+        if (f.gcount() == static_cast<std::streamsize>(elen)) {
+          if (etype == kPreviousGtidsLogEventType) {
+            std::string text = extract_previous_gtids_text(
+                ev.data(), elen, file_has_checksum);
+            if (!text.empty()) {
+              fm.previous_gtid_set = text;
+              fm.last_gtid_set = std::move(text);
+            }
+          } else {
+            std::string gtid = extract_gtid_text(ev.data(), elen);
+            if (!gtid.empty()) {
+              if (!fm.last_gtid_set.empty()) fm.last_gtid_set += ',';
+              fm.last_gtid_set += gtid;
+            }
+          }
+        }
+        f.clear();
+      }
+
+      offset += elen;
+    }
+    f.close();
+
+    // Get file size
+    std::error_code ec;
+    auto sz = fs::file_size(path, ec);
+    if (!ec) fm.size_bytes = sz;
+
+    cs_ptr->file_metadata[fname] = std::move(fm);
+    flush_file_metadata(*cs_ptr, fname);
+    ++rebuilt;
+  }
+  return rebuilt;
 }
 
 }  // namespace binlog_server

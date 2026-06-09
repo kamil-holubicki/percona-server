@@ -6,5 +6,8 @@ MYSQL_ADD_COMPONENT(binlog_server
   archive_sender.cc
   gtid_set.cc
   user_channel_map_loader.cc
+  pfs_status_table.cc
+  pfs_storage_table.cc
+  pfs_archive_table.cc
   MODULE_ONLY
 )

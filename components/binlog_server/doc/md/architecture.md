@@ -368,9 +368,13 @@ backends requires no changes to the binlog protocol logic.
 
 | Module | Responsibility | Key state |
 | --- | --- | --- |
-| `binlog_server_component.cc` | Component lifecycle (init/deinit), service registration, sysvar management | `log_bi`, `log_bs`, `sysvar_default_serve_channel` |
-| `binlog_archive.{h,cc}` | Per-channel state management, event parsing, rotation, crash recovery, watermark | `BinlogArchive` singleton, `ChannelState` map |
+| `binlog_server_component.cc` | Component lifecycle (init/deinit), service registration, sysvar management, UDF registration | `log_bi`, `log_bs`, `sysvar_default_serve_channel` |
+| `binlog_archive.{h,cc}` | Per-channel state management, event parsing, rotation, crash recovery, watermark, metadata tracking | `BinlogArchive` singleton, `ChannelState` map, `FileMetadata` map |
 | `archive_sender.{h,cc}` | Dump handler dispatch, dump session lifecycle, GTID-based serving | `ArchiveSender` singleton, `ArchiveDumpSession` per connection |
+| `pfs_status_table.{h,cc}` | PFS table: `replication_binlog_server_status` (per-channel counters) | Snapshot from `BinlogArchive::snapshot_status()` |
+| `pfs_storage_table.{h,cc}` | PFS table: `replication_binlog_server_storage` (per-channel storage summary) | Snapshot from `BinlogArchive::snapshot_storage()` |
+| `pfs_archive_table.{h,cc}` | PFS table: `replication_binlog_server_archive` (per-file metadata) | Snapshot from `BinlogArchive::snapshot_archive()` |
+| `user_channel_map_loader.{h,cc}` | Parses inline CSV and `table://` URIs into a user&rarr;channel map | &mdash; |
 | `gtid_set.{h,cc}` | Component-local GTID set: parsing, binary decode, interval management, subset checks | `binlog_server::gtid::Gtid_set` |
 | `server_services.h` | Thin C++ aliases for acquired server services (`dump_handler_register`, `_io`, `thd_kill_handler`) | Service placeholders |
 | `file_storage.{h,cc}` | File I/O abstraction for `file://` URIs | Directory creation, path management |

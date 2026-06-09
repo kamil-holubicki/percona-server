@@ -97,7 +97,7 @@ SET GLOBAL binlog_server.default_serve_channel = 'src_a';
 | **Crash-safe** | On startup, the archive walks the last file to find the last fully-written event, truncates any partial tail, and restores the watermark. |
 | **Durable at transaction boundaries** | Every `Xid` / `XA_prepare` event triggers an `fsync(2)`, ensuring committed transactions survive a power loss. |
 
-## Current status (Phase 1 + Phase 2 + Phase 3)
+## Current status (Phase 1 + Phase 2 + Phase 3 + Phase 4)
 
 **Phase 1** — collection path:
 
@@ -127,12 +127,20 @@ SET GLOBAL binlog_server.default_serve_channel = 'src_a';
 - Channel path sanitization (whitelist `[A-Za-z0-9_.-]`)
 - Per-channel `BINLOG_SERVER_STORAGE_URI` override
 
+**Phase 4** — observability + per-file metadata:
+
+- Three Performance Schema tables: `replication_binlog_server_status`, `replication_binlog_server_storage`, `replication_binlog_server_archive`
+- Per-channel operational counters: events appended, bytes, duplicates dropped, write errors, timestamps, last error
+- Per-channel storage summary: file count, total disk usage, active/idle status, GTID set covered
+- Per-file metadata: size, event count, min/max timestamps, Previous_gtid and accumulated GTID sets
+- `.meta` sidecar files for fast metadata recovery (no full-archive rescan on startup)
+- `binlog_server_rebuild_archive_index()` UDF for backfilling missing metadata
+
 **Not yet implemented** (planned for later phases):
 - S3-compatible object storage backend
-- Performance Schema observability tables
-- Binlog purging
+- Binlog purging / retention policies
 - Local rotation / rewriting
-- Binlog metadata sidecars (per-file `.json` for faster GTID resolution)
+- Point-in-time search queries (`search_by_timestamp`, `search_by_gtid_set`)
 
 ## License
 

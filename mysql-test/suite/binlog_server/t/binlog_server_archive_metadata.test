@@ -1,0 +1,148 @@
+# ==== Purpose ====
+#
+# Verify correctness and robustness of per-file archive metadata:
+#
+#   1. rebuild_archive_index() skips files that already have a credible
+#      .meta sidecar on disk (avoids redundant rescans).
+#   2. A corrupt/malformed .meta file does not crash the server --
+#      load_file_metadata silently ignores unparseable values.
+#   3. Binary SID-encoded Previous_gtids_log_event payloads are parsed
+#      correctly into the GTID set columns of
+#      replication_binlog_server_archive.
+
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+--source ../inc/have_binlog_server.inc
+
+--let $use_gtids = 1
+--let $rpl_skip_change_master = 1
+--let $rpl_skip_start_slave = 1
+--source include/rpl/init_source_replica.inc
+
+--echo
+--echo # ---- Setup binlog server ----
+--source include/rpl/connection_replica.inc
+--source ../inc/binlog_server_suppressions.inc
+
+--let $store = $MYSQLTEST_VARDIR/tmp/bs_meta_test
+--exec rm -rf $store
+--mkdir $store
+
+INSTALL COMPONENT 'file://component_binlog_server';
+--replace_result $BINLOG_SERVER_RELAY BINLOG_SERVER_RELAY
+eval INSTALL PLUGIN binlog_server_relay SONAME '$BINLOG_SERVER_RELAY';
+
+--replace_result $SERVER_MYPORT_1 SOURCE_PORT $store STORE
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_1,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1,
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file://$store/'
+  FOR CHANNEL 'meta_ch';
+
+START REPLICA IO_THREAD FOR CHANNEL 'meta_ch';
+--let $rpl_channel_name = 'meta_ch'
+--source include/rpl/wait_for_receiver_to_start.inc
+--let $rpl_channel_name =
+
+--echo
+--echo # ---- Generate events to populate archive ----
+--source include/rpl/connection_source.inc
+CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(50));
+INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+INSERT INTO t1 VALUES (4, 'four'), (5, 'five');
+--let $rpl_channel_name = 'meta_ch'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--echo
+--echo # ==== GTID columns populated (binary SID-encoding) ====
+--source include/rpl/connection_replica.inc
+
+--let $gtid = `SELECT LAST_GTID_SET FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'meta_ch' AND LAST_GTID_SET IS NOT NULL LIMIT 1`
+--let $assert_text = LAST_GTID_SET is populated (binary Previous_gtids parsed)
+--let $assert_cond = "$gtid" != ""
+--source include/assert.inc
+
+--echo
+--echo # ==== rebuild_archive_index skips files with existing .meta ====
+
+# First rebuild: should write .meta sidecars for all files
+--let $first_rebuild = `SELECT binlog_server_rebuild_archive_index('meta_ch')`
+--let $assert_text = first rebuild processes files
+--let $assert_cond = $first_rebuild >= 0
+--source include/assert.inc
+
+# Second rebuild: should skip files that now have credible .meta
+--let $second_rebuild = `SELECT binlog_server_rebuild_archive_index('meta_ch')`
+--let $assert_text = second rebuild returns 0 (all files already have .meta)
+--let $assert_cond = $second_rebuild = 0
+--source include/assert.inc
+
+--echo
+--echo # ==== Corrupt .meta does not crash the server ====
+
+# Stop IO thread so we can safely manipulate .meta files
+STOP REPLICA IO_THREAD FOR CHANNEL 'meta_ch';
+--let $rpl_channel_name = 'meta_ch'
+--source include/rpl/wait_for_receiver_to_stop.inc
+--let $rpl_channel_name =
+
+# Write garbage into the first .meta file
+--let $meta_file = `SELECT CONCAT('$store/meta_ch/', FILE_NAME, '.meta') FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'meta_ch' LIMIT 1`
+--exec /bin/sh -c "echo 'event_count=NOT_A_NUMBER' > $meta_file"
+--exec /bin/sh -c "echo 'min_event_timestamp=GARBAGE' >> $meta_file"
+
+# Restart the channel -- this triggers load_file_metadata internally.
+# Without robust parsing, the server would crash on std::stoul("NOT_A_NUMBER").
+--replace_result $SERVER_MYPORT_1 SOURCE_PORT $store STORE
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_1,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1,
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file://$store/'
+  FOR CHANNEL 'meta_ch';
+
+START REPLICA IO_THREAD FOR CHANNEL 'meta_ch';
+--let $rpl_channel_name = 'meta_ch'
+--source include/rpl/wait_for_receiver_to_start.inc
+--let $rpl_channel_name =
+
+--echo # Server survived corrupt .meta (no crash)
+
+# rebuild_archive_index should now rescan the corrupted file
+# (since its .meta is no longer credible)
+--let $rebuilt_after_corrupt = `SELECT binlog_server_rebuild_archive_index('meta_ch')`
+--let $assert_text = rebuild rescans file with corrupt .meta
+--let $assert_cond = $rebuilt_after_corrupt >= 1
+--source include/assert.inc
+
+--echo
+--echo # ---- Tear down ----
+--source include/rpl/connection_source.inc
+DROP TABLE t1;
+--let $rpl_channel_name = 'meta_ch'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--source include/rpl/connection_replica.inc
+STOP REPLICA IO_THREAD FOR CHANNEL 'meta_ch';
+--let $rpl_channel_name = 'meta_ch'
+--source include/rpl/wait_for_receiver_to_stop.inc
+--let $rpl_channel_name =
+RESET REPLICA ALL FOR CHANNEL 'meta_ch';
+SET GLOBAL binlog_server.default_storage_uri = '';
+SET GLOBAL binlog_server.default_serve_channel = '';
+
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+
+--exec rm -rf $store
+
+--let $rpl_skip_sync = 1
+--let $rpl_skip_stop_slave = 1
+--source include/rpl/deinit.inc

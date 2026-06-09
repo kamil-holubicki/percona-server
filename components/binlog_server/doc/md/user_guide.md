@@ -346,6 +346,115 @@ Downstream replicas connecting as `repl_primary` get events from
 `prod_primary`; those connecting as `repl_secondary` get events from
 `prod_secondary`. Any other user falls back to the default.
 
+## Observability (Performance Schema tables)
+
+When the component is loaded, three read-only tables appear in
+`performance_schema`. They are populated automatically as channels
+operate; no additional configuration is needed.
+
+### replication_binlog_server_status
+
+Per-channel operational counters and error tracking.
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `CHANNEL_NAME` | VARCHAR(64) | Channel name |
+| `STATE` | VARCHAR(32) | `RUNNING`, `STOPPED`, or `ERROR` |
+| `SOURCE_HOST` | VARCHAR(255) | Upstream host |
+| `SOURCE_PORT` | INT | Upstream port |
+| `SOURCE_UUID` | VARCHAR(36) | Source server UUID |
+| `CURRENT_FILE` | VARCHAR(512) | Binlog file currently being written |
+| `CURRENT_POSITION` | BIGINT | Byte offset in the current file |
+| `EVENTS_APPENDED` | BIGINT | Total events written to the archive |
+| `BYTES_APPENDED` | BIGINT | Total bytes written |
+| `DUPLICATES_DROPPED` | BIGINT | Events skipped by watermark dedup |
+| `WRITE_ERRORS` | BIGINT | I/O errors encountered while writing |
+| `RECONNECT_COUNT` | BIGINT | Number of IO-thread reconnections |
+| `LAST_ERROR_NUMBER` | INT | Most recent error code (0 = none) |
+| `LAST_ERROR_MESSAGE` | VARCHAR(1024) | Most recent error description |
+| `LAST_ERROR_TIMESTAMP` | TIMESTAMP(6) | When the last error occurred |
+| `LAST_EVENT_TIMESTAMP` | TIMESTAMP(6) | Timestamp of the last appended event |
+| `LAST_HEARTBEAT_TIMESTAMP` | TIMESTAMP(6) | Last upstream heartbeat received |
+
+```sql
+SELECT CHANNEL_NAME, STATE, EVENTS_APPENDED, BYTES_APPENDED,
+       WRITE_ERRORS, LAST_ERROR_MESSAGE
+FROM performance_schema.replication_binlog_server_status;
+```
+
+### replication_binlog_server_storage
+
+Per-channel storage backend summary.
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `CHANNEL_NAME` | VARCHAR(64) | Channel name |
+| `STORAGE_TYPE` | VARCHAR(32) | Backend type (`FILE`) |
+| `STORAGE_URI` | VARCHAR(1024) | Resolved `file://` URI |
+| `STATUS` | VARCHAR(32) | `ACTIVE`, `IDLE`, or `FAILED` |
+| `FILE_COUNT` | BIGINT | Number of archive files (from binlog.index) |
+| `TOTAL_BYTES_ON_DISK` | BIGINT | Aggregate size of all archive files |
+| `OLDEST_FILE` | VARCHAR(512) | First file in the index |
+| `NEWEST_FILE` | VARCHAR(512) | Last file in the index |
+| `OLDEST_TIMESTAMP` | TIMESTAMP(6) | Earliest event timestamp across all files |
+| `NEWEST_TIMESTAMP` | TIMESTAMP(6) | Latest event timestamp across all files |
+| `GTID_SET_COVERED` | TEXT | Union of all GTIDs stored in this channel |
+
+```sql
+SELECT CHANNEL_NAME, STORAGE_TYPE, FILE_COUNT,
+       TOTAL_BYTES_ON_DISK, STATUS
+FROM performance_schema.replication_binlog_server_storage;
+```
+
+### replication_binlog_server_archive
+
+Per-file metadata for each binlog file in the archive. Enables
+answering "which file contains events from time T?" or "which file
+has GTID X?" without scanning the archive.
+
+| Column | Type | Description |
+| --- | --- | --- |
+| `CHANNEL_NAME` | VARCHAR(64) | Channel name |
+| `FILE_NAME` | VARCHAR(512) | Binlog archive file name |
+| `FILE_SIZE` | BIGINT | Size in bytes |
+| `EVENT_COUNT` | BIGINT | Number of events in this file |
+| `MIN_TIMESTAMP` | TIMESTAMP(6) | Earliest event timestamp |
+| `MAX_TIMESTAMP` | TIMESTAMP(6) | Latest event timestamp |
+| `PREVIOUS_GTID_SET` | TEXT | GTIDs already committed before this file |
+| `LAST_GTID_SET` | TEXT | GTIDs contained within this file |
+| `IS_ACTIVE` | VARCHAR(3) | `YES` if this is the file currently being written |
+
+```sql
+SELECT CHANNEL_NAME, FILE_NAME, FILE_SIZE, EVENT_COUNT,
+       MIN_TIMESTAMP, MAX_TIMESTAMP
+FROM performance_schema.replication_binlog_server_archive
+ORDER BY CHANNEL_NAME, FILE_NAME;
+```
+
+### Per-file .meta sidecars
+
+The component persists per-file metadata as `.meta` sidecar files
+alongside each binlog archive file:
+
+```
+/data/archive/src_a/
+├── binlog.index
+├── binlog.000001
+├── binlog.000001.meta    ← timestamp + GTID metadata
+├── binlog.000002
+├── binlog.000002.meta
+└── ...
+```
+
+These files are written automatically when a binlog file is rotated
+or the channel is stopped. They are loaded on recovery so that
+`replication_binlog_server_archive` is populated without rescanning
+the full archive.
+
+If `.meta` files are missing (e.g., after manual file manipulation),
+use the `binlog_server_rebuild_archive_index()` UDF to regenerate
+them.
+
 ## System variables
 
 | Variable | Scope | Type | Default | Description |
@@ -359,6 +468,17 @@ Downstream replicas connecting as `repl_primary` get events from
 | Function | Returns | Description |
 | --- | --- | --- |
 | `binlog_server_reload_user_channel_map()` | INT (mapping count) or NULL on failure | Re-reads the current `user_channel_map` spec and rebuilds the live routing map. Required after setting a `table://` URI; also useful to pick up table row changes without re-setting the sysvar. |
+| `binlog_server_rebuild_archive_index(channel)` | INT (files processed) or -1 on error | Scans every binlog file in the named channel's archive, extracts timestamps and GTID sets, and writes/updates `.meta` sidecar files. Use after manual file moves or if `.meta` files are missing. Pass the channel name as the single argument. |
+
+### Examples
+
+```sql
+-- Reload user routing after editing the table.
+SELECT binlog_server_reload_user_channel_map();
+
+-- Rebuild metadata sidecars for a channel.
+SELECT binlog_server_rebuild_archive_index('prod_primary');
+```
 
 ## Stopping and restarting
 
@@ -395,6 +515,21 @@ This guarantees that collection can resume seamlessly after any crash.
 ### Checking channel status
 
 ```sql
+-- Binlog server operational counters.
+SELECT * FROM performance_schema.replication_binlog_server_status
+WHERE CHANNEL_NAME = 'src_a'\G
+
+-- Storage summary (file count, total size).
+SELECT * FROM performance_schema.replication_binlog_server_storage
+WHERE CHANNEL_NAME = 'src_a'\G
+
+-- Per-file archive listing with timestamps and GTIDs.
+SELECT FILE_NAME, FILE_SIZE, MIN_TIMESTAMP, MAX_TIMESTAMP,
+       PREVIOUS_GTID_SET, LAST_GTID_SET
+FROM performance_schema.replication_binlog_server_archive
+WHERE CHANNEL_NAME = 'src_a'
+ORDER BY FILE_NAME;
+
 -- Standard replication status.
 SELECT * FROM performance_schema.replication_connection_status
 WHERE CHANNEL_NAME = 'src_a';

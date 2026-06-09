@@ -13,6 +13,7 @@
 #include <mysql/components/services/mysql_command_services.h>
 #include <mysql/components/services/mysql_current_thread_reader.h>
 #include <mysql/components/services/mysql_thd_kill_handler.h>
+#include <mysql/components/services/pfs_plugin_table_service.h>
 #include <mysql/components/services/udf_registration.h>
 #include <mysqld_error.h>
 
@@ -25,6 +26,9 @@
 #include "archive_sender.h"
 #include "binlog_archive.h"
 #include "log_helpers.h"
+#include "pfs_archive_table.h"
+#include "pfs_status_table.h"
+#include "pfs_storage_table.h"
 #include "user_channel_map_loader.h"
 
 // Service placeholders required by the component framework
@@ -52,6 +56,14 @@ REQUIRES_SERVICE_PLACEHOLDER_AS(mysql_command_error_info,
 REQUIRES_SERVICE_PLACEHOLDER_AS(mysql_current_thread_reader,
                                 current_thread_reader_srv);
 REQUIRES_SERVICE_PLACEHOLDER_AS(udf_registration, udf_registration_srv);
+
+// PFS table services
+REQUIRES_SERVICE_PLACEHOLDER(pfs_plugin_table_v1);
+REQUIRES_SERVICE_PLACEHOLDER(pfs_plugin_column_string_v2);
+REQUIRES_SERVICE_PLACEHOLDER(pfs_plugin_column_integer_v1);
+REQUIRES_SERVICE_PLACEHOLDER(pfs_plugin_column_bigint_v1);
+REQUIRES_SERVICE_PLACEHOLDER(pfs_plugin_column_timestamp_v2);
+REQUIRES_SERVICE_PLACEHOLDER(pfs_plugin_column_text_v1);
 
 // LogComponentErr uses these global pointers
 SERVICE_TYPE(log_builtins) *log_bi;
@@ -188,6 +200,47 @@ static long long binlog_server_reload_ucm_func(UDF_INIT *, UDF_ARGS *,
 }
 
 static void binlog_server_reload_ucm_deinit(UDF_INIT *) {}
+
+static bool binlog_server_rebuild_idx_init(UDF_INIT *initid, UDF_ARGS *args,
+                                           char *message) {
+  if (args->arg_count != 1 || args->arg_type[0] != STRING_RESULT) {
+    std::snprintf(message, MYSQL_ERRMSG_SIZE,
+                  "binlog_server_rebuild_archive_index(channel_name) "
+                  "requires one string argument");
+    return true;
+  }
+  initid->maybe_null = true;
+  return false;
+}
+
+static long long binlog_server_rebuild_idx_func(UDF_INIT *, UDF_ARGS *args,
+                                                unsigned char *is_null,
+                                                unsigned char *error) {
+  if (!g_archive || args->args[0] == nullptr) {
+    *is_null = 1;
+    *error = 0;
+    return 0;
+  }
+  const long long n = g_archive->rebuild_archive_index(args->args[0]);
+  if (n < 0) {
+    binlog_server::bslog(
+        WARNING_LEVEL,
+        "binlog_server: rebuild_archive_index('%s') failed: channel not found",
+        args->args[0]);
+    *is_null = 1;
+    *error = 0;
+    return 0;
+  }
+  binlog_server::bslog(
+      INFORMATION_LEVEL,
+      "binlog_server: rebuild_archive_index('%s') rebuilt %lld file(s)",
+      args->args[0], n);
+  *is_null = 0;
+  *error = 0;
+  return n;
+}
+
+static void binlog_server_rebuild_idx_deinit(UDF_INIT *) {}
 
 }  // extern "C"
 
@@ -346,6 +399,26 @@ static mysql_service_status_t component_init() {
     return 1;
   }
 
+  // Register PFS tables (non-fatal if they fail)
+  if (binlog_server::register_pfs_status_table(g_archive)) {
+    binlog_server::bslog(
+        WARNING_LEVEL,
+        "binlog_server: failed to register PFS table "
+        "replication_binlog_server_status");
+  }
+  if (binlog_server::register_pfs_storage_table(g_archive)) {
+    binlog_server::bslog(
+        WARNING_LEVEL,
+        "binlog_server: failed to register PFS table "
+        "replication_binlog_server_storage");
+  }
+  if (binlog_server::register_pfs_archive_table(g_archive)) {
+    binlog_server::bslog(
+        WARNING_LEVEL,
+        "binlog_server: failed to register PFS table "
+        "replication_binlog_server_archive");
+  }
+
   // Register reload UDF
   if (udf_registration_srv->udf_register(
           "binlog_server_reload_user_channel_map", INT_RESULT,
@@ -355,6 +428,17 @@ static mysql_service_status_t component_init() {
     binlog_server::bslog(WARNING_LEVEL,
                          "binlog_server: failed to register "
                          "binlog_server_reload_user_channel_map() UDF");
+  }
+
+  // Register rebuild archive index UDF
+  if (udf_registration_srv->udf_register(
+          "binlog_server_rebuild_archive_index", INT_RESULT,
+          reinterpret_cast<Udf_func_any>(binlog_server_rebuild_idx_func),
+          binlog_server_rebuild_idx_init,
+          binlog_server_rebuild_idx_deinit)) {
+    binlog_server::bslog(WARNING_LEVEL,
+                         "binlog_server: failed to register "
+                         "binlog_server_rebuild_archive_index() UDF");
   }
 
   // Apply initial user_channel_map spec (CSV applies; table:// may fail
@@ -389,7 +473,7 @@ static mysql_service_status_t component_deinit() {
   (void)dump_handler_register_srv->uninstall();
   binlog_server::ArchiveSender::instance().set_storage(nullptr);
 
-  // Unregister UDF first -- if a session is mid-call, refuse unload
+  // Unregister UDFs -- if a session is mid-call, refuse unload
   {
     int was_present = 0;
     bool unregistered = false;
@@ -413,6 +497,20 @@ static mysql_service_status_t component_deinit() {
       return 1;
     }
   }
+  {
+    int was_present = 0;
+    for (int i = 0; i < 10; ++i) {
+      if (!udf_registration_srv->udf_unregister(
+              "binlog_server_rebuild_archive_index", &was_present))
+        break;
+      if (was_present == 0) break;
+    }
+  }
+
+  // Unregister PFS tables (reverse order)
+  binlog_server::unregister_pfs_archive_table();
+  binlog_server::unregister_pfs_storage_table();
+  binlog_server::unregister_pfs_status_table();
 
   mysql_service_component_sys_variable_unregister->unregister_variable(
       "binlog_server", "user_channel_map");
@@ -454,6 +552,12 @@ REQUIRES_SERVICE(log_builtins), REQUIRES_SERVICE(log_builtins_string),
     REQUIRES_SERVICE_AS(mysql_current_thread_reader,
                         current_thread_reader_srv),
     REQUIRES_SERVICE_AS(udf_registration, udf_registration_srv),
+    REQUIRES_SERVICE(pfs_plugin_table_v1),
+    REQUIRES_SERVICE(pfs_plugin_column_string_v2),
+    REQUIRES_SERVICE(pfs_plugin_column_integer_v1),
+    REQUIRES_SERVICE(pfs_plugin_column_bigint_v1),
+    REQUIRES_SERVICE(pfs_plugin_column_timestamp_v2),
+    REQUIRES_SERVICE(pfs_plugin_column_text_v1),
     END_COMPONENT_REQUIRES();
 
 BEGIN_COMPONENT_METADATA(component_binlog_server)
