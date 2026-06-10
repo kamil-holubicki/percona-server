@@ -539,10 +539,8 @@ void register_handlers(httplib::Server &svr,
 
     std::string sql =
         "SELECT "
-        "DATE_FORMAT(CONVERT_TZ(MIN(MIN_EVENT_TIMESTAMP), "
-        "@@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%s') AS min_ts, "
-        "DATE_FORMAT(CONVERT_TZ(MAX(MAX_EVENT_TIMESTAMP), "
-        "@@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%s') AS max_ts, "
+        "DATE_FORMAT(MIN(MIN_EVENT_TIMESTAMP), '%Y-%m-%dT%H:%i:%s') AS min_ts, "
+        "DATE_FORMAT(MAX(MAX_EVENT_TIMESTAMP), '%Y-%m-%dT%H:%i:%s') AS max_ts, "
         "COALESCE("
         " (SELECT LAST_GTID_SET"
         "  FROM performance_schema.replication_binlog_server_archive"

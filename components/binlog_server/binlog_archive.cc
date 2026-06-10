@@ -2055,7 +2055,8 @@ static uint32_t parse_iso_timestamp(const char *s) {
     p = strptime(s, "%Y-%m-%d %H:%M:%S", &tm);
   }
   if (p == nullptr) return 0;
-  time_t t = timegm(&tm);
+  tm.tm_isdst = -1;
+  time_t t = mktime(&tm);
   return (t <= 0) ? 0 : static_cast<uint32_t>(t);
 }
 
@@ -2079,7 +2080,7 @@ static std::string format_iso_timestamp(uint32_t ts) {
   if (ts == 0) return "";
   time_t t = static_cast<time_t>(ts);
   struct tm tm {};
-  gmtime_r(&t, &tm);
+  localtime_r(&t, &tm);
   char buf[32];
   strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
   return buf;

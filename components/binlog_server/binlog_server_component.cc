@@ -14,6 +14,7 @@
 #include <mysql/components/services/mysql_current_thread_reader.h>
 #include <mysql/components/services/mysql_thd_kill_handler.h>
 #include <mysql/components/services/pfs_plugin_table_service.h>
+#include <mysql/components/services/udf_metadata.h>
 #include <mysql/components/services/udf_registration.h>
 #include <mysqld_error.h>
 
@@ -57,6 +58,7 @@ REQUIRES_SERVICE_PLACEHOLDER_AS(mysql_command_error_info,
 REQUIRES_SERVICE_PLACEHOLDER_AS(mysql_current_thread_reader,
                                 current_thread_reader_srv);
 REQUIRES_SERVICE_PLACEHOLDER_AS(udf_registration, udf_registration_srv);
+REQUIRES_SERVICE_PLACEHOLDER(mysql_udf_metadata);
 
 // PFS table services
 REQUIRES_SERVICE_PLACEHOLDER(pfs_plugin_table_v1);
@@ -520,6 +522,8 @@ static bool binlog_server_search_ts_init(UDF_INIT *initid, UDF_ARGS *args,
   initid->maybe_null = true;
   initid->max_length = 65535;
   initid->ptr = nullptr;
+  mysql_service_mysql_udf_metadata->result_set(
+      initid, "charset", const_cast<char *>("utf8mb4"));
   return false;
 }
 
@@ -564,6 +568,8 @@ static bool binlog_server_search_gtid_init(UDF_INIT *initid, UDF_ARGS *args,
   initid->maybe_null = true;
   initid->max_length = 65535;
   initid->ptr = nullptr;
+  mysql_service_mysql_udf_metadata->result_set(
+      initid, "charset", const_cast<char *>("utf8mb4"));
   return false;
 }
 
@@ -1122,6 +1128,7 @@ REQUIRES_SERVICE(log_builtins), REQUIRES_SERVICE(log_builtins_string),
     REQUIRES_SERVICE_AS(mysql_current_thread_reader,
                         current_thread_reader_srv),
     REQUIRES_SERVICE_AS(udf_registration, udf_registration_srv),
+    REQUIRES_SERVICE(mysql_udf_metadata),
     REQUIRES_SERVICE(pfs_plugin_table_v1),
     REQUIRES_SERVICE(pfs_plugin_column_string_v2),
     REQUIRES_SERVICE(pfs_plugin_column_integer_v1),

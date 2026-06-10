@@ -125,7 +125,7 @@ nav button:hover:not(.active) { color: var(--fg); background: var(--bg3); }
         </defs>
       </svg>
     </div>
-    <div class="refresh-info">Auto-refreshes every 5s</div>
+    <div class="refresh-info">Auto-refreshes every 1s</div>
   </div>
 
   <div class="panel" id="panel-sources">
@@ -622,6 +622,18 @@ async function refresh() {
     const channels = (status || []).map(s => s.CHANNEL_NAME).filter(Boolean);
     updateChannelDropdowns(channels);
 
+    // Auto-refresh active panel data
+    const activePanel = document.querySelector('.panel.active');
+    if (activePanel) {
+      if (activePanel.id === 'panel-archive') {
+        const ch = document.getElementById('archive-channel-select').value;
+        if (ch) loadArchive(ch);
+      } else if (activePanel.id === 'panel-search') {
+        const ch = document.getElementById('search-channel-select').value;
+        if (ch) loadRange(ch);
+      }
+    }
+
     document.getElementById('connection-status').innerHTML = '<span class="badge badge-ok">Connected</span>';
   } catch(e) {
     document.getElementById('connection-status').innerHTML = '<span class="badge badge-err">Disconnected</span>';
@@ -631,7 +643,7 @@ async function refresh() {
 // Initial load
 refresh();
 loadConfig();
-setInterval(refresh, 5000);
+setInterval(refresh, 1000);
 </script>
 </body>
 </html>

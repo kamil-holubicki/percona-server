@@ -551,7 +551,7 @@ a keyring or any special configuration.
 | `binlog_server_purge_channel(channel, up_to_file)` | INT (files purged) or NULL on error | Removes archive files from the oldest up to and including the named file. The active (tail) file can never be purged. |
 | `binlog_server_purge_before_gtid(channel, gtid_set)` | INT (files purged) or NULL on error | Removes archive files whose accumulated GTID set is fully contained in the given set. Files are processed from oldest to newest; stops at the first file not fully contained. |
 | `binlog_server_purge_before_timestamp(channel, unix_ts)` | INT (files purged) or NULL on error | Removes archive files whose `max_event_timestamp` is below the given Unix timestamp (seconds). |
-| `binlog_server_search_by_timestamp(channel, iso_timestamp)` | JSON string | Finds binlog files spanning the given timestamp. The timestamp must be ISO-8601 format (`YYYY-MM-DDTHH:MM:SS` or `YYYY-MM-DD HH:MM:SS`, UTC). Returns `{"status":"success","result":[...]}` with file details, or `{"status":"error","message":"..."}` on failure. |
+| `binlog_server_search_by_timestamp(channel, from, to)` | JSON string | Finds binlog files overlapping the given time range. Timestamps must be in `YYYY-MM-DDTHH:MM:SS` or `YYYY-MM-DD HH:MM:SS` format (server local time). Fractional seconds are accepted and ignored. Returns `{"status":"success","result":[...]}` with file details, or `{"status":"error","message":"..."}` on failure. |
 | `binlog_server_search_by_gtid_set(channel, gtid_set)` | JSON string | Finds the minimal set of binlog files needed to cover the given GTID set. Returns `{"status":"success","result":[...]}` with file details, or `{"status":"error","message":"..."}` on failure. |
 
 ### Examples
@@ -573,9 +573,9 @@ SELECT binlog_server_purge_before_timestamp('prod_primary', UNIX_TIMESTAMP() - 8
 SELECT binlog_server_purge_before_gtid('prod_primary',
     'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-100');
 
--- Search: find files containing events at or before a specific time (PITR).
+-- Search: find files overlapping a time range (PITR).
 SELECT binlog_server_search_by_timestamp('prod_primary',
-    '2026-06-10T14:30:00');
+    '2026-06-10T14:00:00', '2026-06-10T15:00:00');
 
 -- Search: find the minimal file set covering a GTID range.
 SELECT binlog_server_search_by_gtid_set('prod_primary',
@@ -886,10 +886,10 @@ curl -u admin:password -X POST \
 # Get available data range for a channel
 curl -u admin:password http://127.0.0.1:8440/api/v1/range/prod
 
-# Search by timestamp (ISO-8601 format, UTC)
+# Search by timestamp range (server local time)
 curl -u admin:password -X POST \
   -H "Content-Type: application/json" \
-  -d '{"channel":"prod","timestamp":"2026-06-10T14:30:00"}' \
+  -d '{"channel":"prod","from":"2026-06-10T14:00:00","to":"2026-06-10T15:00:00"}' \
   http://127.0.0.1:8440/api/v1/search/by-timestamp
 
 # Search by GTID set
