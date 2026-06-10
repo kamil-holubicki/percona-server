@@ -36,6 +36,7 @@
 - [Rewrite mode (stub)](#rewrite-mode-stub)
 - [Error code catalogue](#error-code-catalogue)
 - [Build wiring](#build-wiring)
+- [REST API component](#rest-api-component)
 
 ## Source map
 
@@ -898,6 +899,81 @@ columns to `mysql.slave_master_info`.
 `share/messages_to_error_log.txt` contains the `ER_BINLOG_SERVER_*`
 definitions under the "Percona Server 9.6 error log messages" section
 starting at error number 48350.
+
+## REST API component
+
+The REST API lives in a separate component (`component_binlog_server_rest_api`)
+that can be installed independently from `component_binlog_server`. It communicates
+with the core binlog server exclusively via SQL — querying PFS tables and invoking
+UDFs through the `mysql_command_*` internal services.
+
+### Architecture
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  component_binlog_server_rest_api.so                       │
+│                                                            │
+│  ┌──────────────┐   ┌───────────────┐   ┌──────────────┐ │
+│  │ httplib::     │──▶│ rest_handlers │──▶│ SqlExecutor  │ │
+│  │ Server thread │   │  (routing +   │   │  (mysql_cmd_ │ │
+│  │ (HTTP/S)     │   │   JSON build) │   │   factory)   │ │
+│  └──────────────┘   └───────────────┘   └──────────────┘ │
+│         ▲                                       │         │
+│         │                                       ▼         │
+│    TCP :8440                            internal SQL      │
+└────────────────────────────────────────────────────────────┘
+                                                  │
+                                                  ▼
+            ┌──────────────────────────────────────────┐
+            │ MySQL server (PFS tables, UDFs, sysvars) │
+            └──────────────────────────────────────────┘
+```
+
+### Key design decisions
+
+1. **No direct C++ coupling** — The REST API component does not link against
+   or call into `component_binlog_server` code. All data flows through standard
+   MySQL interfaces (SELECT from PFS, SELECT UDF, SET GLOBAL).
+
+2. **Vendored cpp-httplib** — A single-header library (MIT license) provides
+   HTTP and HTTPS serving with no external runtime dependencies beyond OpenSSL.
+
+3. **Runtime-loaded dashboard** — The SPA HTML is read from
+   `binlog_server_rest_api_dashboard.html` in the plugin directory on every
+   HTTP request to `GET /`. Edit the file and refresh your browser — no
+   rebuild or restart needed. CMake copies `dashboard/index.html` to the
+   build output plugin directories automatically. The component locates its
+   own `.so` via `dladdr()` and looks for the HTML file in the same directory.
+
+4. **Thread model** — One `std::thread` runs `httplib::Server::listen()`. The
+   library spawns additional worker threads per request internally. Each
+   worker thread is initialized for MySQL service access via the
+   `mysql_command_thread` service (`init()` / `end()`) using a `thread_local`
+   guard. The component's `deinit()` calls `Server::stop()` + `join()` for
+   clean shutdown.
+
+5. **Authentication** — HTTP Basic Auth over the wire. Credentials are stored
+   in component system variables (`username`, `password`). HTTPS is recommended
+   for production; plain HTTP is provided for development/local use.
+
+6. **SQL execution** — `SqlExecutor` calls `mysql_command_thread->init()` once
+   per httplib worker thread (via `thread_local` flag), then opens an internal
+   connection as `mysql.session@localhost` for each request, executes the query,
+   collects column names via `mysql_command_field_metadata`, and closes. This
+   pattern follows the same approach used by `percona_telemetry_component`.
+
+### Endpoint routing
+
+All API endpoints live under `/api/v1/` and return `application/json`.
+The dashboard is served at `/` as `text/html`. The health endpoint
+(`/api/v1/health`) is exempt from authentication for load-balancer probes.
+
+### System variable lifecycle
+
+Variables are registered at `component_init()` and unregistered at
+`component_deinit()`. The HTTP server thread is launched once `password`
+is non-empty. Changing variables at runtime (e.g., `SET GLOBAL ... .port`)
+requires uninstalling and reinstalling the component to take effect.
 
 ---
 

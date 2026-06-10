@@ -1,0 +1,48 @@
+--source include/have_binlog_format_row.inc
+
+# Requires curl for REST API testing
+--exec which curl > /dev/null 2>&1 || exit 1
+
+
+--echo #
+--echo # Binlog Server REST API component test
+--echo #
+
+--echo # Install both the core binlog server component and the REST API
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL COMPONENT 'file://component_binlog_server_rest_api';
+
+--echo # Verify system variables are registered (defaults: admin/admin)
+SELECT @@GLOBAL.binlog_server_rest_api.bind_address;
+SELECT @@GLOBAL.binlog_server_rest_api.port;
+SELECT @@GLOBAL.binlog_server_rest_api.username;
+
+--echo # Server starts automatically with default credentials
+--sleep 1
+
+--echo # Test: health endpoint (no auth required)
+--exec curl -sf http://127.0.0.1:8440/api/v1/health
+
+--echo # Test: status returns 401 without auth (curl -f returns exit code 22)
+--error 22
+--exec curl -sf http://127.0.0.1:8440/api/v1/status
+
+--echo # Test: status endpoint with Basic Auth (empty array since no channels configured)
+--exec curl -sf -u admin:admin http://127.0.0.1:8440/api/v1/status
+
+--echo # Test: variables endpoint returns binlog_server variables
+--exec curl -sf -u admin:admin http://127.0.0.1:8440/api/v1/variables
+
+--echo # Test: topology endpoint
+--exec curl -sf -u admin:admin http://127.0.0.1:8440/api/v1/topology
+
+--echo # Test: dashboard page returns HTML
+--exec curl -sf http://127.0.0.1:8440/ | grep -c "Binlog Server Dashboard"
+
+--echo # Uninstall (REST API first, then core)
+UNINSTALL COMPONENT 'file://component_binlog_server_rest_api';
+UNINSTALL COMPONENT 'file://component_binlog_server';
+
+--echo # Verify clean unload -- sysvar no longer exists
+--error ER_UNKNOWN_SYSTEM_VARIABLE
+SELECT @@GLOBAL.binlog_server_rest_api.port;

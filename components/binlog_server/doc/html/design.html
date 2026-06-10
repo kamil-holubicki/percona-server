@@ -99,6 +99,7 @@
 <li><a href="#rewrite-mode-stub">Rewrite mode (stub)</a></li>
 <li><a href="#error-code-catalogue">Error code catalogue</a></li>
 <li><a href="#build-wiring">Build wiring</a></li>
+<li><a href="#rest-api-component">REST API component</a></li>
 </ul>
 <h2 id="source-map">Source map<a class="headerlink" href="#source-map" title="Permanent link">&#x00B6;</a></h2>
 <table>
@@ -1001,6 +1002,80 @@ columns to <code>mysql.slave_master_info</code>.</p>
 <p><code>share/messages_to_error_log.txt</code> contains the <code>ER_BINLOG_SERVER_*</code>
 definitions under the "Percona Server 9.6 error log messages" section
 starting at error number 48350.</p>
+<h2 id="rest-api-component">REST API component<a class="headerlink" href="#rest-api-component" title="Permanent link">&#x00B6;</a></h2>
+<p>The REST API lives in a separate component (<code>component_binlog_server_rest_api</code>)
+that can be installed independently from <code>component_binlog_server</code>. It communicates
+with the core binlog server exclusively via SQL — querying PFS tables and invoking
+UDFs through the <code>mysql_command_*</code> internal services.</p>
+<h3 id="architecture">Architecture<a class="headerlink" href="#architecture" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code>┌────────────────────────────────────────────────────────────┐
+│  component_binlog_server_rest_api.so                       │
+│                                                            │
+│  ┌──────────────┐   ┌───────────────┐   ┌──────────────┐ │
+│  │ httplib::     │──▶│ rest_handlers │──▶│ SqlExecutor  │ │
+│  │ Server thread │   │  (routing +   │   │  (mysql_cmd_ │ │
+│  │ (HTTP/S)     │   │   JSON build) │   │   factory)   │ │
+│  └──────────────┘   └───────────────┘   └──────────────┘ │
+│         ▲                                       │         │
+│         │                                       ▼         │
+│    TCP :8440                            internal SQL      │
+└────────────────────────────────────────────────────────────┘
+                                                  │
+                                                  ▼
+            ┌──────────────────────────────────────────┐
+            │ MySQL server (PFS tables, UDFs, sysvars) │
+            └──────────────────────────────────────────┘
+</code></pre></div>
+
+<h3 id="key-design-decisions">Key design decisions<a class="headerlink" href="#key-design-decisions" title="Permanent link">&#x00B6;</a></h3>
+<ol>
+<li>
+<p><strong>No direct C++ coupling</strong> — The REST API component does not link against
+   or call into <code>component_binlog_server</code> code. All data flows through standard
+   MySQL interfaces (SELECT from PFS, SELECT UDF, SET GLOBAL).</p>
+</li>
+<li>
+<p><strong>Vendored cpp-httplib</strong> — A single-header library (MIT license) provides
+   HTTP and HTTPS serving with no external runtime dependencies beyond OpenSSL.</p>
+</li>
+<li>
+<p><strong>Runtime-loaded dashboard</strong> — The SPA HTML is read from
+   <code>binlog_server_rest_api_dashboard.html</code> in the plugin directory on every
+   HTTP request to <code>GET /</code>. Edit the file and refresh your browser — no
+   rebuild or restart needed. CMake copies <code>dashboard/index.html</code> to the
+   build output plugin directories automatically. The component locates its
+   own <code>.so</code> via <code>dladdr()</code> and looks for the HTML file in the same directory.</p>
+</li>
+<li>
+<p><strong>Thread model</strong> — One <code>std::thread</code> runs <code>httplib::Server::listen()</code>. The
+   library spawns additional worker threads per request internally. Each
+   worker thread is initialized for MySQL service access via the
+   <code>mysql_command_thread</code> service (<code>init()</code> / <code>end()</code>) using a <code>thread_local</code>
+   guard. The component's <code>deinit()</code> calls <code>Server::stop()</code> + <code>join()</code> for
+   clean shutdown.</p>
+</li>
+<li>
+<p><strong>Authentication</strong> — HTTP Basic Auth over the wire. Credentials are stored
+   in component system variables (<code>username</code>, <code>password</code>). HTTPS is recommended
+   for production; plain HTTP is provided for development/local use.</p>
+</li>
+<li>
+<p><strong>SQL execution</strong> — <code>SqlExecutor</code> calls <code>mysql_command_thread-&gt;init()</code> once
+   per httplib worker thread (via <code>thread_local</code> flag), then opens an internal
+   connection as <code>mysql.session@localhost</code> for each request, executes the query,
+   collects column names via <code>mysql_command_field_metadata</code>, and closes. This
+   pattern follows the same approach used by <code>percona_telemetry_component</code>.</p>
+</li>
+</ol>
+<h3 id="endpoint-routing">Endpoint routing<a class="headerlink" href="#endpoint-routing" title="Permanent link">&#x00B6;</a></h3>
+<p>All API endpoints live under <code>/api/v1/</code> and return <code>application/json</code>.
+The dashboard is served at <code>/</code> as <code>text/html</code>. The health endpoint
+(<code>/api/v1/health</code>) is exempt from authentication for load-balancer probes.</p>
+<h3 id="system-variable-lifecycle">System variable lifecycle<a class="headerlink" href="#system-variable-lifecycle" title="Permanent link">&#x00B6;</a></h3>
+<p>Variables are registered at <code>component_init()</code> and unregistered at
+<code>component_deinit()</code>. The HTTP server thread is launched once <code>password</code>
+is non-empty. Changing variables at runtime (e.g., <code>SET GLOBAL ... .port</code>)
+requires uninstalling and reinstalling the component to take effect.</p>
 <hr>
 <p><a href="index.html">&larr; Back to index</a> &middot;
 <a href="overview.html">Overview</a> &middot;

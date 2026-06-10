@@ -1308,6 +1308,7 @@ int BinlogArchive::append_event(const char *channel_name,
     }
     return 1;
   }
+  cs.out->flush();
 
   cs.io_failure_count = 0;
   if (log_pos > 0) cs.last_source_log_pos = log_pos;

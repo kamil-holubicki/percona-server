@@ -212,7 +212,7 @@ flowchart LR
 </tr>
 </tbody>
 </table>
-<h2 id="current-status-phase-16">Current status (Phase 1–6)<a class="headerlink" href="#current-status-phase-16" title="Permanent link">&#x00B6;</a></h2>
+<h2 id="current-status-phase-17">Current status (Phase 1–7)<a class="headerlink" href="#current-status-phase-17" title="Permanent link">&#x00B6;</a></h2>
 <p><strong>Phase 1</strong> — collection path:</p>
 <ul>
 <li>Receive binlogs from upstream sources via the IO thread</li>
@@ -269,6 +269,17 @@ flowchart LR
 <li>Keyring integration via <code>component_keyring_file</code> (any keyring component works)</li>
 <li><code>StorageWriteStream</code> / <code>StorageReadStream</code> abstractions for storage-agnostic I/O</li>
 <li>Encryption operates above the storage backend: same logic works for file:// and future S3</li>
+</ul>
+<p><strong>Phase 7</strong> — REST API + web dashboard:</p>
+<ul>
+<li>Separate <code>component_binlog_server_rest_api</code> component (independent from core)</li>
+<li>Embedded HTTP/HTTPS server (cpp-httplib) on configurable port (default 8440)</li>
+<li>HTTP Basic Auth with configurable username/password</li>
+<li>HTTPS support via configurable PEM cert/key paths</li>
+<li>Full REST API: status, storage, archive, topology, purge, key rotation, variable management</li>
+<li>Self-contained single-page web dashboard with live topology diagram (loaded from file at runtime — edit and refresh)</li>
+<li>Dashboard shows sources, channels, storage, downstream replicas as animated SVG</li>
+<li>All operations accessible via both SQL and REST endpoints</li>
 </ul>
 <p><strong>Not yet implemented</strong> (planned for later phases):
 - S3-compatible object storage backend (stubs in place)

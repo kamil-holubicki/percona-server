@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Binlog Server Dashboard</title>
+<style>
+:root {
+  --bg: #0f1419;
+  --bg2: #1a2332;
+  --bg3: #243447;
+  --fg: #e8edf3;
+  --fg2: #8899aa;
+  --accent: #4fc3f7;
+  --green: #66bb6a;
+  --amber: #ffa726;
+  --red: #ef5350;
+  --border: #2d4055;
+  --radius: 8px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --mono: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f5f7fa;
+    --bg2: #ffffff;
+    --bg3: #e8edf3;
+    --fg: #1a2332;
+    --fg2: #5a6a7a;
+    --border: #d0d8e0;
+  }
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: var(--font); background: var(--bg); color: var(--fg); min-height: 100vh; }
+.app { max-width: 1400px; margin: 0 auto; padding: 20px; }
+header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+header h1 { font-size: 1.5rem; font-weight: 600; }
+header h1 span { color: var(--accent); }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; }
+.badge-ok { background: var(--green); color: #000; }
+.badge-warn { background: var(--amber); color: #000; }
+.badge-err { background: var(--red); color: #fff; }
+.badge-enc { background: #7c4dff; color: #fff; }
+
+nav { display: flex; gap: 4px; background: var(--bg2); border-radius: var(--radius); padding: 4px; border: 1px solid var(--border); }
+nav button { padding: 8px 16px; border: none; background: transparent; color: var(--fg2); border-radius: 6px; cursor: pointer; font-size: 0.85rem; font-weight: 500; transition: all 0.15s; }
+nav button.active { background: var(--accent); color: #000; font-weight: 600; }
+nav button:hover:not(.active) { color: var(--fg); background: var(--bg3); }
+
+.panel { display: none; margin-top: 20px; }
+.panel.active { display: block; }
+
+/* Topology SVG */
+#topology-container { background: var(--bg2); border-radius: var(--radius); border: 1px solid var(--border); padding: 24px; min-height: 400px; position: relative; }
+#topology-svg { width: 100%; min-height: 400px; }
+.topo-node { cursor: default; }
+.topo-node rect, .topo-node circle { transition: all 0.2s; }
+.topo-node:hover rect, .topo-node:hover circle { filter: brightness(1.2); }
+.topo-label { font-family: var(--font); font-size: 11px; fill: var(--fg); text-anchor: middle; }
+.topo-sublabel { font-family: var(--font); font-size: 9px; fill: var(--fg2); text-anchor: middle; }
+.topo-arrow { stroke: var(--accent); stroke-width: 2; fill: none; marker-end: url(#arrowhead); }
+.topo-arrow-animated { stroke-dasharray: 8 4; animation: flowDash 1s linear infinite; }
+@keyframes flowDash { to { stroke-dashoffset: -12; } }
+
+/* Cards grid */
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+.cards-vertical { display: flex; flex-direction: column; gap: 16px; }
+.card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
+.card h3 { font-size: 0.9rem; color: var(--fg2); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+.card-row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 0.85rem; }
+.card-row:last-child { border-bottom: none; }
+.card-row .label { color: var(--fg2); }
+.card-row .value { font-family: var(--mono); font-weight: 500; }
+
+/* Table */
+.data-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+.data-table th { text-align: left; padding: 10px 12px; background: var(--bg3); color: var(--fg2); font-weight: 600; text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.5px; }
+.data-table td { padding: 8px 12px; border-bottom: 1px solid var(--border); font-family: var(--mono); }
+.data-table tr:hover td { background: var(--bg3); }
+
+/* Operations */
+.ops-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+.op-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+.op-card h3 { margin-bottom: 12px; font-size: 0.95rem; }
+.op-card input, .op-card select { width: 100%; padding: 8px 12px; margin-bottom: 8px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; color: var(--fg); font-family: var(--mono); font-size: 0.82rem; }
+.op-card button { padding: 8px 16px; background: var(--accent); color: #000; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; font-size: 0.82rem; }
+.op-card button:hover { filter: brightness(1.1); }
+.op-result { margin-top: 8px; padding: 8px; background: var(--bg); border-radius: 4px; font-family: var(--mono); font-size: 0.78rem; color: var(--fg2); white-space: pre-wrap; display: none; }
+
+/* Config */
+.config-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.config-row .name { flex: 1; font-family: var(--mono); font-size: 0.82rem; }
+.config-row input { flex: 2; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--fg); font-family: var(--mono); font-size: 0.82rem; }
+.config-row button { padding: 6px 12px; background: var(--bg3); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 0.78rem; }
+
+.refresh-info { text-align: right; font-size: 0.72rem; color: var(--fg2); margin-top: 8px; }
+.error-msg { color: var(--red); font-size: 0.82rem; padding: 12px; background: rgba(239,83,80,0.1); border-radius: var(--radius); margin: 12px 0; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1><span>Binlog Server</span> Dashboard</h1>
+    <div id="connection-status"></div>
+  </header>
+
+  <nav id="main-nav">
+    <button class="active" data-panel="topology">Topology</button>
+    <button data-panel="sources">Sources</button>
+    <button data-panel="replicas">Replicas</button>
+    <button data-panel="storage">Storage</button>
+    <button data-panel="archive">Archive</button>
+    <button data-panel="operations">Operations</button>
+    <button data-panel="config">Configuration</button>
+  </nav>
+
+  <div class="panel active" id="panel-topology">
+    <div id="topology-container">
+      <svg id="topology-svg" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="var(--accent)"/>
+          </marker>
+        </defs>
+      </svg>
+    </div>
+    <div class="refresh-info">Auto-refreshes every 5s</div>
+  </div>
+
+  <div class="panel" id="panel-sources">
+    <div class="cards-vertical" id="sources-cards"></div>
+  </div>
+
+  <div class="panel" id="panel-replicas">
+    <div class="cards-vertical" id="replicas-cards"></div>
+  </div>
+
+  <div class="panel" id="panel-storage">
+    <div class="cards-vertical" id="storage-cards"></div>
+  </div>
+
+  <div class="panel" id="panel-archive">
+    <div style="margin-bottom: 12px;">
+      <select id="archive-channel-select" style="padding: 8px 12px; background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; color: var(--fg); font-family: var(--mono);">
+        <option value="">Select channel...</option>
+      </select>
+    </div>
+    <div id="archive-table-container"></div>
+  </div>
+
+  <div class="panel" id="panel-operations">
+    <div class="ops-grid">
+      <div class="op-card">
+        <h3>Purge by File</h3>
+        <select id="purge-file-ch" class="channel-select"><option value="">Select channel...</option></select>
+        <input type="text" id="purge-file-name" placeholder="binlog.000005">
+        <button onclick="doPurgeFile()">Purge</button>
+        <div class="op-result" id="purge-file-result"></div>
+      </div>
+      <div class="op-card">
+        <h3>Purge by Timestamp</h3>
+        <select id="purge-ts-ch" class="channel-select"><option value="">Select channel...</option></select>
+        <input type="number" id="purge-ts-val" placeholder="unix timestamp">
+        <button onclick="doPurgeTs()">Purge</button>
+        <div class="op-result" id="purge-ts-result"></div>
+      </div>
+      <div class="op-card">
+        <h3>Purge by GTID</h3>
+        <select id="purge-gtid-ch" class="channel-select"><option value="">Select channel...</option></select>
+        <input type="text" id="purge-gtid-val" placeholder="uuid:1-100">
+        <button onclick="doPurgeGtid()">Purge</button>
+        <div class="op-result" id="purge-gtid-result"></div>
+      </div>
+      <div class="op-card">
+        <h3>Rotate Encryption Key</h3>
+        <select id="rotate-ch" class="channel-select"><option value="">Select channel...</option></select>
+        <button onclick="doRotateKey()">Rotate</button>
+        <div class="op-result" id="rotate-result"></div>
+      </div>
+      <div class="op-card">
+        <h3>Reload User Channel Map</h3>
+        <button onclick="doReloadMap()">Reload</button>
+        <div class="op-result" id="reload-result"></div>
+      </div>
+      <div class="op-card">
+        <h3>Rebuild Archive Index</h3>
+        <select id="rebuild-ch" class="channel-select"><option value="">Select channel...</option></select>
+        <button onclick="doRebuildIndex()">Rebuild</button>
+        <div class="op-result" id="rebuild-result"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-config">
+    <div class="card">
+      <h3>System Variables</h3>
+      <div id="config-vars"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+
+function getAuth() {
+  const stored = sessionStorage.getItem('bs_dashboard_auth');
+  if (stored) return stored;
+  const user = prompt('REST API Username:', 'admin');
+  const pass = prompt('REST API Password:');
+  if (user && pass) {
+    const cred = 'Basic ' + btoa(user + ':' + pass);
+    sessionStorage.setItem('bs_dashboard_auth', cred);
+    return cred;
+  }
+  return '';
+}
+
+async function api(path, opts = {}) {
+  const auth = getAuth();
+  if (!auth) throw new Error('No credentials');
+  const res = await fetch(API + path, {
+    ...opts,
+    headers: { 'Authorization': auth, 'Content-Type': 'application/json', ...(opts.headers || {}) }
+  });
+  if (res.status === 401) {
+    sessionStorage.removeItem('bs_dashboard_auth');
+    throw new Error('Unauthorized');
+  }
+  return res.json();
+}
+
+// Navigation
+document.querySelectorAll('#main-nav button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#main-nav button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('panel-' + btn.dataset.panel).classList.add('active');
+  });
+});
+
+// Topology rendering
+function renderTopology(data) {
+  const svg = document.getElementById('topology-svg');
+  const W = svg.clientWidth || 900;
+
+  const sources = data.sources || [];
+  const channels = data.channels || [];
+  const downstream = data.downstream || [];
+
+  const srcCount = sources.length;
+  const dstCount = downstream.length;
+  const maxVertical = Math.max(srcCount, dstCount, 1);
+  const H = Math.max(400, maxVertical * 100 + 80);
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  svg.style.height = H + 'px';
+
+  let html = svg.querySelector('defs').outerHTML;
+
+  const colSrc = W * 0.15;
+  const colHub = W * 0.5;
+  const colDst = W * 0.85;
+
+  const nodeW = 130;
+  const nodeH = 56;
+  const hubW = 150;
+  const hubH = 64;
+
+  // Binlog Server node (center)
+  const hubY = H / 2;
+  const chInfo = channels.map(ch => {
+    const encrypted = (ch.ENCRYPTION || '') === 'ON';
+    return (ch.CHANNEL_NAME || '') + (encrypted ? ' 🔒' : '');
+  }).join(', ') || 'no channels';
+  html += `<g class="topo-node" transform="translate(${colHub},${hubY})">
+    <rect x="${-hubW/2}" y="${-hubH/2}" width="${hubW}" height="${hubH}" rx="10" fill="var(--bg2)" stroke="var(--accent)" stroke-width="2.5"/>
+    <text class="topo-label" y="-8" style="font-size:12px;font-weight:700;fill:var(--accent)">Binlog Server</text>
+    <text class="topo-sublabel" y="8">${channels.length} channel${channels.length !== 1 ? 's' : ''}</text>
+    <text class="topo-sublabel" y="20">${chInfo.length > 28 ? chInfo.slice(0, 26) + '…' : chInfo}</text>
+  </g>`;
+
+  // Draw source nodes
+  sources.forEach((s, i) => {
+    const y = (H / (srcCount + 1)) * (i + 1);
+    const state = (s.SERVICE_STATE || '').toLowerCase();
+    const color = state === 'on' ? 'var(--green)' : 'var(--amber)';
+    const host = s.SOURCE_HOST || 'source';
+    const port = s.SOURCE_PORT || '3306';
+    const ch = s.CHANNEL_NAME || '';
+    html += `<g class="topo-node" transform="translate(${colSrc},${y})">
+      <rect x="${-nodeW/2}" y="${-nodeH/2}" width="${nodeW}" height="${nodeH}" rx="8" fill="var(--bg3)" stroke="${color}" stroke-width="2"/>
+      <text class="topo-label" y="-8">${host}:${port}</text>
+      <text class="topo-sublabel" y="8">${ch}</text>
+      <text class="topo-sublabel" y="20" style="fill:${color}">● ${state === 'on' ? 'collecting' : state || 'unknown'}</text>
+    </g>`;
+    // Arrow: source → binlog server
+    html += `<line class="topo-arrow topo-arrow-animated" x1="${colSrc + nodeW/2}" y1="${y}" x2="${colHub - hubW/2}" y2="${hubY}"/>`;
+  });
+
+  // Draw downstream replica nodes
+  downstream.forEach((d, i) => {
+    const y = (H / (dstCount + 1)) * (i + 1);
+    const host = (d.HOST || 'replica');
+    const user = d.USER || '';
+    const channel = d.CHANNEL || d.SERVE_CHANNEL || '';
+    html += `<g class="topo-node" transform="translate(${colDst},${y})">
+      <rect x="${-nodeW/2}" y="${-nodeH/2}" width="${nodeW}" height="${nodeH}" rx="8" fill="var(--bg3)" stroke="var(--green)" stroke-width="2"/>
+      <text class="topo-label" y="-8">${host}</text>
+      <text class="topo-sublabel" y="8">${user}${channel ? ' → ' + channel : ''}</text>
+      <text class="topo-sublabel" y="20" style="fill:var(--green)">● connected</text>
+    </g>`;
+    // Arrow: binlog server → replica
+    html += `<line class="topo-arrow topo-arrow-animated" x1="${colHub + hubW/2}" y1="${hubY}" x2="${colDst - nodeW/2}" y2="${y}"/>`;
+  });
+
+  // Placeholder if no data
+  if (srcCount === 0 && channels.length === 0 && dstCount === 0) {
+    html += `<text x="${W/2}" y="${H/2}" text-anchor="middle" fill="var(--fg2)" font-size="14">No channels configured yet</text>`;
+  }
+
+  svg.innerHTML = html;
+}
+
+// Sources tab (collection channels status)
+function renderSources(data) {
+  const el = document.getElementById('sources-cards');
+  if (!data || data.length === 0) { el.innerHTML = '<div class="error-msg">No channels found</div>'; return; }
+  el.innerHTML = data.map(ch => {
+    const rows = Object.entries(ch).map(([k,v]) =>
+      `<div class="card-row"><span class="label">${k}</span><span class="value">${v}</span></div>`
+    ).join('');
+    return `<div class="card"><h3>${ch.CHANNEL_NAME || 'unknown'}</h3>${rows}</div>`;
+  }).join('');
+}
+
+// Replicas tab (downstream dump threads)
+function renderReplicas(data) {
+  const el = document.getElementById('replicas-cards');
+  if (!data || data.length === 0) { el.innerHTML = '<div class="error-msg">No downstream replicas connected</div>'; return; }
+  el.innerHTML = data.map(d => {
+    const rows = Object.entries(d).map(([k,v]) =>
+      `<div class="card-row"><span class="label">${k}</span><span class="value">${v}</span></div>`
+    ).join('');
+    const title = (d.USER || 'replica') + '@' + (d.HOST || '?');
+    return `<div class="card"><h3>${title}</h3>${rows}</div>`;
+  }).join('');
+}
+
+// Storage tab
+function renderStorage(data) {
+  const el = document.getElementById('storage-cards');
+  if (!data || data.length === 0) { el.innerHTML = '<div class="error-msg">No storage data</div>'; return; }
+  el.innerHTML = data.map(s => {
+    const rows = Object.entries(s).map(([k,v]) =>
+      `<div class="card-row"><span class="label">${k}</span><span class="value">${v}</span></div>`
+    ).join('');
+    return `<div class="card"><h3>${s.CHANNEL_NAME || 'unknown'}</h3>${rows}</div>`;
+  }).join('');
+}
+
+// Archive table
+async function loadArchive(channel) {
+  if (!channel) return;
+  try {
+    const data = await api('/api/v1/archive/' + encodeURIComponent(channel));
+    const container = document.getElementById('archive-table-container');
+    if (!data || data.length === 0) { container.innerHTML = '<div class="error-msg">No archive files</div>'; return; }
+    const cols = Object.keys(data[0]);
+    let html = '<table class="data-table"><thead><tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr></thead><tbody>';
+    html += data.map(row => '<tr>' + cols.map(c => `<td>${row[c] || ''}</td>`).join('') + '</tr>').join('');
+    html += '</tbody></table>';
+    container.innerHTML = html;
+  } catch(e) { document.getElementById('archive-table-container').innerHTML = `<div class="error-msg">${e.message}</div>`; }
+}
+
+document.getElementById('archive-channel-select').addEventListener('change', e => loadArchive(e.target.value));
+
+// Operations
+async function opPost(url, body, resultId) {
+  const el = document.getElementById(resultId);
+  el.style.display = 'block';
+  el.textContent = 'Working...';
+  try {
+    const r = await api(url, { method: 'POST', body: JSON.stringify(body) });
+    el.textContent = JSON.stringify(r, null, 2);
+  } catch(e) { el.textContent = 'Error: ' + e.message; }
+}
+
+function doPurgeFile() { opPost('/api/v1/purge/by-file', { channel: document.getElementById('purge-file-ch').value, file: document.getElementById('purge-file-name').value }, 'purge-file-result'); }
+function doPurgeTs() { opPost('/api/v1/purge/by-timestamp', { channel: document.getElementById('purge-ts-ch').value, timestamp: parseInt(document.getElementById('purge-ts-val').value) }, 'purge-ts-result'); }
+function doPurgeGtid() { opPost('/api/v1/purge/by-gtid', { channel: document.getElementById('purge-gtid-ch').value, gtid_set: document.getElementById('purge-gtid-val').value }, 'purge-gtid-result'); }
+function doRotateKey() { opPost('/api/v1/rotate-key', { channel: document.getElementById('rotate-ch').value }, 'rotate-result'); }
+function doReloadMap() { opPost('/api/v1/reload-map', {}, 'reload-result'); }
+function doRebuildIndex() { opPost('/api/v1/rebuild-index', { channel: document.getElementById('rebuild-ch').value }, 'rebuild-result'); }
+
+// Config
+async function loadConfig() {
+  try {
+    const vars = await api('/api/v1/variables');
+    const el = document.getElementById('config-vars');
+    el.innerHTML = Object.entries(vars).map(([k, v]) =>
+      `<div class="config-row">
+        <span class="name">${k}</span>
+        <input type="text" value="${v}" id="cfg-${k}">
+        <button onclick="setVar('${k}')">Set</button>
+      </div>`
+    ).join('');
+  } catch(e) {}
+}
+
+async function setVar(name) {
+  const val = document.getElementById('cfg-' + name).value;
+  try { await api('/api/v1/variables/' + encodeURIComponent(name), { method: 'PUT', body: JSON.stringify({ value: val }) }); }
+  catch(e) { alert('Error: ' + e.message); }
+}
+
+// Update all channel dropdowns (archive + operations)
+function updateChannelDropdowns(channels) {
+  const opts = '<option value="">Select channel...</option>' +
+    channels.map(c => `<option value="${c}">${c}</option>`).join('');
+
+  // Archive dropdown (preserve selection)
+  const archSel = document.getElementById('archive-channel-select');
+  const archCur = archSel.value;
+  archSel.innerHTML = opts;
+  if (archCur && channels.includes(archCur)) archSel.value = archCur;
+
+  // Operations dropdowns (preserve selections)
+  document.querySelectorAll('.channel-select').forEach(sel => {
+    const cur = sel.value;
+    sel.innerHTML = opts;
+    if (cur && channels.includes(cur)) sel.value = cur;
+  });
+}
+
+// Main refresh loop
+async function refresh() {
+  try {
+    const [topo, status, storage] = await Promise.all([
+      api('/api/v1/topology'),
+      api('/api/v1/status'),
+      api('/api/v1/storage')
+    ]);
+    renderTopology(topo);
+    renderSources(status);
+    renderReplicas(topo.downstream || []);
+    renderStorage(storage);
+
+    const channels = (status || []).map(s => s.CHANNEL_NAME).filter(Boolean);
+    updateChannelDropdowns(channels);
+
+    document.getElementById('connection-status').innerHTML = '<span class="badge badge-ok">Connected</span>';
+  } catch(e) {
+    document.getElementById('connection-status').innerHTML = '<span class="badge badge-err">Disconnected</span>';
+  }
+}
+
+// Initial load
+refresh();
+loadConfig();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

@@ -124,6 +124,16 @@ percona-server/
 │   ├── log_helpers.h / .cc          # bslog / bslog_code logging wrappers
 │   └── doc/                          # this documentation
 │
+├── components/binlog_server_rest_api/   # Phase 7: REST API component
+│   ├── CMakeLists.txt
+│   ├── binlog_server_rest_api.cc    # component lifecycle, sysvar registration, HTTP server thread
+│   ├── rest_handlers.cc / .h        # REST endpoint implementations
+│   ├── sql_executor.cc / .h         # internal SQL execution via mysql_command_* services
+│   ├── json_helpers.h               # lightweight JSON serialization
+│   ├── httplib.h                    # vendored cpp-httplib (single-header HTTP/HTTPS server)
+│   └── dashboard/
+│       └── index.html               # self-contained SPA with live topology diagram
+│
 ├── scripts/
 │   ├── mysql_system_tables.sql       # DDL for slave_master_info columns
 │   └── mysql_system_tables_fix.sql   # ALTER for upgrades
@@ -347,6 +357,21 @@ END_SERVICE_DEFINITION(mysql_binlog_dump_handler_io)
 | `keyring_generator` | `encryption.cc` | Generate new master keys in the keyring |
 | `keyring_reader_with_status` | `encryption.cc` | Read master key material from the keyring |
 | `keyring_writer` | `encryption.cc` | Store/remove master keys during rotation |
+
+### Services acquired by `component_binlog_server_rest_api` (Phase 7)
+
+| Service | Purpose |
+| --- | --- |
+| `mysql_command_factory` | Open/close internal SQL session per HTTP request |
+| `mysql_command_options` | Set protocol/user/host for the internal session |
+| `mysql_command_query` | Execute SQL (SELECT from PFS, UDF calls, SET GLOBAL) |
+| `mysql_command_query_result` | Retrieve result set rows |
+| `mysql_command_field_info` | Get column count and iterate fields |
+| `mysql_command_field_metadata` | Retrieve column names for JSON serialization |
+| `mysql_command_error_info` | Surface SQL errors in JSON responses |
+| `mysql_command_thread` | Initialize httplib worker threads for MySQL service access |
+| `component_sys_variable_register` | Register/unregister REST API system variables |
+| `log_builtins` | Component logging |
 
 ## Storage backend abstraction
 

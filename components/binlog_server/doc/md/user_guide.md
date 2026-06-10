@@ -745,6 +745,130 @@ When implemented, rewrite mode will:
   coalescing multiple source segments into a single local file
 - Respect transaction boundaries (never split mid-transaction)
 
+## REST API
+
+The binlog server provides an optional REST API via the separate
+`component_binlog_server_rest_api` component. It exposes the same
+functionality available through SQL (PFS tables, UDFs, system variables)
+over HTTP/HTTPS with JSON responses.
+
+### Installation
+
+```sql
+INSTALL COMPONENT 'file://component_binlog_server_rest_api';
+```
+
+The REST API server starts automatically with default credentials
+(`admin`/`admin`). Change the password after installation:
+
+```sql
+SET GLOBAL binlog_server_rest_api.password = 'your-secure-password';
+```
+
+### Configuration
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `binlog_server_rest_api.port` | UINT | `8440` | TCP port |
+| `binlog_server_rest_api.bind_address` | STRING | `127.0.0.1` | Bind address |
+| `binlog_server_rest_api.username` | STRING | `admin` | Basic Auth username |
+| `binlog_server_rest_api.password` | STRING | `admin` | Basic Auth password |
+| `binlog_server_rest_api.ssl_cert` | STRING | `''` | PEM cert path (enables HTTPS) |
+| `binlog_server_rest_api.ssl_key` | STRING | `''` | PEM key path (enables HTTPS) |
+
+### HTTPS
+
+To enable HTTPS, configure certificate and key paths:
+
+```sql
+SET GLOBAL binlog_server_rest_api.ssl_cert = '/etc/ssl/binlog-server.crt';
+SET GLOBAL binlog_server_rest_api.ssl_key = '/etc/ssl/binlog-server.key';
+```
+
+If both are set when the component starts, the server listens with TLS.
+If neither is set, plain HTTP is used.
+
+### Endpoints
+
+All endpoints (except health) require HTTP Basic Auth.
+
+#### Monitoring (GET)
+
+| Endpoint | Description |
+| --- | --- |
+| `GET /api/v1/health` | Health check (no auth), returns `{"status":"ok"}` |
+| `GET /api/v1/status` | All channels status (from PFS) |
+| `GET /api/v1/status/:channel` | Single channel status |
+| `GET /api/v1/storage` | Storage summary per channel |
+| `GET /api/v1/storage/:channel` | Single channel storage |
+| `GET /api/v1/archive/:channel` | Per-file archive listing |
+| `GET /api/v1/variables` | All binlog_server system variables |
+| `GET /api/v1/topology` | Topology: sources, channels, downstream replicas |
+| `GET /api/v1/threads` | Debug: all foreground threads (useful for troubleshooting) |
+
+#### Operations (POST)
+
+| Endpoint | Body | Description |
+| --- | --- | --- |
+| `POST /api/v1/purge/by-file` | `{"channel":"...","file":"..."}` | Purge up to file |
+| `POST /api/v1/purge/by-gtid` | `{"channel":"...","gtid_set":"..."}` | Purge by GTID |
+| `POST /api/v1/purge/by-timestamp` | `{"channel":"...","timestamp":N}` | Purge by timestamp |
+| `POST /api/v1/rotate-key` | `{"channel":"..."}` | Rotate encryption key |
+| `POST /api/v1/reload-map` | (empty) | Reload user channel map |
+| `POST /api/v1/rebuild-index` | `{"channel":"..."}` | Rebuild archive index |
+
+#### Configuration (PUT)
+
+| Endpoint | Body | Description |
+| --- | --- | --- |
+| `PUT /api/v1/variables/:name` | `{"value":"..."}` | Set a binlog_server.* variable |
+
+### Web Dashboard
+
+The component serves a built-in web dashboard at `GET /`. Open
+`http://127.0.0.1:8440/` in a browser to see:
+
+- **Topology** — live SVG diagram showing sources, the binlog server, and
+  downstream replicas as separate nodes connected with animated arrows
+- **Sources** — per-channel collection status (stacked vertically)
+- **Replicas** — connected downstream replicas with connection details
+- **Storage** — per-channel storage summary
+- **Archive** — file-level archive browser (select channel from dropdown)
+- **Operations** — purge, key rotation, map reload (channel selectable via dropdown)
+- **Configuration** — live system variable editor
+
+The dashboard auto-refreshes every 5 seconds and requires no external
+dependencies (single self-contained HTML page with inline CSS/JS).
+
+The HTML file is read from disk on every request (`binlog_server_rest_api_dashboard.html`
+in the plugin directory), so you can edit it and refresh the browser without
+restarting the server.
+
+### curl examples
+
+```bash
+# Health check
+curl http://127.0.0.1:8440/api/v1/health
+
+# Get all channel status
+curl -u admin:password http://127.0.0.1:8440/api/v1/status
+
+# Get topology
+curl -u admin:password http://127.0.0.1:8440/api/v1/topology
+
+# Purge old files
+curl -u admin:password -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"prod","file":"binlog.000005"}' \
+  http://127.0.0.1:8440/api/v1/purge/by-file
+
+# Rotate encryption key
+curl -u admin:password -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"prod"}' \
+  http://127.0.0.1:8440/api/v1/rotate-key
+```
+
 ## Troubleshooting
 
 | Symptom | Probable cause | Resolution |

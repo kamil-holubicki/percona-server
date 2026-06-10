@@ -1,0 +1,220 @@
+# ==== Purpose ====
+#
+# Verify end-to-end data flow through the binlog server:
+#   source → binlog_server (collection) → downstream replica (serving)
+#
+# This tests:
+#   1. Events written on the source propagate through the binlog server
+#      archive to a downstream replica (flush-after-write path).
+#   2. Heartbeat V2 events sent by the dump session are well-formed.
+#   3. Source binlog rotation is handled correctly during serving.
+#   4. Data written AFTER replica connects (tail-follow) is received.
+#
+# Topology:
+#   server_1 (source) → server_2 (binlog server / collector) → server_3 (downstream replica)
+#
+
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+--source ../inc/have_binlog_server.inc
+
+--let $rpl_topology = 1->2->3
+--let $rpl_server_count = 3
+--let $rpl_skip_change_master = 1
+--let $rpl_skip_start_slave = 1
+--let $use_gtids = 1
+--source include/rpl/init.inc
+
+--echo
+--echo # ============================================================
+--echo # Setup binlog server on server_2
+--echo # ============================================================
+
+--let $rpl_connection_name = server_2
+--source include/connection.inc
+--source ../inc/binlog_server_suppressions.inc
+
+INSTALL COMPONENT 'file://component_binlog_server';
+--replace_result $BINLOG_SERVER_RELAY BINLOG_SERVER_RELAY
+eval INSTALL PLUGIN binlog_server_relay SONAME '$BINLOG_SERVER_RELAY';
+
+--let $store = $MYSQLTEST_VARDIR/tmp/binlog_server_downstream_repl
+--exec rm -rf $store
+--mkdir $store
+
+SET GLOBAL binlog_server.default_serve_channel = 'src1';
+
+--echo
+--echo # ---- Configure collection from server_1
+--replace_result $SERVER_MYPORT_1 SOURCE_PORT $store STORE
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_1,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1,
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file://$store/'
+  FOR CHANNEL 'src1';
+
+START REPLICA IO_THREAD FOR CHANNEL 'src1';
+--let $rpl_channel_name = 'src1'
+--source include/rpl/wait_for_receiver_to_start.inc
+--let $rpl_channel_name =
+
+--echo
+--echo # ============================================================
+--echo # Connect downstream replica (server_3) to binlog server
+--echo # ============================================================
+
+--let $rpl_connection_name = server_3
+--source include/connection.inc
+
+--replace_result $SERVER_MYPORT_2 BINLOG_SERVER_PORT
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_2,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1;
+
+START REPLICA;
+--source include/rpl/wait_for_replica_to_start.inc
+
+--echo
+--echo # ============================================================
+--echo # Phase 1: Write data on source and verify it arrives on replica
+--echo # ============================================================
+
+--let $rpl_connection_name = server_1
+--source include/connection.inc
+CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(64)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1, 'first_event'), (2, 'second_event');
+
+--echo # ---- Sync collection on server_2
+--let $sync_slave_connection = server_2
+--let $rpl_channel_name = 'src1'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--echo # ---- Sync downstream replica (server_3) to source
+--let $rpl_connection_name = server_1
+--source include/connection.inc
+--let $sync_slave_connection = server_3
+--source include/rpl/sync_to_replica.inc
+
+--echo # ---- Verify data on replica
+--let $rpl_connection_name = server_3
+--source include/connection.inc
+SELECT * FROM t1 ORDER BY id;
+
+--echo
+--echo # ============================================================
+--echo # Phase 2: Source binlog rotation + more data (tail-follow)
+--echo # ============================================================
+
+--let $rpl_connection_name = server_1
+--source include/connection.inc
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (3, 'after_rotate');
+
+--echo # ---- Sync through
+--let $sync_slave_connection = server_2
+--let $rpl_channel_name = 'src1'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--let $rpl_connection_name = server_1
+--source include/connection.inc
+--let $sync_slave_connection = server_3
+--source include/rpl/sync_to_replica.inc
+
+--echo # ---- Verify post-rotation data
+--let $rpl_connection_name = server_3
+--source include/connection.inc
+SELECT * FROM t1 ORDER BY id;
+
+--echo
+--echo # ============================================================
+--echo # Phase 3: Multiple inserts to stress tail-follow
+--echo # ============================================================
+
+--let $rpl_connection_name = server_1
+--source include/connection.inc
+INSERT INTO t1 VALUES (4, 'batch_a');
+INSERT INTO t1 VALUES (5, 'batch_b');
+INSERT INTO t1 VALUES (6, 'batch_c');
+CREATE TABLE t2 (x INT) ENGINE=InnoDB;
+INSERT INTO t2 VALUES (100), (200), (300);
+
+--echo # ---- Sync through
+--let $sync_slave_connection = server_2
+--let $rpl_channel_name = 'src1'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--let $rpl_connection_name = server_1
+--source include/connection.inc
+--let $sync_slave_connection = server_3
+--source include/rpl/sync_to_replica.inc
+
+--echo # ---- Verify all data arrived
+--let $rpl_connection_name = server_3
+--source include/connection.inc
+SELECT COUNT(*) AS t1_rows FROM t1;
+SELECT COUNT(*) AS t2_rows FROM t2;
+
+--echo
+--echo # ============================================================
+--echo # Cleanup
+--echo # ============================================================
+
+--let $rpl_connection_name = server_3
+--source include/connection.inc
+STOP REPLICA;
+--source include/rpl/wait_for_replica_to_stop.inc
+RESET REPLICA ALL;
+
+--let $rpl_connection_name = server_2
+--source include/connection.inc
+
+--let $rpl_channel_name = 'src1'
+STOP REPLICA IO_THREAD FOR CHANNEL 'src1';
+--source include/rpl/wait_for_receiver_to_stop.inc
+--let $rpl_channel_name =
+RESET REPLICA ALL FOR CHANNEL 'src1';
+
+SET GLOBAL binlog_server.default_serve_channel = '';
+
+--let $kill_id = `SELECT COALESCE(MIN(ID),0) FROM information_schema.PROCESSLIST WHERE COMMAND IN ('Binlog Dump','Binlog Dump GTID')`
+if ($kill_id)
+{
+  --disable_query_log
+  --eval KILL CONNECTION $kill_id
+  --enable_query_log
+}
+
+let $wait_timeout = 60;
+let $wait_condition =
+  SELECT COUNT(*) = 0 FROM information_schema.PROCESSLIST
+  WHERE COMMAND IN ('Binlog Dump','Binlog Dump GTID');
+--source include/wait_condition.inc
+
+--disable_query_log
+--let $_dummy = `SELECT SLEEP(1)`
+--enable_query_log
+
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+
+--exec rm -rf $store
+
+--let $rpl_connection_name = server_1
+--source include/connection.inc
+DROP TABLE t1, t2;
+
+--let $rpl_connection_name = server_3
+--source include/connection.inc
+DROP TABLE t1, t2;
+
+--let $rpl_skip_sync = 1
+--let $rpl_skip_stop_slave = 1
+--source include/rpl/deinit.inc

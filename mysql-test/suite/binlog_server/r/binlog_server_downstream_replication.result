@@ -1,0 +1,117 @@
+include/rpl/init.inc [topology=1->2->3]
+
+# ============================================================
+# Setup binlog server on server_2
+# ============================================================
+[connection server_2]
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL PLUGIN binlog_server_relay SONAME 'BINLOG_SERVER_RELAY';
+SET GLOBAL binlog_server.default_serve_channel = 'src1';
+
+# ---- Configure collection from server_1
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = SOURCE_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1,
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORE/'
+  FOR CHANNEL 'src1';
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA IO_THREAD FOR CHANNEL 'src1';
+include/rpl/wait_for_receiver_to_start.inc [FOR CHANNEL 'src1']
+
+# ============================================================
+# Connect downstream replica (server_3) to binlog server
+# ============================================================
+[connection server_3]
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = BINLOG_SERVER_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1;
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA;
+include/rpl/wait_for_replica_to_start.inc
+
+# ============================================================
+# Phase 1: Write data on source and verify it arrives on replica
+# ============================================================
+[connection server_1]
+CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(64)) ENGINE=InnoDB;
+INSERT INTO t1 VALUES (1, 'first_event'), (2, 'second_event');
+# ---- Sync collection on server_2
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'src1']
+# ---- Sync downstream replica (server_3) to source
+[connection server_1]
+include/rpl/sync_to_replica.inc
+# ---- Verify data on replica
+[connection server_3]
+SELECT * FROM t1 ORDER BY id;
+id	val
+1	first_event
+2	second_event
+
+# ============================================================
+# Phase 2: Source binlog rotation + more data (tail-follow)
+# ============================================================
+[connection server_1]
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (3, 'after_rotate');
+# ---- Sync through
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'src1']
+[connection server_1]
+include/rpl/sync_to_replica.inc
+# ---- Verify post-rotation data
+[connection server_3]
+SELECT * FROM t1 ORDER BY id;
+id	val
+1	first_event
+2	second_event
+3	after_rotate
+
+# ============================================================
+# Phase 3: Multiple inserts to stress tail-follow
+# ============================================================
+[connection server_1]
+INSERT INTO t1 VALUES (4, 'batch_a');
+INSERT INTO t1 VALUES (5, 'batch_b');
+INSERT INTO t1 VALUES (6, 'batch_c');
+CREATE TABLE t2 (x INT) ENGINE=InnoDB;
+INSERT INTO t2 VALUES (100), (200), (300);
+# ---- Sync through
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'src1']
+[connection server_1]
+include/rpl/sync_to_replica.inc
+# ---- Verify all data arrived
+[connection server_3]
+SELECT COUNT(*) AS t1_rows FROM t1;
+t1_rows
+6
+SELECT COUNT(*) AS t2_rows FROM t2;
+t2_rows
+3
+
+# ============================================================
+# Cleanup
+# ============================================================
+[connection server_3]
+STOP REPLICA;
+include/rpl/wait_for_replica_to_stop.inc
+RESET REPLICA ALL;
+[connection server_2]
+STOP REPLICA IO_THREAD FOR CHANNEL 'src1';
+include/rpl/wait_for_receiver_to_stop.inc [FOR CHANNEL 'src1']
+RESET REPLICA ALL FOR CHANNEL 'src1';
+SET GLOBAL binlog_server.default_serve_channel = '';
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+[connection server_1]
+DROP TABLE t1, t2;
+[connection server_3]
+DROP TABLE t1, t2;
+include/rpl/deinit.inc

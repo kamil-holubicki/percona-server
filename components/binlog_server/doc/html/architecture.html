@@ -251,6 +251,16 @@ not know about files, directories, or binlog event formats.</p>
 │   ├── log_helpers.h / .cc          # bslog / bslog_code logging wrappers
 │   └── doc/                          # this documentation
 │
+├── components/binlog_server_rest_api/   # Phase 7: REST API component
+│   ├── CMakeLists.txt
+│   ├── binlog_server_rest_api.cc    # component lifecycle, sysvar registration, HTTP server thread
+│   ├── rest_handlers.cc / .h        # REST endpoint implementations
+│   ├── sql_executor.cc / .h         # internal SQL execution via mysql_command_* services
+│   ├── json_helpers.h               # lightweight JSON serialization
+│   ├── httplib.h                    # vendored cpp-httplib (single-header HTTP/HTTPS server)
+│   └── dashboard/
+│       └── index.html               # self-contained SPA with live topology diagram
+│
 ├── scripts/
 │   ├── mysql_system_tables.sql       # DDL for slave_master_info columns
 │   └── mysql_system_tables_fix.sql   # ALTER for upgrades
@@ -570,6 +580,57 @@ and <code>mysql_binlog_dump_handler_io.h</code>:</p>
 <td><code>keyring_writer</code></td>
 <td><code>encryption.cc</code></td>
 <td>Store/remove master keys during rotation</td>
+</tr>
+</tbody>
+</table>
+<h3 id="services-acquired-by-component_binlog_server_rest_api-phase-7">Services acquired by <code>component_binlog_server_rest_api</code> (Phase 7)<a class="headerlink" href="#services-acquired-by-component_binlog_server_rest_api-phase-7" title="Permanent link">&#x00B6;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Service</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>mysql_command_factory</code></td>
+<td>Open/close internal SQL session per HTTP request</td>
+</tr>
+<tr>
+<td><code>mysql_command_options</code></td>
+<td>Set protocol/user/host for the internal session</td>
+</tr>
+<tr>
+<td><code>mysql_command_query</code></td>
+<td>Execute SQL (SELECT from PFS, UDF calls, SET GLOBAL)</td>
+</tr>
+<tr>
+<td><code>mysql_command_query_result</code></td>
+<td>Retrieve result set rows</td>
+</tr>
+<tr>
+<td><code>mysql_command_field_info</code></td>
+<td>Get column count and iterate fields</td>
+</tr>
+<tr>
+<td><code>mysql_command_field_metadata</code></td>
+<td>Retrieve column names for JSON serialization</td>
+</tr>
+<tr>
+<td><code>mysql_command_error_info</code></td>
+<td>Surface SQL errors in JSON responses</td>
+</tr>
+<tr>
+<td><code>mysql_command_thread</code></td>
+<td>Initialize httplib worker threads for MySQL service access</td>
+</tr>
+<tr>
+<td><code>component_sys_variable_register</code></td>
+<td>Register/unregister REST API system variables</td>
+</tr>
+<tr>
+<td><code>log_builtins</code></td>
+<td>Component logging</td>
 </tr>
 </tbody>
 </table>

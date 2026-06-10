@@ -98,7 +98,7 @@ SET GLOBAL binlog_server.default_serve_channel = 'src_a';
 | **Durable at transaction boundaries** | Every `Xid` / `XA_prepare` event triggers an `fsync(2)`, ensuring committed transactions survive a power loss. |
 | **At-rest encryption** | Optional AES-256-CTR encryption with keyring-managed master keys. Online key rotation without stopping collection. Transparent decryption when serving to replicas. |
 
-## Current status (Phase 1–6)
+## Current status (Phase 1–7)
 
 **Phase 1** — collection path:
 
@@ -156,6 +156,17 @@ SET GLOBAL binlog_server.default_serve_channel = 'src_a';
 - Keyring integration via `component_keyring_file` (any keyring component works)
 - `StorageWriteStream` / `StorageReadStream` abstractions for storage-agnostic I/O
 - Encryption operates above the storage backend: same logic works for file:// and future S3
+
+**Phase 7** — REST API + web dashboard:
+
+- Separate `component_binlog_server_rest_api` component (independent from core)
+- Embedded HTTP/HTTPS server (cpp-httplib) on configurable port (default 8440)
+- HTTP Basic Auth with configurable username/password
+- HTTPS support via configurable PEM cert/key paths
+- Full REST API: status, storage, archive, topology, purge, key rotation, variable management
+- Self-contained single-page web dashboard with live topology diagram (loaded from file at runtime — edit and refresh)
+- Dashboard shows sources, channels, storage, downstream replicas as animated SVG
+- All operations accessible via both SQL and REST endpoints
 
 **Not yet implemented** (planned for later phases):
 - S3-compatible object storage backend (stubs in place)

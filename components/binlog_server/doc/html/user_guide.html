@@ -1028,6 +1028,226 @@ ignored until a future release</p>
 - Fix <code>sequence_number</code> / <code>last_committed</code> logical clock fields when
   coalescing multiple source segments into a single local file
 - Respect transaction boundaries (never split mid-transaction)</p>
+<h2 id="rest-api">REST API<a class="headerlink" href="#rest-api" title="Permanent link">&#x00B6;</a></h2>
+<p>The binlog server provides an optional REST API via the separate
+<code>component_binlog_server_rest_api</code> component. It exposes the same
+functionality available through SQL (PFS tables, UDFs, system variables)
+over HTTP/HTTPS with JSON responses.</p>
+<h3 id="installation_1">Installation<a class="headerlink" href="#installation_1" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="n">INSTALL</span><span class="w"> </span><span class="n">COMPONENT</span><span class="w"> </span><span class="s1">&#39;file://component_binlog_server_rest_api&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>The REST API server starts automatically with default credentials
+(<code>admin</code>/<code>admin</code>). Change the password after installation:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SET</span><span class="w"> </span><span class="k">GLOBAL</span><span class="w"> </span><span class="n">binlog_server_rest_api</span><span class="p">.</span><span class="n">password</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;your-secure-password&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<h3 id="configuration">Configuration<a class="headerlink" href="#configuration" title="Permanent link">&#x00B6;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>binlog_server_rest_api.port</code></td>
+<td>UINT</td>
+<td><code>8440</code></td>
+<td>TCP port</td>
+</tr>
+<tr>
+<td><code>binlog_server_rest_api.bind_address</code></td>
+<td>STRING</td>
+<td><code>127.0.0.1</code></td>
+<td>Bind address</td>
+</tr>
+<tr>
+<td><code>binlog_server_rest_api.username</code></td>
+<td>STRING</td>
+<td><code>admin</code></td>
+<td>Basic Auth username</td>
+</tr>
+<tr>
+<td><code>binlog_server_rest_api.password</code></td>
+<td>STRING</td>
+<td><code>admin</code></td>
+<td>Basic Auth password</td>
+</tr>
+<tr>
+<td><code>binlog_server_rest_api.ssl_cert</code></td>
+<td>STRING</td>
+<td><code>''</code></td>
+<td>PEM cert path (enables HTTPS)</td>
+</tr>
+<tr>
+<td><code>binlog_server_rest_api.ssl_key</code></td>
+<td>STRING</td>
+<td><code>''</code></td>
+<td>PEM key path (enables HTTPS)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="https">HTTPS<a class="headerlink" href="#https" title="Permanent link">&#x00B6;</a></h3>
+<p>To enable HTTPS, configure certificate and key paths:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">SET</span><span class="w"> </span><span class="k">GLOBAL</span><span class="w"> </span><span class="n">binlog_server_rest_api</span><span class="p">.</span><span class="n">ssl_cert</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;/etc/ssl/binlog-server.crt&#39;</span><span class="p">;</span>
+<span class="k">SET</span><span class="w"> </span><span class="k">GLOBAL</span><span class="w"> </span><span class="n">binlog_server_rest_api</span><span class="p">.</span><span class="n">ssl_key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;/etc/ssl/binlog-server.key&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>If both are set when the component starts, the server listens with TLS.
+If neither is set, plain HTTP is used.</p>
+<h3 id="endpoints">Endpoints<a class="headerlink" href="#endpoints" title="Permanent link">&#x00B6;</a></h3>
+<p>All endpoints (except health) require HTTP Basic Auth.</p>
+<h4 id="monitoring-get">Monitoring (GET)<a class="headerlink" href="#monitoring-get" title="Permanent link">&#x00B6;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /api/v1/health</code></td>
+<td>Health check (no auth), returns <code>{"status":"ok"}</code></td>
+</tr>
+<tr>
+<td><code>GET /api/v1/status</code></td>
+<td>All channels status (from PFS)</td>
+</tr>
+<tr>
+<td><code>GET /api/v1/status/:channel</code></td>
+<td>Single channel status</td>
+</tr>
+<tr>
+<td><code>GET /api/v1/storage</code></td>
+<td>Storage summary per channel</td>
+</tr>
+<tr>
+<td><code>GET /api/v1/storage/:channel</code></td>
+<td>Single channel storage</td>
+</tr>
+<tr>
+<td><code>GET /api/v1/archive/:channel</code></td>
+<td>Per-file archive listing</td>
+</tr>
+<tr>
+<td><code>GET /api/v1/variables</code></td>
+<td>All binlog_server system variables</td>
+</tr>
+<tr>
+<td><code>GET /api/v1/topology</code></td>
+<td>Topology: sources, channels, downstream replicas</td>
+</tr>
+<tr>
+<td><code>GET /api/v1/threads</code></td>
+<td>Debug: all foreground threads (useful for troubleshooting)</td>
+</tr>
+</tbody>
+</table>
+<h4 id="operations-post">Operations (POST)<a class="headerlink" href="#operations-post" title="Permanent link">&#x00B6;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Body</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /api/v1/purge/by-file</code></td>
+<td><code>{"channel":"...","file":"..."}</code></td>
+<td>Purge up to file</td>
+</tr>
+<tr>
+<td><code>POST /api/v1/purge/by-gtid</code></td>
+<td><code>{"channel":"...","gtid_set":"..."}</code></td>
+<td>Purge by GTID</td>
+</tr>
+<tr>
+<td><code>POST /api/v1/purge/by-timestamp</code></td>
+<td><code>{"channel":"...","timestamp":N}</code></td>
+<td>Purge by timestamp</td>
+</tr>
+<tr>
+<td><code>POST /api/v1/rotate-key</code></td>
+<td><code>{"channel":"..."}</code></td>
+<td>Rotate encryption key</td>
+</tr>
+<tr>
+<td><code>POST /api/v1/reload-map</code></td>
+<td>(empty)</td>
+<td>Reload user channel map</td>
+</tr>
+<tr>
+<td><code>POST /api/v1/rebuild-index</code></td>
+<td><code>{"channel":"..."}</code></td>
+<td>Rebuild archive index</td>
+</tr>
+</tbody>
+</table>
+<h4 id="configuration-put">Configuration (PUT)<a class="headerlink" href="#configuration-put" title="Permanent link">&#x00B6;</a></h4>
+<table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Body</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PUT /api/v1/variables/:name</code></td>
+<td><code>{"value":"..."}</code></td>
+<td>Set a binlog_server.* variable</td>
+</tr>
+</tbody>
+</table>
+<h3 id="web-dashboard">Web Dashboard<a class="headerlink" href="#web-dashboard" title="Permanent link">&#x00B6;</a></h3>
+<p>The component serves a built-in web dashboard at <code>GET /</code>. Open
+<code>http://127.0.0.1:8440/</code> in a browser to see:</p>
+<ul>
+<li><strong>Topology</strong> — live SVG diagram showing sources, the binlog server, and
+  downstream replicas as separate nodes connected with animated arrows</li>
+<li><strong>Sources</strong> — per-channel collection status (stacked vertically)</li>
+<li><strong>Replicas</strong> — connected downstream replicas with connection details</li>
+<li><strong>Storage</strong> — per-channel storage summary</li>
+<li><strong>Archive</strong> — file-level archive browser (select channel from dropdown)</li>
+<li><strong>Operations</strong> — purge, key rotation, map reload (channel selectable via dropdown)</li>
+<li><strong>Configuration</strong> — live system variable editor</li>
+</ul>
+<p>The dashboard auto-refreshes every 5 seconds and requires no external
+dependencies (single self-contained HTML page with inline CSS/JS).</p>
+<p>The HTML file is read from disk on every request (<code>binlog_server_rest_api_dashboard.html</code>
+in the plugin directory), so you can edit it and refresh the browser without
+restarting the server.</p>
+<h3 id="curl-examples">curl examples<a class="headerlink" href="#curl-examples" title="Permanent link">&#x00B6;</a></h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Health check</span>
+curl<span class="w"> </span>http://127.0.0.1:8440/api/v1/health
+
+<span class="c1"># Get all channel status</span>
+curl<span class="w"> </span>-u<span class="w"> </span>admin:password<span class="w"> </span>http://127.0.0.1:8440/api/v1/status
+
+<span class="c1"># Get topology</span>
+curl<span class="w"> </span>-u<span class="w"> </span>admin:password<span class="w"> </span>http://127.0.0.1:8440/api/v1/topology
+
+<span class="c1"># Purge old files</span>
+curl<span class="w"> </span>-u<span class="w"> </span>admin:password<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;channel&quot;:&quot;prod&quot;,&quot;file&quot;:&quot;binlog.000005&quot;}&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://127.0.0.1:8440/api/v1/purge/by-file
+
+<span class="c1"># Rotate encryption key</span>
+curl<span class="w"> </span>-u<span class="w"> </span>admin:password<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;channel&quot;:&quot;prod&quot;}&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://127.0.0.1:8440/api/v1/rotate-key
+</code></pre></div>
+
 <h2 id="troubleshooting">Troubleshooting<a class="headerlink" href="#troubleshooting" title="Permanent link">&#x00B6;</a></h2>
 <table>
 <thead>

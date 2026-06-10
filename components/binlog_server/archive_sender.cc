@@ -99,6 +99,33 @@ void write_u64_le(unsigned char *p, uint64_t v) {
   }
 }
 
+size_t net_length_size(uint64_t v) {
+  if (v < 251ULL) return 1;
+  if (v < 65536ULL) return 3;
+  if (v < 16777216ULL) return 4;
+  return 9;
+}
+
+unsigned char *net_store_len(unsigned char *p, uint64_t v) {
+  if (v < 251ULL) {
+    *p++ = static_cast<unsigned char>(v);
+  } else if (v < 65536ULL) {
+    *p++ = 252;
+    *p++ = static_cast<unsigned char>(v & 0xFF);
+    *p++ = static_cast<unsigned char>((v >> 8) & 0xFF);
+  } else if (v < 16777216ULL) {
+    *p++ = 253;
+    *p++ = static_cast<unsigned char>(v & 0xFF);
+    *p++ = static_cast<unsigned char>((v >> 8) & 0xFF);
+    *p++ = static_cast<unsigned char>((v >> 16) & 0xFF);
+  } else {
+    *p++ = 254;
+    for (int i = 0; i < 8; ++i)
+      *p++ = static_cast<unsigned char>((v >> (i * 8)) & 0xFF);
+  }
+  return p;
+}
+
 struct Crc32Table {
   uint32_t v[256]{};
   constexpr Crc32Table() {
@@ -550,10 +577,20 @@ bool ArchiveDumpSession::send_heartbeat_v1() {
 }
 
 bool ArchiveDumpSession::send_heartbeat_v2() {
+  constexpr uint64_t kFieldFilename = 1;
+  constexpr uint64_t kFieldPosition = 2;
+  constexpr uint64_t kEndMark = 0;
+
   const size_t name_len = m_current_file.size();
-  const size_t encoded_name_len =
-      (name_len < 128) ? 1 + name_len : 2 + name_len;
-  const size_t total = kLogEventHeaderLen + encoded_name_len +
+  const uint64_t pos_val = static_cast<uint64_t>(m_current_pos);
+  const size_t pos_enc_len = net_length_size(pos_val);
+
+  const size_t payload_size =
+      net_length_size(kFieldFilename) + net_length_size(name_len) + name_len +
+      net_length_size(kFieldPosition) + net_length_size(pos_enc_len) +
+      pos_enc_len + net_length_size(kEndMark);
+
+  const size_t total = kLogEventHeaderLen + payload_size +
                        (m_has_checksum ? kBinlogChecksumLen : 0);
   std::vector<unsigned char> ev(total, 0);
 
@@ -563,14 +600,15 @@ bool ArchiveDumpSession::send_heartbeat_v2() {
   write_u32_le(ev.data() + kLogPosOffset,
                static_cast<uint32_t>(m_current_pos));
 
-  size_t off = kLogEventHeaderLen;
-  if (name_len < 128) {
-    ev[off++] = static_cast<unsigned char>(name_len);
-  } else {
-    ev[off++] = static_cast<unsigned char>((name_len & 0x7F) | 0x80);
-    ev[off++] = static_cast<unsigned char>(name_len >> 7);
-  }
-  std::memcpy(ev.data() + off, m_current_file.data(), name_len);
+  unsigned char *ptr = ev.data() + kLogEventHeaderLen;
+  ptr = net_store_len(ptr, kFieldFilename);
+  ptr = net_store_len(ptr, name_len);
+  std::memcpy(ptr, m_current_file.data(), name_len);
+  ptr += name_len;
+  ptr = net_store_len(ptr, kFieldPosition);
+  ptr = net_store_len(ptr, pos_enc_len);
+  ptr = net_store_len(ptr, pos_val);
+  ptr = net_store_len(ptr, kEndMark);
 
   if (m_has_checksum) {
     const uint32_t crc = crc32_ieee(0, ev.data(), total - kBinlogChecksumLen);
