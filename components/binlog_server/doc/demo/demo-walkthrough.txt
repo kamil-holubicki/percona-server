@@ -1,0 +1,321 @@
+$BASE_DIR/bin/mysql --defaults-file=./ps-node/n1.cnf -h127.0.0.1 -P4000 -uroot
+===============================================================================
+                    BINLOG SERVER DEMO WALKTHROUGH
+===============================================================================
+
+
+ACT 1: MANUAL SINGLE-SOURCE SETUP
+==================================
+
+--- Start instances ---
+
+  cd /home/kamil/repo/ps/8.0/install
+  ./ps-node/bs_demo_cnf/bs-demo-act1-start.sh
+
+
+--- 1.2 Configure source (on source_1 :4000) ---
+
+  CREATE USER 'repl'@'%' IDENTIFIED BY 'repl';
+  GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
+
+
+--- 1.3 Install and configure binlog server (on binlog_server :6000) ---
+
+  SET sql_log_bin=0;
+  INSTALL COMPONENT 'file://component_binlog_server';
+  INSTALL COMPONENT 'file://component_binlog_server_rest_api';
+  INSTALL PLUGIN binlog_server_relay SONAME 'binlog_server_relay.so';
+  SET sql_log_bin=1;
+
+  SET sql_log_bin=0;
+  CHANGE REPLICATION SOURCE TO
+    SOURCE_HOST = '127.0.0.1',
+    SOURCE_PORT = 4000,
+    SOURCE_USER = 'repl',
+    SOURCE_PASSWORD = 'repl',
+    SOURCE_AUTO_POSITION = 1,
+    BINLOG_SERVER = 1,
+    BINLOG_SERVER_STORAGE_URI = 'file:///home/kamil/repo/ps/8.0/install/ps-node/dn3/bs_storage/src1/'
+    FOR CHANNEL 'src1';
+  SET sql_log_bin=1;
+
+  START REPLICA FOR CHANNEL 'src1';
+
+
+--- 1.4 Configure downstream replica ---
+
+On binlog_server (:6000):
+
+  SET sql_log_bin=0;
+  SET GLOBAL binlog_server.user_channel_map = 'repl_src1=src1';
+  CREATE USER 'repl_src1'@'%' IDENTIFIED BY 'repl';
+  GRANT REPLICATION SLAVE ON *.* TO 'repl_src1'@'%';
+  SET sql_log_bin=1;
+
+On replica_1 (:7000):
+
+  SET sql_log_bin=0;
+  CHANGE REPLICATION SOURCE TO
+    SOURCE_HOST = '127.0.0.1',
+    SOURCE_PORT = 6000,
+    SOURCE_USER = 'repl_src1',
+    SOURCE_PASSWORD = 'repl',
+    SOURCE_AUTO_POSITION = 1;
+  SET sql_log_bin=1;
+  START REPLICA;
+
+
+--- 1.5 Write data, observe replication ---
+
+On source_1:
+
+  CREATE DATABASE demo;
+  USE demo;
+  CREATE TABLE t1 (id INT AUTO_INCREMENT PRIMARY KEY, msg VARCHAR(100));
+  INSERT INTO t1 (msg) VALUES ('hello from source_1');
+  INSERT INTO t1 (msg) VALUES ('second message');
+  SELECT SLEEP(2);
+  FLUSH BINARY LOGS;
+
+  INSERT INTO t1 (msg) VALUES ('third message');
+  INSERT INTO t1 (msg) VALUES ('fourth message');
+  INSERT INTO t1 (msg) VALUES ('fifth message');
+  SELECT SLEEP(2);
+  FLUSH BINARY LOGS;
+
+  INSERT INTO t1 (msg) VALUES ('sixth message');
+  INSERT INTO t1 (msg) VALUES ('seventh message');
+  SELECT SLEEP(1);
+  FLUSH BINARY LOGS;
+
+  INSERT INTO t1 (msg) VALUES ('eighth message');
+
+  -- Now we have 4+ binlog files: src1-bin.000001 .. src1-bin.000004
+  -- (source_1 uses log_bin=src1-bin, so archived files keep that name)
+
+On replica_1 — data arrives:
+
+  SELECT * FROM demo.t1;
+
+On binlog_server — NO data (archive-only, does not apply):
+
+  USE demo;
+  -- ERROR 1049: Unknown database 'demo'
+
+
+--- 1.6 Monitoring via PFS tables (on binlog_server) ---
+
+  SELECT * FROM performance_schema.replication_binlog_server_status\G
+  SELECT * FROM performance_schema.replication_binlog_server_storage\G
+  SELECT FILE_NAME, SIZE_BYTES, MIN_EVENT_TIMESTAMP, MAX_EVENT_TIMESTAMP,
+         PREVIOUS_GTID_SET, LAST_GTID_SET
+    FROM performance_schema.replication_binlog_server_archive
+    WHERE CHANNEL_NAME='src1'\G
+
+
+--- 1.7 Search UDFs (on binlog_server) ---
+
+  -- Search by timestamp range (adjust times to current)
+  SELECT binlog_server_search_by_timestamp('src1',
+    '2026-06-10T00:00:00', '2026-06-10T23:59:59')\G
+
+  -- Search by GTID set (get UUID: SELECT @@server_uuid on source_1)
+  SELECT binlog_server_search_by_gtid_set('src1',
+    '<paste-uuid-here>:1-3')\G
+
+
+--- 1.8 REST API via curl ---
+
+  # Replication status
+  curl -s -u admin:admin http://127.0.0.1:8440/api/v1/status | jq .
+
+  # Topology view
+  curl -s -u admin:admin http://127.0.0.1:8440/api/v1/topology | jq .
+
+  # Storage overview
+  curl -s -u admin:admin http://127.0.0.1:8440/api/v1/storage | jq .
+
+  # Archive files for channel src1
+  curl -s -u admin:admin http://127.0.0.1:8440/api/v1/archive/src1 | jq .
+
+  # Available search range
+  curl -s -u admin:admin http://127.0.0.1:8440/api/v1/range/src1 | jq .
+
+  # Search by timestamp
+  curl -s -u admin:admin -X POST http://127.0.0.1:8440/api/v1/search/by-timestamp \
+    -d '{"channel":"src1","from":"2026-06-10T00:00:00","to":"2026-06-10T23:59:59"}' | jq .
+
+  # Search by GTID
+  curl -s -u admin:admin -X POST http://127.0.0.1:8440/api/v1/search/by-gtid-set \
+    -d '{"channel":"src1","gtid_set":"<uuid>:1-3"}' | jq .
+
+
+===============================================================================
+ACT 2: FULL MULTI-SOURCE TOPOLOGY + DASHBOARD
+===============================================================================
+
+--- Stop Act 1, start full topology ---
+
+  cd /home/kamil/repo/ps/8.0/install
+  ./ps-node/bs_demo_cnf/bs-demo-stop.sh
+  ./ps-node/bs_demo_cnf/bs-demo-start.sh
+
+
+--- 2.2 Generate traffic ---
+
+Note: source_1 uses log_bin=src1-bin, source_2 uses log_bin=src2-bin.
+      The binlog server archives files with the original names from each source.
+
+On source_1 (:4000) — generate 6 binlog files:
+
+  CREATE DATABASE app1;
+  USE app1;
+  CREATE TABLE orders (id INT AUTO_INCREMENT PRIMARY KEY, product VARCHAR(50), amount DECIMAL(10,2));
+  INSERT INTO orders (product, amount) VALUES ('Widget A', 29.99), ('Widget B', 49.99);
+  SELECT SLEEP(2);
+  FLUSH BINARY LOGS;
+
+  INSERT INTO orders (product, amount) VALUES ('Widget C', 9.99), ('Widget D', 19.99);
+  INSERT INTO orders (product, amount) VALUES ('Widget E', 59.99);
+  SELECT SLEEP(3);
+  FLUSH BINARY LOGS;
+
+  INSERT INTO orders (product, amount) VALUES ('Widget F', 39.99);
+  SELECT SLEEP(2);
+  FLUSH BINARY LOGS;
+
+  INSERT INTO orders (product, amount) VALUES ('Widget G', 79.99), ('Widget H', 99.99);
+  INSERT INTO orders (product, amount) VALUES ('Widget I', 14.99);
+  SELECT SLEEP(2);
+  FLUSH BINARY LOGS;
+
+  INSERT INTO orders (product, amount) VALUES ('Widget J', 24.99), ('Widget K', 44.99);
+  SELECT SLEEP(1);
+  FLUSH BINARY LOGS;
+
+  INSERT INTO orders (product, amount) VALUES ('Widget L', 64.99);
+
+  -- Result: src1-bin.000001 through src1-bin.000006 in BS storage
+
+On source_2 (:5000) — generate 3 binlog files:
+
+  CREATE DATABASE app2;
+  USE app2;
+  CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100), email VARCHAR(100));
+  INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com');
+  INSERT INTO users (name, email) VALUES ('Bob', 'bob@example.com');
+  SELECT SLEEP(3);
+  FLUSH BINARY LOGS;
+
+  INSERT INTO users (name, email) VALUES ('Charlie', 'charlie@example.com');
+  INSERT INTO users (name, email) VALUES ('Diana', 'diana@example.com');
+  INSERT INTO users (name, email) VALUES ('Eve', 'eve@example.com');
+  SELECT SLEEP(2);
+  FLUSH BINARY LOGS;
+
+  INSERT INTO users (name, email) VALUES ('Frank', 'frank@example.com');
+
+  -- Result: src2-bin.000001 through src2-bin.000003 in BS storage
+
+
+--- 2.3 Verify selective replication ---
+
+On replica_1 (:7000) — gets source_1 only:
+
+  SELECT * FROM app1.orders;     -- works
+  SELECT * FROM app2.users;      -- ERROR: unknown database
+
+On replica_2 (:8000) — gets source_2 only:
+
+  SELECT * FROM app2.users;      -- works
+  SELECT * FROM app1.orders;     -- ERROR: unknown database
+
+
+--- 2.4 Web Dashboard ---
+
+  Open browser: http://127.0.0.1:8440/
+
+  Tour the tabs:
+    - Overview: topology, status, storage
+    - Archive: per-channel file list with contributed GTIDs
+    - Search: timestamp range and GTID search
+    - Operations: purge, rotate key, rebuild index
+    - Config: runtime variables
+
+
+--- 2.5 Bulk insert (watch dashboard update) ---
+
+On source_1 — run this procedure that inserts data continuously and rotates
+the binlog every ~5 seconds, for about 1 minute total (~12 new files):
+
+  USE app1;
+  DELIMITER //
+  CREATE PROCEDURE demo_bulk_load()
+  BEGIN
+    DECLARE batch INT DEFAULT 0;
+    WHILE batch < 12 DO
+      -- Insert a batch of rows
+      SET @i = 0;
+      WHILE @i < 50 DO
+        INSERT INTO orders (product, amount)
+          VALUES (CONCAT('Bulk_', batch, '_', @i), ROUND(RAND()*100, 2));
+        SET @i = @i + 1;
+      END WHILE;
+      -- Rotate binlog so a new file appears in the dashboard
+      FLUSH BINARY LOGS;
+      -- Wait 5 seconds before next batch
+      DO SLEEP(5);
+      SET batch = batch + 1;
+    END WHILE;
+  END //
+  DELIMITER ;
+
+  CALL demo_bulk_load();
+
+  -- Watch the Archive tab: a new src1-bin.* file appears every ~5 seconds
+  -- Total: ~12 new files over 1 minute, ~600 rows inserted
+
+
+--- 2.6 Purge demo ---
+
+On binlog_server:
+
+  SELECT binlog_server_purge_before_timestamp('src1', UNIX_TIMESTAMP() - 60);
+
+
+===============================================================================
+ACT 3: ORCHESTRATOR
+===============================================================================
+
+--- Start orchestrator (in a separate terminal) ---
+
+  cd /home/kamil/repo/ps/8.0/install
+  ./ps-node/bs_demo_cnf/bs-demo-orchestrator.sh
+
+  Open browser: http://127.0.0.1:3000/
+
+  Note: orchestrator shows one upstream for the binlog server (limitation of
+  its single-master-per-instance model). All nodes are visible and monitored.
+
+
+===============================================================================
+TEARDOWN
+===============================================================================
+
+  cd /home/kamil/repo/ps/8.0/install
+  ./ps-node/bs_demo_cnf/bs-demo-stop.sh
+  # Kill orchestrator with Ctrl+C
+
+
+===============================================================================
+KEY MESSAGES
+===============================================================================
+
+  - Archive-only: BS does NOT apply transactions — it stores binlogs only.
+  - Multi-source: multiple independent clusters archived to one BS instance.
+  - Selective replication: replicas choose which source via user-channel routing.
+  - GTID-native: everything uses GTIDs, no position-based replication needed.
+  - Search/PITR: find files for point-in-time recovery by timestamp or GTID.
+  - REST API + Dashboard: full HTTP interface for automation and monitoring.
+  - Encryption: at-rest encryption with keyring-managed keys (optional).
+  - Orchestrator: standard tools can discover the topology (with limitations).
