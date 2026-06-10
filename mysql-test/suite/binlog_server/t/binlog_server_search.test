@@ -1,0 +1,203 @@
+# ==== Purpose ====
+#
+# Verify the binlog archive search UDFs:
+#
+#   1. search_by_timestamp returns matching files (PITR use-case)
+#   2. search_by_timestamp with timestamp in the future returns all files
+#   3. search_by_timestamp with timestamp too old returns error
+#   4. search_by_timestamp with invalid format returns error
+#   5. search_by_gtid_set returns minimal covering file set
+#   6. search_by_gtid_set with empty/invalid GTID returns error
+#   7. search on nonexistent channel returns error
+#   8. Both UDFs return valid JSON with expected fields
+
+--source include/have_log_bin.inc
+--source include/have_binlog_format_row.inc
+--source ../inc/have_binlog_server.inc
+
+--let $use_gtids = 1
+--let $rpl_skip_change_master = 1
+--let $rpl_skip_start_slave = 1
+--source include/rpl/init_source_replica.inc
+
+--echo
+--echo # ---- Setup binlog server ----
+--source include/rpl/connection_replica.inc
+--source ../inc/binlog_server_suppressions.inc
+
+--let $store = $MYSQLTEST_VARDIR/tmp/bs_search_test
+--exec rm -rf $store
+--mkdir $store
+
+INSTALL COMPONENT 'file://component_binlog_server';
+--replace_result $BINLOG_SERVER_RELAY BINLOG_SERVER_RELAY
+eval INSTALL PLUGIN binlog_server_relay SONAME '$BINLOG_SERVER_RELAY';
+
+--replace_result $SERVER_MYPORT_1 SOURCE_PORT $store STORE
+eval CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST = '127.0.0.1',
+  SOURCE_PORT = $SERVER_MYPORT_1,
+  SOURCE_USER = 'root',
+  SOURCE_AUTO_POSITION = 1,
+  BINLOG_SERVER = 1,
+  BINLOG_SERVER_STORAGE_URI = 'file://$store/'
+  FOR CHANNEL 'search_ch';
+
+START REPLICA IO_THREAD FOR CHANNEL 'search_ch';
+--let $rpl_channel_name = 'search_ch'
+--source include/rpl/wait_for_receiver_to_start.inc
+--let $rpl_channel_name =
+
+--echo
+--echo # ---- Generate traffic to create multiple binlog files ----
+--source include/rpl/connection_source.inc
+CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(50));
+INSERT INTO t1 VALUES (1, 'one');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (2, 'two');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (3, 'three');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (4, 'four');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (5, 'five');
+
+--let $rpl_channel_name = 'search_ch'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--echo
+--echo # ---- Rebuild archive index to populate metadata ----
+--source include/rpl/connection_replica.inc
+SELECT binlog_server_rebuild_archive_index('search_ch') >= 0 AS rebuild_ok;
+
+--echo
+--echo # ---- Verify we have multiple files in archive ----
+--let $file_count = `SELECT COUNT(*) FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'search_ch'`
+--let $assert_text = archive has at least 5 files
+--let $assert_cond = $file_count >= 5
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 1: search_by_timestamp - returns JSON with success ====
+--let $assert_text = search_by_timestamp returns success status
+--let $assert_cond = (SELECT binlog_server_search_by_timestamp("search_ch", DATE_FORMAT(UTC_TIMESTAMP(), "%Y-%m-%dT%H:%i:%s")) LIKE "%status%:%success%") = 1
+--source include/assert.inc
+
+--let $assert_text = search_by_timestamp result contains file names
+--let $assert_cond = (SELECT binlog_server_search_by_timestamp("search_ch", DATE_FORMAT(UTC_TIMESTAMP(), "%Y-%m-%dT%H:%i:%s")) LIKE "%name%") = 1
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 2: search_by_timestamp with far future - returns all files ====
+--let $assert_text = future timestamp returns success with file entries
+--let $assert_cond = (SELECT binlog_server_search_by_timestamp("search_ch", "2099-12-31T23:59:59") LIKE "%name%") = 1
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 3: search_by_timestamp with very old timestamp - returns error ====
+--let $assert_text = ancient timestamp returns error
+--let $assert_cond = (SELECT binlog_server_search_by_timestamp("search_ch", "2000-01-01T00:00:01") LIKE "%error%") = 1
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 4: search_by_timestamp with invalid format ====
+--let $assert_text = invalid timestamp format returns error
+--let $assert_cond = (SELECT binlog_server_search_by_timestamp("search_ch", "not-a-date") LIKE "%error%") = 1
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 5: search_by_gtid_set - returns matching files ====
+--let $first_gtid = `SELECT LAST_GTID_SET FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'search_ch' AND LAST_GTID_SET != '' ORDER BY FILE_NAME ASC LIMIT 1`
+if ($first_gtid)
+{
+  --let $assert_text = search_by_gtid_set returns success
+  --let $assert_cond = (SELECT binlog_server_search_by_gtid_set("search_ch", "$first_gtid") LIKE "%success%") = 1
+  --source include/assert.inc
+
+  --let $assert_text = search_by_gtid_set result contains file entries
+  --let $assert_cond = (SELECT binlog_server_search_by_gtid_set("search_ch", "$first_gtid") LIKE "%name%") = 1
+  --source include/assert.inc
+}
+
+--echo
+--echo # ==== Test 6: search_by_gtid_set with full executed set ====
+--let $full_gtid = `SELECT LAST_GTID_SET FROM performance_schema.replication_binlog_server_archive WHERE CHANNEL_NAME = 'search_ch' AND LAST_GTID_SET != '' ORDER BY FILE_NAME DESC LIMIT 1`
+if ($full_gtid)
+{
+  --let $assert_text = full GTID set search returns success
+  --let $assert_cond = (SELECT binlog_server_search_by_gtid_set("search_ch", "$full_gtid") LIKE "%success%") = 1
+  --source include/assert.inc
+
+  --let $assert_text = full GTID set search includes multiple files
+  --let $assert_cond = (SELECT LENGTH(binlog_server_search_by_gtid_set("search_ch", "$full_gtid")) > 100) = 1
+  --source include/assert.inc
+}
+
+--echo
+--echo # ==== Test 7: search_by_gtid_set with invalid GTID returns error ====
+--let $assert_text = invalid GTID set returns error JSON
+--let $assert_cond = (SELECT binlog_server_search_by_gtid_set("search_ch", "not-a-gtid") LIKE "%error%") = 1
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 8: search on nonexistent channel ====
+--let $assert_text = search_by_timestamp on bad channel returns error
+--let $assert_cond = (SELECT binlog_server_search_by_timestamp("no_such_channel", "2026-06-10T12:00:00") LIKE "%error%") = 1
+--source include/assert.inc
+
+--let $assert_text = search_by_gtid_set on bad channel returns error
+--let $assert_cond = (SELECT binlog_server_search_by_gtid_set("no_such_channel", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1") LIKE "%error%") = 1
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 9: Verify JSON structure has expected fields ====
+--let $assert_text = result contains min_timestamp field
+--let $assert_cond = (SELECT binlog_server_search_by_timestamp("search_ch", DATE_FORMAT(UTC_TIMESTAMP(), "%Y-%m-%dT%H:%i:%s")) LIKE "%min_timestamp%") = 1
+--source include/assert.inc
+--let $assert_text = result contains max_timestamp field
+--let $assert_cond = (SELECT binlog_server_search_by_timestamp("search_ch", DATE_FORMAT(UTC_TIMESTAMP(), "%Y-%m-%dT%H:%i:%s")) LIKE "%max_timestamp%") = 1
+--source include/assert.inc
+--let $assert_text = result contains previous_gtids field
+--let $assert_cond = (SELECT binlog_server_search_by_timestamp("search_ch", DATE_FORMAT(UTC_TIMESTAMP(), "%Y-%m-%dT%H:%i:%s")) LIKE "%previous_gtids%") = 1
+--source include/assert.inc
+--let $assert_text = result contains size field
+--let $assert_cond = (SELECT binlog_server_search_by_timestamp("search_ch", DATE_FORMAT(UTC_TIMESTAMP(), "%Y-%m-%dT%H:%i:%s")) LIKE "%size%") = 1
+--source include/assert.inc
+
+--echo
+--echo # ==== Test 10: search_by_gtid_set with NULL args returns NULL ====
+--let $assert_text = search_by_gtid_set with NULL channel returns NULL
+--let $assert_cond = (SELECT binlog_server_search_by_gtid_set(NULL, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1") IS NULL) = 1
+--source include/assert.inc
+--let $assert_text = search_by_timestamp with NULL channel returns NULL
+--let $assert_cond = (SELECT binlog_server_search_by_timestamp(NULL, "2026-06-10T12:00:00") IS NULL) = 1
+--source include/assert.inc
+
+--echo
+--echo # ---- Tear down ----
+--source include/rpl/connection_source.inc
+DROP TABLE t1;
+--let $rpl_channel_name = 'search_ch'
+--source include/rpl/sync_to_replica_received.inc
+--let $rpl_channel_name =
+
+--source include/rpl/connection_replica.inc
+STOP REPLICA IO_THREAD FOR CHANNEL 'search_ch';
+--let $rpl_channel_name = 'search_ch'
+--source include/rpl/wait_for_receiver_to_stop.inc
+--let $rpl_channel_name =
+RESET REPLICA ALL FOR CHANNEL 'search_ch';
+SET GLOBAL binlog_server.default_storage_uri = '';
+SET GLOBAL binlog_server.default_serve_channel = '';
+SET GLOBAL binlog_server.rewrite_file_size = 0;
+SET GLOBAL binlog_server.rewrite_base_name = '';
+
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+
+--exec rm -rf $store
+
+--let $rpl_skip_sync = 1
+--let $rpl_skip_stop_slave = 1
+--source include/rpl/deinit.inc

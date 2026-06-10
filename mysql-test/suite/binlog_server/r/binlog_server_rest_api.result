@@ -1,12 +1,10 @@
-CALL mtr.add_suppression("Component binlog_server_rest_api reported: 'REST API cannot start");
-CALL mtr.add_suppression("Component binlog_server_rest_api reported: 'REST API server not started");
 #
 # Binlog Server REST API component test
 #
 # Install both the core binlog server component and the REST API
 INSTALL COMPONENT 'file://component_binlog_server';
 INSTALL COMPONENT 'file://component_binlog_server_rest_api';
-# Verify system variables are registered
+# Verify system variables are registered (defaults: admin/admin)
 SELECT @@GLOBAL.binlog_server_rest_api.bind_address;
 @@GLOBAL.binlog_server_rest_api.bind_address
 127.0.0.1
@@ -16,14 +14,12 @@ SELECT @@GLOBAL.binlog_server_rest_api.port;
 SELECT @@GLOBAL.binlog_server_rest_api.username;
 @@GLOBAL.binlog_server_rest_api.username
 admin
-# Set password to trigger server start (update callback starts it)
-SET GLOBAL binlog_server_rest_api.password = 'testpass';
-# Wait for REST API server to start
+# Server starts automatically with default credentials
 # Test: health endpoint (no auth required)
 {"status":"ok"}# Test: status returns 401 without auth (curl -f returns exit code 22)
 # Test: status endpoint with Basic Auth (empty array since no channels configured)
 []# Test: variables endpoint returns binlog_server variables
-{"binlog_server.default_serve_channel":"","binlog_server.default_storage_uri":"","binlog_server.encryption":"OFF","binlog_server.rewrite_base_name":"","binlog_server.rewrite_file_size":"0","binlog_server.storage_root":"","binlog_server.trace_send_path":"OFF","binlog_server.user_channel_map":"","binlog_server_rest_api.bind_address":"127.0.0.1","binlog_server_rest_api.password":"testpass","binlog_server_rest_api.port":"8440","binlog_server_rest_api.ssl_cert":"","binlog_server_rest_api.ssl_key":"","binlog_server_rest_api.username":"admin"}# Test: topology endpoint
+{"binlog_server.default_serve_channel":"","binlog_server.default_storage_uri":"","binlog_server.encryption":"OFF","binlog_server.rewrite_base_name":"","binlog_server.rewrite_file_size":"0","binlog_server.storage_root":"","binlog_server.trace_send_path":"OFF","binlog_server.user_channel_map":"","binlog_server_rest_api.bind_address":"127.0.0.1","binlog_server_rest_api.password":"admin","binlog_server_rest_api.port":"8440","binlog_server_rest_api.ssl_cert":"","binlog_server_rest_api.ssl_key":"","binlog_server_rest_api.username":"admin"}# Test: topology endpoint
 {"sources":[],"channels":[],"downstream":[]}# Test: dashboard page returns HTML
 1
 # Uninstall (REST API first, then core)

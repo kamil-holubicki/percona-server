@@ -505,6 +505,94 @@ static char *binlog_server_rotate_key_func(UDF_INIT *, UDF_ARGS *args,
 
 static void binlog_server_rotate_key_deinit(UDF_INIT *) {}
 
+// ---- search_by_timestamp UDF ----
+
+static bool binlog_server_search_ts_init(UDF_INIT *initid, UDF_ARGS *args,
+                                         char *message) {
+  if (args->arg_count != 3 || args->arg_type[0] != STRING_RESULT ||
+      args->arg_type[1] != STRING_RESULT ||
+      args->arg_type[2] != STRING_RESULT) {
+    std::snprintf(message, MYSQL_ERRMSG_SIZE,
+                  "binlog_server_search_by_timestamp(channel, from, to) "
+                  "requires three string arguments");
+    return true;
+  }
+  initid->maybe_null = true;
+  initid->max_length = 65535;
+  initid->ptr = nullptr;
+  return false;
+}
+
+static char *binlog_server_search_ts_func(UDF_INIT *initid, UDF_ARGS *args,
+                                          char * /* result */,
+                                          unsigned long *length,
+                                          unsigned char *is_null,
+                                          unsigned char *error) {
+  if (!g_archive || args->args[0] == nullptr || args->args[1] == nullptr ||
+      args->args[2] == nullptr) {
+    *is_null = 1;
+    *error = 0;
+    return nullptr;
+  }
+  std::string json = g_archive->search_by_timestamp(
+      args->args[0], args->args[1], args->args[2]);
+  *is_null = 0;
+  *error = 0;
+  *length = static_cast<unsigned long>(json.size());
+  if (initid->ptr) free(initid->ptr);
+  initid->ptr = static_cast<char *>(malloc(*length + 1));
+  if (!initid->ptr) { *is_null = 1; return nullptr; }
+  std::memcpy(initid->ptr, json.c_str(), *length + 1);
+  return initid->ptr;
+}
+
+static void binlog_server_search_ts_deinit(UDF_INIT *initid) {
+  if (initid->ptr) { free(initid->ptr); initid->ptr = nullptr; }
+}
+
+// ---- search_by_gtid_set UDF ----
+
+static bool binlog_server_search_gtid_init(UDF_INIT *initid, UDF_ARGS *args,
+                                           char *message) {
+  if (args->arg_count != 2 || args->arg_type[0] != STRING_RESULT ||
+      args->arg_type[1] != STRING_RESULT) {
+    std::snprintf(message, MYSQL_ERRMSG_SIZE,
+                  "binlog_server_search_by_gtid_set(channel, gtid_set) "
+                  "requires two string arguments");
+    return true;
+  }
+  initid->maybe_null = true;
+  initid->max_length = 65535;
+  initid->ptr = nullptr;
+  return false;
+}
+
+static char *binlog_server_search_gtid_func(UDF_INIT *initid, UDF_ARGS *args,
+                                            char * /* result */,
+                                            unsigned long *length,
+                                            unsigned char *is_null,
+                                            unsigned char *error) {
+  if (!g_archive || args->args[0] == nullptr || args->args[1] == nullptr) {
+    *is_null = 1;
+    *error = 0;
+    return nullptr;
+  }
+  std::string json = g_archive->search_by_gtid_set(args->args[0],
+                                                   args->args[1]);
+  *is_null = 0;
+  *error = 0;
+  *length = static_cast<unsigned long>(json.size());
+  if (initid->ptr) free(initid->ptr);
+  initid->ptr = static_cast<char *>(malloc(*length + 1));
+  if (!initid->ptr) { *is_null = 1; return nullptr; }
+  std::memcpy(initid->ptr, json.c_str(), *length + 1);
+  return initid->ptr;
+}
+
+static void binlog_server_search_gtid_deinit(UDF_INIT *initid) {
+  if (initid->ptr) { free(initid->ptr); initid->ptr = nullptr; }
+}
+
 }  // extern "C"
 
 static bool archive_sender_dispatch(void *user_data, MYSQL_THD thd,
@@ -837,6 +925,26 @@ static mysql_service_status_t component_init() {
                          "binlog_server_rotate_encryption_key() UDF");
   }
 
+  // Register search UDFs
+  if (udf_registration_srv->udf_register(
+          "binlog_server_search_by_timestamp", STRING_RESULT,
+          reinterpret_cast<Udf_func_any>(binlog_server_search_ts_func),
+          binlog_server_search_ts_init,
+          binlog_server_search_ts_deinit)) {
+    binlog_server::bslog(WARNING_LEVEL,
+                         "binlog_server: failed to register "
+                         "binlog_server_search_by_timestamp() UDF");
+  }
+  if (udf_registration_srv->udf_register(
+          "binlog_server_search_by_gtid_set", STRING_RESULT,
+          reinterpret_cast<Udf_func_any>(binlog_server_search_gtid_func),
+          binlog_server_search_gtid_init,
+          binlog_server_search_gtid_deinit)) {
+    binlog_server::bslog(WARNING_LEVEL,
+                         "binlog_server: failed to register "
+                         "binlog_server_search_by_gtid_set() UDF");
+  }
+
   // Apply initial user_channel_map spec (CSV applies; table:// may fail
   // at startup auto-load when there is no SQL context)
   {
@@ -934,6 +1042,24 @@ static mysql_service_status_t component_deinit() {
     for (int i = 0; i < 10; ++i) {
       if (!udf_registration_srv->udf_unregister(
               "binlog_server_rotate_encryption_key", &was_present))
+        break;
+      if (was_present == 0) break;
+    }
+  }
+  {
+    int was_present = 0;
+    for (int i = 0; i < 10; ++i) {
+      if (!udf_registration_srv->udf_unregister(
+              "binlog_server_search_by_timestamp", &was_present))
+        break;
+      if (was_present == 0) break;
+    }
+  }
+  {
+    int was_present = 0;
+    for (int i = 0; i < 10; ++i) {
+      if (!udf_registration_srv->udf_unregister(
+              "binlog_server_search_by_gtid_set", &was_present))
         break;
       if (was_present == 0) break;
     }

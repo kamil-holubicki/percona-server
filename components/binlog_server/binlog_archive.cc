@@ -20,6 +20,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -809,20 +810,11 @@ std::string extract_previous_gtids_text(const char *event_buf,
   const unsigned payload_len = event_len - overhead;
   if (payload_len < 1) return {};
 
-  // Flag-encoding (0x01 byte): remaining bytes are raw GTID text
-  if (p[0] == 0x01 && payload_len > 1) {
-    return std::string(reinterpret_cast<const char *>(p + 1), payload_len - 1);
-  }
-
-  // SID-encoding (flag byte absent or 0x00): binary format
-  // Layout: n_sids (8 bytes) + for each SID: uuid (16) + n_intervals (8) +
-  //          intervals (n_intervals * 16 bytes: start(8) + end(8))
+  // Binary SID-encoding: n_sids (8 bytes LE) + for each SID: uuid (16) +
+  // n_intervals (8) + intervals (n_intervals * 16 bytes: start(8) + end(8))
   const unsigned char *cursor = p;
   const unsigned char *end_ptr = p + payload_len;
 
-  // Check if first byte is 0x00 (explicit flag) vs direct n_sids
-  // MySQL uses flag encoding when the byte is 0x01; otherwise the
-  // payload starts directly with n_sids (8 bytes LE).
   if (payload_len < 8) return {};
 
   uint64_t n_sids = read_u64_le(cursor);
@@ -2049,6 +2041,217 @@ long long BinlogArchive::purge_before_timestamp(const char *channel_name,
           name.c_str(), purged, timestamp);
   }
   return purged;
+}
+
+// ---------------------------------------------------------------------------
+// Search helpers
+// ---------------------------------------------------------------------------
+
+static uint32_t parse_iso_timestamp(const char *s) {
+  if (s == nullptr || s[0] == '\0') return 0;
+  struct tm tm {};
+  const char *p = strptime(s, "%Y-%m-%dT%H:%M:%S", &tm);
+  if (p == nullptr) {
+    p = strptime(s, "%Y-%m-%d %H:%M:%S", &tm);
+  }
+  if (p == nullptr) return 0;
+  time_t t = timegm(&tm);
+  return (t <= 0) ? 0 : static_cast<uint32_t>(t);
+}
+
+static std::string escape_json_string(const std::string &s) {
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (char c : s) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default: out += c;
+    }
+  }
+  return out;
+}
+
+static std::string format_iso_timestamp(uint32_t ts) {
+  if (ts == 0) return "";
+  time_t t = static_cast<time_t>(ts);
+  struct tm tm {};
+  gmtime_r(&t, &tm);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+  return buf;
+}
+
+static std::string file_meta_to_json(const std::string &name,
+                                     const std::string &base_dir,
+                                     const FileMetadata &fm) {
+  std::string gtids_text;
+  if (!fm.last_gtid_set.empty()) {
+    gtid::Gtid_set last;
+    if (last.assign_from_text(fm.last_gtid_set)) {
+      if (!fm.previous_gtid_set.empty()) {
+        gtid::Gtid_set prev;
+        if (prev.assign_from_text(fm.previous_gtid_set))
+          gtids_text = last.subtract(prev).to_text();
+        else
+          gtids_text = fm.last_gtid_set;
+      } else {
+        gtids_text = fm.last_gtid_set;
+      }
+    }
+  }
+
+  std::string o = "{";
+  o += "\"name\":\"" + escape_json_string(name) + "\"";
+  o += ",\"size\":" + std::to_string(fm.size_bytes);
+  o += ",\"uri\":\"file://" + escape_json_string(base_dir + name) + "\"";
+  o += ",\"min_timestamp\":\"" + format_iso_timestamp(fm.min_event_timestamp) +
+       "\"";
+  o += ",\"max_timestamp\":\"" + format_iso_timestamp(fm.max_event_timestamp) +
+       "\"";
+  o += ",\"gtids\":\"" + escape_json_string(gtids_text) + "\"";
+  o += "}";
+  return o;
+}
+
+std::string BinlogArchive::search_by_timestamp(const char *channel_name,
+                                               const char *iso_from,
+                                               const char *iso_to) {
+  if (iso_from == nullptr || iso_from[0] == '\0' || iso_to == nullptr ||
+      iso_to[0] == '\0')
+    return R"js({"status":"error","message":"Both from and to timestamps are required (ISO-8601)"})js";
+
+  const uint32_t ts_from = parse_iso_timestamp(iso_from);
+  const uint32_t ts_to = parse_iso_timestamp(iso_to);
+  if (ts_from == 0 || ts_to == 0)
+    return R"js({"status":"error","message":"Invalid timestamp format (use YYYY-MM-DDTHH:MM:SS)"})js";
+  if (ts_from > ts_to)
+    return R"({"status":"error","message":"'from' must be earlier than 'to'"})";
+
+  std::string name = channel_name != nullptr ? channel_name : "";
+  auto cs_ptr = find_channel(name);
+  if (!cs_ptr)
+    return R"({"status":"error","message":"Channel not found"})";
+
+  std::lock_guard<std::mutex> lk(cs_ptr->io_mutex);
+  load_index_file(*cs_ptr);
+
+  auto &fo = cs_ptr->file_order;
+  if (fo.empty())
+    return R"({"status":"error","message":"Binlog storage is empty"})";
+
+  // Find files that overlap with [ts_from, ts_to].
+  // A file overlaps if: file.min <= ts_to AND file.max >= ts_from
+  std::string result_arr = "[";
+  bool first = true;
+  for (const auto &fname : fo) {
+    auto it = cs_ptr->file_metadata.find(fname);
+    if (it == cs_ptr->file_metadata.end()) continue;
+    const auto &fm = it->second;
+
+    if (fm.min_event_timestamp == 0) continue;
+
+    if (fm.min_event_timestamp > ts_to) break;
+
+    if (fm.max_event_timestamp >= ts_from) {
+      if (!first) result_arr += ",";
+      result_arr += file_meta_to_json(fname, cs_ptr->base_dir, fm);
+      first = false;
+    }
+  }
+  result_arr += "]";
+
+  return "{\"status\":\"success\",\"result\":" + result_arr + "}";
+}
+
+std::string BinlogArchive::search_by_gtid_set(const char *channel_name,
+                                              const char *gtid_set_text) {
+  if (gtid_set_text == nullptr || gtid_set_text[0] == '\0')
+    return R"({"status":"error","message":"cannot parse GTID set"})";
+
+  gtid::Gtid_set requested;
+  if (!requested.assign_from_text(gtid_set_text))
+    return R"({"status":"error","message":"cannot parse GTID set"})";
+
+  if (requested.empty())
+    return R"({"status":"error","message":"cannot parse GTID set"})";
+
+  std::string name = channel_name != nullptr ? channel_name : "";
+  auto cs_ptr = find_channel(name);
+  if (!cs_ptr)
+    return R"({"status":"error","message":"Channel not found"})";
+
+  std::lock_guard<std::mutex> lk(cs_ptr->io_mutex);
+  load_index_file(*cs_ptr);
+
+  auto &fo = cs_ptr->file_order;
+  if (fo.empty())
+    return R"({"status":"error","message":"Binlog storage is empty"})";
+
+  // Check if any file has GTID metadata
+  bool has_gtid_meta = false;
+  for (const auto &fname : fo) {
+    auto it = cs_ptr->file_metadata.find(fname);
+    if (it != cs_ptr->file_metadata.end() &&
+        !it->second.last_gtid_set.empty()) {
+      has_gtid_meta = true;
+      break;
+    }
+  }
+  if (!has_gtid_meta)
+    return R"({"status":"error","message":"GTID set search is not supported in storages created in position-based replication mode"})";
+
+  // Find minimal set of files that contain GTIDs from the requested set.
+  // A file is included only if its last_gtid_set actually overlaps with
+  // the requested set (i.e., the file contains relevant GTIDs).
+  // Once last_gtid_set fully covers the requested set, stop.
+  std::string result_arr = "[";
+  bool first = true;
+  bool covered = false;
+
+  for (const auto &fname : fo) {
+    auto it = cs_ptr->file_metadata.find(fname);
+    if (it == cs_ptr->file_metadata.end()) continue;
+    const auto &fm = it->second;
+
+    // If previous_gtids already covers everything requested, done
+    if (!fm.previous_gtid_set.empty()) {
+      gtid::Gtid_set prev;
+      if (prev.assign_from_text(fm.previous_gtid_set)) {
+        if (requested.is_subset_of(prev)) {
+          covered = true;
+          break;
+        }
+      }
+    }
+
+    // Skip file if its cumulative last_gtid_set has no overlap with requested
+    if (!fm.last_gtid_set.empty()) {
+      gtid::Gtid_set last;
+      if (last.assign_from_text(fm.last_gtid_set)) {
+        if (!requested.intersects(last)) continue;
+
+        // File has relevant GTIDs — include it
+        if (!first) result_arr += ",";
+        result_arr += file_meta_to_json(fname, cs_ptr->base_dir, fm);
+        first = false;
+
+        if (requested.is_subset_of(last)) {
+          covered = true;
+          break;
+        }
+      }
+    }
+  }
+  result_arr += "]";
+
+  if (!covered && first)
+    return R"({"status":"error","message":"The specified GTID set cannot be covered"})";
+
+  return "{\"status\":\"success\",\"result\":" + result_arr + "}";
 }
 
 }  // namespace binlog_server

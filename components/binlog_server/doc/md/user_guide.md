@@ -551,6 +551,8 @@ a keyring or any special configuration.
 | `binlog_server_purge_channel(channel, up_to_file)` | INT (files purged) or NULL on error | Removes archive files from the oldest up to and including the named file. The active (tail) file can never be purged. |
 | `binlog_server_purge_before_gtid(channel, gtid_set)` | INT (files purged) or NULL on error | Removes archive files whose accumulated GTID set is fully contained in the given set. Files are processed from oldest to newest; stops at the first file not fully contained. |
 | `binlog_server_purge_before_timestamp(channel, unix_ts)` | INT (files purged) or NULL on error | Removes archive files whose `max_event_timestamp` is below the given Unix timestamp (seconds). |
+| `binlog_server_search_by_timestamp(channel, iso_timestamp)` | JSON string | Finds binlog files spanning the given timestamp. The timestamp must be ISO-8601 format (`YYYY-MM-DDTHH:MM:SS` or `YYYY-MM-DD HH:MM:SS`, UTC). Returns `{"status":"success","result":[...]}` with file details, or `{"status":"error","message":"..."}` on failure. |
+| `binlog_server_search_by_gtid_set(channel, gtid_set)` | JSON string | Finds the minimal set of binlog files needed to cover the given GTID set. Returns `{"status":"success","result":[...]}` with file details, or `{"status":"error","message":"..."}` on failure. |
 
 ### Examples
 
@@ -570,6 +572,14 @@ SELECT binlog_server_purge_before_timestamp('prod_primary', UNIX_TIMESTAMP() - 8
 -- Purge files whose GTIDs are fully contained in the replica's executed set.
 SELECT binlog_server_purge_before_gtid('prod_primary',
     'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-100');
+
+-- Search: find files containing events at or before a specific time (PITR).
+SELECT binlog_server_search_by_timestamp('prod_primary',
+    '2026-06-10T14:30:00');
+
+-- Search: find the minimal file set covering a GTID range.
+SELECT binlog_server_search_by_gtid_set('prod_primary',
+    'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-50');
 ```
 
 ### Purge safety rules
@@ -804,6 +814,7 @@ All endpoints (except health) require HTTP Basic Auth.
 | `GET /api/v1/archive/:channel` | Per-file archive listing |
 | `GET /api/v1/variables` | All binlog_server system variables |
 | `GET /api/v1/topology` | Topology: sources, channels, downstream replicas |
+| `GET /api/v1/range/:channel` | Available timestamp range and GTID coverage for a channel |
 | `GET /api/v1/threads` | Debug: all foreground threads (useful for troubleshooting) |
 
 #### Operations (POST)
@@ -816,6 +827,8 @@ All endpoints (except health) require HTTP Basic Auth.
 | `POST /api/v1/rotate-key` | `{"channel":"..."}` | Rotate encryption key |
 | `POST /api/v1/reload-map` | (empty) | Reload user channel map |
 | `POST /api/v1/rebuild-index` | `{"channel":"..."}` | Rebuild archive index |
+| `POST /api/v1/search/by-timestamp` | `{"channel":"...","timestamp":"ISO-8601"}` | Search files spanning a timestamp |
+| `POST /api/v1/search/by-gtid-set` | `{"channel":"...","gtid_set":"..."}` | Search minimal file set for a GTID range |
 
 #### Configuration (PUT)
 
@@ -834,6 +847,8 @@ The component serves a built-in web dashboard at `GET /`. Open
 - **Replicas** — connected downstream replicas with connection details
 - **Storage** — per-channel storage summary
 - **Archive** — file-level archive browser (select channel from dropdown)
+- **Search** — search by timestamp or GTID set; shows available data range
+  (earliest/latest timestamps, first/last GTID sets) and result file listing
 - **Operations** — purge, key rotation, map reload (channel selectable via dropdown)
 - **Configuration** — live system variable editor
 
@@ -867,6 +882,21 @@ curl -u admin:password -X POST \
   -H "Content-Type: application/json" \
   -d '{"channel":"prod"}' \
   http://127.0.0.1:8440/api/v1/rotate-key
+
+# Get available data range for a channel
+curl -u admin:password http://127.0.0.1:8440/api/v1/range/prod
+
+# Search by timestamp (ISO-8601 format, UTC)
+curl -u admin:password -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"prod","timestamp":"2026-06-10T14:30:00"}' \
+  http://127.0.0.1:8440/api/v1/search/by-timestamp
+
+# Search by GTID set
+curl -u admin:password -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"prod","gtid_set":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-50"}' \
+  http://127.0.0.1:8440/api/v1/search/by-gtid-set
 ```
 
 ## Troubleshooting

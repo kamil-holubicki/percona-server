@@ -475,6 +475,125 @@ void register_handlers(httplib::Server &svr,
     obj.add("value", value);
     res.set_content(obj.str(), "application/json");
   });
+
+  // POST /api/v1/search/by-timestamp
+  svr.Post("/api/v1/search/by-timestamp", [](const httplib::Request &req,
+                                             httplib::Response &res) {
+    std::string ch = sql_escape(parse_json_string(req.body, "channel"));
+    std::string ts_from = sql_escape(parse_json_string(req.body, "from"));
+    std::string ts_to = sql_escape(parse_json_string(req.body, "to"));
+    if (ch.empty() || ts_from.empty() || ts_to.empty()) {
+      res.status = 400;
+      res.set_content(error_json("channel, from, and to required"),
+                      "application/json");
+      return;
+    }
+    auto r = execute_query(
+        "SELECT binlog_server_search_by_timestamp('" + ch + "', '" + ts_from +
+        "', '" + ts_to + "') AS result");
+    if (!r.ok) {
+      res.status = 500;
+      res.set_content(error_json(r.error), "application/json");
+      return;
+    }
+    std::string json_result =
+        (r.rows.empty() || r.rows[0].values.empty()) ? "{}" :
+        r.rows[0].values[0];
+    res.set_content(json_result, "application/json");
+  });
+
+  // POST /api/v1/search/by-gtid-set
+  svr.Post("/api/v1/search/by-gtid-set", [](const httplib::Request &req,
+                                            httplib::Response &res) {
+    std::string ch = sql_escape(parse_json_string(req.body, "channel"));
+    std::string gtid = sql_escape(parse_json_string(req.body, "gtid_set"));
+    if (ch.empty() || gtid.empty()) {
+      res.status = 400;
+      res.set_content(error_json("channel and gtid_set required"),
+                      "application/json");
+      return;
+    }
+    auto r = execute_query(
+        "SELECT binlog_server_search_by_gtid_set('" + ch + "', '" + gtid +
+        "') AS result");
+    if (!r.ok) {
+      res.status = 500;
+      res.set_content(error_json(r.error), "application/json");
+      return;
+    }
+    std::string json_result =
+        (r.rows.empty() || r.rows[0].values.empty()) ? "{}" :
+        r.rows[0].values[0];
+    res.set_content(json_result, "application/json");
+  });
+
+  // GET /api/v1/range/:channel
+  svr.Get("/api/v1/range/:channel", [](const httplib::Request &req,
+                                       httplib::Response &res) {
+    std::string ch = sql_escape(req.path_params.at("channel"));
+    if (ch.empty()) {
+      res.status = 400;
+      res.set_content(error_json("channel required"), "application/json");
+      return;
+    }
+
+    std::string sql =
+        "SELECT "
+        "DATE_FORMAT(CONVERT_TZ(MIN(MIN_EVENT_TIMESTAMP), "
+        "@@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%s') AS min_ts, "
+        "DATE_FORMAT(CONVERT_TZ(MAX(MAX_EVENT_TIMESTAMP), "
+        "@@session.time_zone, '+00:00'), '%Y-%m-%dT%H:%i:%s') AS max_ts, "
+        "COALESCE("
+        " (SELECT LAST_GTID_SET"
+        "  FROM performance_schema.replication_binlog_server_archive"
+        "  WHERE CHANNEL_NAME = '" + ch + "' AND LAST_GTID_SET != ''"
+        "  ORDER BY FILE_NAME ASC LIMIT 1),"
+        " (SELECT PREVIOUS_GTID_SET"
+        "  FROM performance_schema.replication_binlog_server_archive"
+        "  WHERE CHANNEL_NAME = '" + ch + "' AND PREVIOUS_GTID_SET != ''"
+        "  ORDER BY FILE_NAME ASC LIMIT 1)"
+        ") AS first_gtid_set, "
+        "COALESCE("
+        " (SELECT LAST_GTID_SET"
+        "  FROM performance_schema.replication_binlog_server_archive"
+        "  WHERE CHANNEL_NAME = '" + ch + "' AND LAST_GTID_SET != ''"
+        "  ORDER BY FILE_NAME DESC LIMIT 1),"
+        " (SELECT PREVIOUS_GTID_SET"
+        "  FROM performance_schema.replication_binlog_server_archive"
+        "  WHERE CHANNEL_NAME = '" + ch + "' AND PREVIOUS_GTID_SET != ''"
+        "  ORDER BY FILE_NAME DESC LIMIT 1)"
+        ") AS last_gtid_set "
+        "FROM performance_schema.replication_binlog_server_archive "
+        "WHERE CHANNEL_NAME = '" + ch + "'";
+
+    auto r = execute_query(sql);
+    if (!r.ok) {
+      res.status = 500;
+      res.set_content(error_json(r.error), "application/json");
+      return;
+    }
+    if (r.rows.empty()) {
+      res.set_content("{\"min_ts\":null,\"max_ts\":null,"
+                      "\"first_gtid_set\":\"\",\"last_gtid_set\":\"\"}",
+                      "application/json");
+      return;
+    }
+
+    auto val_or_empty = [&](size_t idx) -> std::string {
+      if (idx >= r.rows[0].values.size()) return "";
+      const auto &v = r.rows[0].values[idx];
+      return (v.empty() || v == "NULL") ? "" : v;
+    };
+
+    json::Object obj;
+    obj.add("min_ts", val_or_empty(0));
+    obj.add("max_ts", val_or_empty(1));
+    obj.add("first_gtid_set",
+            r.rows[0].values.size() > 2 ? r.rows[0].values[2] : "");
+    obj.add("last_gtid_set",
+            r.rows[0].values.size() > 3 ? r.rows[0].values[3] : "");
+    res.set_content(obj.str(), "application/json");
+  });
 }
 
 }  // namespace rest_api

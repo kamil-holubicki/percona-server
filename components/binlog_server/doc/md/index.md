@@ -98,7 +98,7 @@ SET GLOBAL binlog_server.default_serve_channel = 'src_a';
 | **Durable at transaction boundaries** | Every `Xid` / `XA_prepare` event triggers an `fsync(2)`, ensuring committed transactions survive a power loss. |
 | **At-rest encryption** | Optional AES-256-CTR encryption with keyring-managed master keys. Online key rotation without stopping collection. Transparent decryption when serving to replicas. |
 
-## Current status (Phase 1–7)
+## Current status (Phase 1–8)
 
 **Phase 1** — collection path:
 
@@ -168,10 +168,17 @@ SET GLOBAL binlog_server.default_serve_channel = 'src_a';
 - Dashboard shows sources, channels, storage, downstream replicas as animated SVG
 - All operations accessible via both SQL and REST endpoints
 
+**Phase 8** — search by timestamp / GTID set:
+
+- `binlog_server_search_by_timestamp(channel, iso_timestamp)` UDF — finds binlog files spanning a timestamp (for PITR)
+- `binlog_server_search_by_gtid_set(channel, gtid_set)` UDF — finds minimal file set covering a GTID range
+- REST endpoints: `POST /api/v1/search/by-timestamp`, `POST /api/v1/search/by-gtid-set`, `GET /api/v1/range/:channel`
+- Dashboard "Search" tab with available range display and interactive search forms
+- ISO-8601 timestamp parsing (`YYYY-MM-DDTHH:MM:SS` or `YYYY-MM-DD HH:MM:SS`, UTC)
+
 **Not yet implemented** (planned for later phases):
 - S3-compatible object storage backend (stubs in place)
 - Local rotation / rewriting (stubs in place)
-- Point-in-time search queries (`search_by_timestamp`, `search_by_gtid_set`)
 
 ## License
 

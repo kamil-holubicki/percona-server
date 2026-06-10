@@ -168,6 +168,14 @@ class BinlogArchive {
   long long purge_before_timestamp(const char *channel_name,
                                    unsigned long timestamp);
 
+  // Search: find files overlapping a [from, to] timestamp range (ISO-8601)
+  std::string search_by_timestamp(const char *channel_name,
+                                  const char *iso_from, const char *iso_to);
+
+  // Search: find minimal file set covering the given GTID set
+  std::string search_by_gtid_set(const char *channel_name,
+                                 const char *gtid_set_text);
+
  private:
   std::shared_ptr<ChannelState> find_channel(const std::string &name);
   std::unique_ptr<StorageBackend> create_backend(const std::string &uri);

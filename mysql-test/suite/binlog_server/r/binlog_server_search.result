@@ -1,0 +1,97 @@
+include/rpl/init_source_replica.inc
+[connection master]
+
+# ---- Setup binlog server ----
+[connection slave]
+INSTALL COMPONENT 'file://component_binlog_server';
+INSTALL PLUGIN binlog_server_relay SONAME 'BINLOG_SERVER_RELAY';
+CHANGE REPLICATION SOURCE TO
+SOURCE_HOST = '127.0.0.1',
+SOURCE_PORT = SOURCE_PORT,
+SOURCE_USER = 'root',
+SOURCE_AUTO_POSITION = 1,
+BINLOG_SERVER = 1,
+BINLOG_SERVER_STORAGE_URI = 'file://STORE/'
+  FOR CHANNEL 'search_ch';
+Warnings:
+Note	1759	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	1760	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+START REPLICA IO_THREAD FOR CHANNEL 'search_ch';
+include/rpl/wait_for_receiver_to_start.inc [FOR CHANNEL 'search_ch']
+
+# ---- Generate traffic to create multiple binlog files ----
+[connection master]
+CREATE TABLE t1 (id INT PRIMARY KEY, val VARCHAR(50));
+INSERT INTO t1 VALUES (1, 'one');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (2, 'two');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (3, 'three');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (4, 'four');
+FLUSH BINARY LOGS;
+INSERT INTO t1 VALUES (5, 'five');
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'search_ch']
+
+# ---- Rebuild archive index to populate metadata ----
+[connection slave]
+SELECT binlog_server_rebuild_archive_index('search_ch') >= 0 AS rebuild_ok;
+rebuild_ok
+1
+
+# ---- Verify we have multiple files in archive ----
+include/assert.inc [archive has at least 5 files]
+
+# ==== Test 1: search_by_timestamp - returns JSON with success ====
+include/assert.inc [search_by_timestamp returns success status]
+include/assert.inc [search_by_timestamp result contains file names]
+
+# ==== Test 2: search_by_timestamp with far future - returns all files ====
+include/assert.inc [future timestamp returns success with file entries]
+
+# ==== Test 3: search_by_timestamp with very old timestamp - returns error ====
+include/assert.inc [ancient timestamp returns error]
+
+# ==== Test 4: search_by_timestamp with invalid format ====
+include/assert.inc [invalid timestamp format returns error]
+
+# ==== Test 5: search_by_gtid_set - returns matching files ====
+include/assert.inc [search_by_gtid_set returns success]
+include/assert.inc [search_by_gtid_set result contains file entries]
+
+# ==== Test 6: search_by_gtid_set with full executed set ====
+include/assert.inc [full GTID set search returns success]
+include/assert.inc [full GTID set search includes multiple files]
+
+# ==== Test 7: search_by_gtid_set with invalid GTID returns error ====
+include/assert.inc [invalid GTID set returns error JSON]
+
+# ==== Test 8: search on nonexistent channel ====
+include/assert.inc [search_by_timestamp on bad channel returns error]
+include/assert.inc [search_by_gtid_set on bad channel returns error]
+
+# ==== Test 9: Verify JSON structure has expected fields ====
+include/assert.inc [result contains min_timestamp field]
+include/assert.inc [result contains max_timestamp field]
+include/assert.inc [result contains previous_gtids field]
+include/assert.inc [result contains size field]
+
+# ==== Test 10: search_by_gtid_set with NULL args returns NULL ====
+include/assert.inc [search_by_gtid_set with NULL channel returns NULL]
+include/assert.inc [search_by_timestamp with NULL channel returns NULL]
+
+# ---- Tear down ----
+[connection master]
+DROP TABLE t1;
+include/rpl/sync_to_replica_received.inc [FOR CHANNEL 'search_ch']
+[connection slave]
+STOP REPLICA IO_THREAD FOR CHANNEL 'search_ch';
+include/rpl/wait_for_receiver_to_stop.inc [FOR CHANNEL 'search_ch']
+RESET REPLICA ALL FOR CHANNEL 'search_ch';
+SET GLOBAL binlog_server.default_storage_uri = '';
+SET GLOBAL binlog_server.default_serve_channel = '';
+SET GLOBAL binlog_server.rewrite_file_size = 0;
+SET GLOBAL binlog_server.rewrite_base_name = '';
+UNINSTALL PLUGIN binlog_server_relay;
+UNINSTALL COMPONENT 'file://component_binlog_server';
+include/rpl/deinit.inc

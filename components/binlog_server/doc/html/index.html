@@ -212,7 +212,7 @@ flowchart LR
 </tr>
 </tbody>
 </table>
-<h2 id="current-status-phase-17">Current status (Phase 1–7)<a class="headerlink" href="#current-status-phase-17" title="Permanent link">&#x00B6;</a></h2>
+<h2 id="current-status-phase-18">Current status (Phase 1–8)<a class="headerlink" href="#current-status-phase-18" title="Permanent link">&#x00B6;</a></h2>
 <p><strong>Phase 1</strong> — collection path:</p>
 <ul>
 <li>Receive binlogs from upstream sources via the IO thread</li>
@@ -281,10 +281,17 @@ flowchart LR
 <li>Dashboard shows sources, channels, storage, downstream replicas as animated SVG</li>
 <li>All operations accessible via both SQL and REST endpoints</li>
 </ul>
+<p><strong>Phase 8</strong> — search by timestamp / GTID set:</p>
+<ul>
+<li><code>binlog_server_search_by_timestamp(channel, iso_timestamp)</code> UDF — finds binlog files spanning a timestamp (for PITR)</li>
+<li><code>binlog_server_search_by_gtid_set(channel, gtid_set)</code> UDF — finds minimal file set covering a GTID range</li>
+<li>REST endpoints: <code>POST /api/v1/search/by-timestamp</code>, <code>POST /api/v1/search/by-gtid-set</code>, <code>GET /api/v1/range/:channel</code></li>
+<li>Dashboard "Search" tab with available range display and interactive search forms</li>
+<li>ISO-8601 timestamp parsing (<code>YYYY-MM-DDTHH:MM:SS</code> or <code>YYYY-MM-DD HH:MM:SS</code>, UTC)</li>
+</ul>
 <p><strong>Not yet implemented</strong> (planned for later phases):
 - S3-compatible object storage backend (stubs in place)
-- Local rotation / rewriting (stubs in place)
-- Point-in-time search queries (<code>search_by_timestamp</code>, <code>search_by_gtid_set</code>)</p>
+- Local rotation / rewriting (stubs in place)</p>
 <h2 id="license">License<a class="headerlink" href="#license" title="Permanent link">&#x00B6;</a></h2>
 <p>GPLv2, matching the rest of Percona Server.</p>
     <footer class="docfoot">

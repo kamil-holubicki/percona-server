@@ -209,6 +209,43 @@ bool Gtid_set::is_subset_of(const Gtid_set &other) const {
   return true;
 }
 
+bool Gtid_set::intersects(const Gtid_set &other) const {
+  for (const auto &[tsid, ivs] : m_by_tsid) {
+    const auto oit = other.m_by_tsid.find(tsid);
+    if (oit == other.m_by_tsid.end()) continue;
+    for (const auto &iv : ivs) {
+      for (const auto &oiv : oit->second) {
+        if (iv.first <= oiv.second && oiv.first <= iv.second) return true;
+        if (oiv.first > iv.second) break;
+      }
+    }
+  }
+  return false;
+}
+
+Gtid_set Gtid_set::subtract(const Gtid_set &other) const {
+  Gtid_set result;
+  for (const auto &[tsid, ivs] : m_by_tsid) {
+    const auto oit = other.m_by_tsid.find(tsid);
+    if (oit == other.m_by_tsid.end()) {
+      result.m_by_tsid[tsid] = ivs;
+      continue;
+    }
+    for (const auto &iv : ivs) {
+      std::int64_t lo = iv.first;
+      const std::int64_t hi = iv.second;
+      for (const auto &oiv : oit->second) {
+        if (oiv.second < lo) continue;
+        if (oiv.first > hi) break;
+        if (oiv.first > lo) result.add_range(tsid, lo, oiv.first - 1);
+        lo = oiv.second + 1;
+      }
+      if (lo <= hi) result.add_range(tsid, lo, hi);
+    }
+  }
+  return result;
+}
+
 std::string Gtid_set::to_text() const {
   if (m_by_tsid.empty()) return {};
   std::ostringstream oss;

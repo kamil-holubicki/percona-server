@@ -48,6 +48,10 @@ class Gtid_set {
 
   bool is_subset_of(const Gtid_set &other) const;
 
+  bool intersects(const Gtid_set &other) const;
+
+  Gtid_set subtract(const Gtid_set &other) const;
+
   std::string to_text() const;
 
  private:

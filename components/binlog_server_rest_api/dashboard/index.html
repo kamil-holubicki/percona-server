@@ -110,6 +110,7 @@ nav button:hover:not(.active) { color: var(--fg); background: var(--bg3); }
     <button data-panel="replicas">Replicas</button>
     <button data-panel="storage">Storage</button>
     <button data-panel="archive">Archive</button>
+    <button data-panel="search">Search</button>
     <button data-panel="operations">Operations</button>
     <button data-panel="config">Configuration</button>
   </nav>
@@ -146,6 +147,44 @@ nav button:hover:not(.active) { color: var(--fg); background: var(--bg3); }
       </select>
     </div>
     <div id="archive-table-container"></div>
+  </div>
+
+  <div class="panel" id="panel-search">
+    <div class="cards" style="grid-template-columns: 1fr 1fr; margin-bottom: 16px;">
+      <div class="card">
+        <h3>Channel & Available Range</h3>
+        <select id="search-channel-select" class="channel-select" style="width:100%;padding:8px 12px;margin-bottom:12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-family:var(--mono);font-size:0.82rem;">
+          <option value="">Select channel...</option>
+        </select>
+        <div id="search-range-info" style="font-size:0.82rem;color:var(--fg2);font-family:var(--mono);">
+          <div style="margin-bottom:8px;font-weight:600;color:var(--fg);font-size:0.85rem;">Timestamp range</div>
+          <div class="card-row"><span class="label">From</span><span class="value" id="range-min-ts">—</span></div>
+          <div class="card-row"><span class="label">To</span><span class="value" id="range-max-ts">—</span></div>
+          <div style="margin-top:12px;margin-bottom:8px;font-weight:600;color:var(--fg);font-size:0.85rem;">GTID coverage</div>
+          <div class="card-row"><span class="label">Available</span><span class="value" id="range-last-gtid" style="word-break:break-all;max-width:280px;">—</span></div>
+        </div>
+      </div>
+      <div class="card" style="display:flex;flex-direction:column;gap:16px;">
+        <div>
+          <h3>Search by Timestamp</h3>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+            <label style="font-size:0.8rem;color:var(--fg2);min-width:32px;">From</label>
+            <input type="text" id="search-ts-from" placeholder="YYYY-MM-DDTHH:MM:SS" style="flex:1;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-family:var(--mono);font-size:0.82rem;">
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+            <label style="font-size:0.8rem;color:var(--fg2);min-width:32px;">To</label>
+            <input type="text" id="search-ts-to" placeholder="YYYY-MM-DDTHH:MM:SS" style="flex:1;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-family:var(--mono);font-size:0.82rem;">
+          </div>
+          <button onclick="doSearchTimestamp()" style="padding:8px 16px;background:var(--accent);color:#000;border:none;border-radius:6px;font-weight:600;cursor:pointer;font-size:0.82rem;">Search</button>
+        </div>
+        <div>
+          <h3>Search by GTID Set</h3>
+          <textarea id="search-gtid-input" rows="3" placeholder="e.g. uuid:1-100" style="width:100%;padding:8px 12px;margin-bottom:8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--fg);font-family:var(--mono);font-size:0.82rem;resize:vertical;"></textarea>
+          <button onclick="doSearchGtid()" style="padding:8px 16px;background:var(--accent);color:#000;border:none;border-radius:6px;font-weight:600;cursor:pointer;font-size:0.82rem;">Search</button>
+        </div>
+      </div>
+    </div>
+    <div id="search-result-container"></div>
   </div>
 
   <div class="panel" id="panel-operations">
@@ -358,6 +397,52 @@ function renderStorage(data) {
   }).join('');
 }
 
+// Compute contributed GTIDs: subtract previous from last (text-based, single-UUID fast path)
+function computeContributedGtids(prev, last) {
+  if (!last) return '';
+  if (!prev) return last;
+  try {
+    const parseSets = s => {
+      const m = {};
+      s.split(',').forEach(part => {
+        part = part.trim(); if (!part) return;
+        const ci = part.indexOf(':');
+        if (ci < 0) return;
+        const uuid = part.substring(0, ci);
+        const ranges = part.substring(ci + 1).split(':').map(r => {
+          const [lo, hi] = r.split('-').map(Number);
+          return [lo, hi || lo];
+        });
+        m[uuid] = (m[uuid] || []).concat(ranges);
+      });
+      return m;
+    };
+    const subtractIntervals = (ivs, sub) => {
+      const result = [];
+      for (let [lo, hi] of ivs) {
+        for (const [slo, shi] of sub) {
+          if (shi < lo) continue;
+          if (slo > hi) break;
+          if (slo > lo) result.push([lo, slo - 1]);
+          lo = shi + 1;
+        }
+        if (lo <= hi) result.push([lo, hi]);
+      }
+      return result;
+    };
+    const lastMap = parseSets(last), prevMap = parseSets(prev);
+    const parts = [];
+    for (const [uuid, ivs] of Object.entries(lastMap)) {
+      const sub = prevMap[uuid] || [];
+      const diff = subtractIntervals(ivs, sub);
+      if (diff.length > 0) {
+        parts.push(uuid + diff.map(([lo, hi]) => ':' + (lo === hi ? lo : lo + '-' + hi)).join(''));
+      }
+    }
+    return parts.join(',');
+  } catch(e) { return last; }
+}
+
 // Archive table
 async function loadArchive(channel) {
   if (!channel) return;
@@ -365,9 +450,18 @@ async function loadArchive(channel) {
     const data = await api('/api/v1/archive/' + encodeURIComponent(channel));
     const container = document.getElementById('archive-table-container');
     if (!data || data.length === 0) { container.innerHTML = '<div class="error-msg">No archive files</div>'; return; }
-    const cols = Object.keys(data[0]);
-    let html = '<table class="data-table"><thead><tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr></thead><tbody>';
-    html += data.map(row => '<tr>' + cols.map(c => `<td>${row[c] || ''}</td>`).join('') + '</tr>').join('');
+    const displayCols = [
+      { key: 'FILE_NAME', label: 'File' },
+      { key: 'FILE_SIZE', label: 'Size' },
+      { key: 'MIN_EVENT_TIMESTAMP', label: 'From' },
+      { key: 'MAX_EVENT_TIMESTAMP', label: 'To' },
+      { key: '_gtids', label: 'GTIDs' }
+    ];
+    let html = '<table class="data-table"><thead><tr>' + displayCols.map(c => `<th>${c.label}</th>`).join('') + '</tr></thead><tbody>';
+    html += data.map(row => {
+      row._gtids = computeContributedGtids(row.PREVIOUS_GTID_SET, row.LAST_GTID_SET);
+      return '<tr>' + displayCols.map(c => `<td>${row[c.key] || ''}</td>`).join('') + '</tr>';
+    }).join('');
     html += '</tbody></table>';
     container.innerHTML = html;
   } catch(e) { document.getElementById('archive-table-container').innerHTML = `<div class="error-msg">${e.message}</div>`; }
@@ -414,7 +508,7 @@ async function setVar(name) {
   catch(e) { alert('Error: ' + e.message); }
 }
 
-// Update all channel dropdowns (archive + operations)
+// Update all channel dropdowns (archive + operations + search)
 function updateChannelDropdowns(channels) {
   const opts = '<option value="">Select channel...</option>' +
     channels.map(c => `<option value="${c}">${c}</option>`).join('');
@@ -425,12 +519,91 @@ function updateChannelDropdowns(channels) {
   archSel.innerHTML = opts;
   if (archCur && channels.includes(archCur)) archSel.value = archCur;
 
+  // Search dropdown (preserve selection)
+  const searchSel = document.getElementById('search-channel-select');
+  const searchCur = searchSel.value;
+  searchSel.innerHTML = opts;
+  if (searchCur && channels.includes(searchCur)) searchSel.value = searchCur;
+
   // Operations dropdowns (preserve selections)
   document.querySelectorAll('.channel-select').forEach(sel => {
+    if (sel.id === 'search-channel-select' || sel.id === 'archive-channel-select') return;
     const cur = sel.value;
     sel.innerHTML = opts;
     if (cur && channels.includes(cur)) sel.value = cur;
   });
+}
+
+// Search tab
+document.getElementById('search-channel-select').addEventListener('change', e => loadRange(e.target.value));
+
+async function loadRange(channel) {
+  const minEl = document.getElementById('range-min-ts');
+  const maxEl = document.getElementById('range-max-ts');
+  const lastGtid = document.getElementById('range-last-gtid');
+  if (!channel) {
+    minEl.textContent = maxEl.textContent = lastGtid.textContent = '—';
+    return;
+  }
+  try {
+    const r = await api('/api/v1/range/' + encodeURIComponent(channel));
+    const fmt = v => (!v || v === 'NULL' || v === 'null') ? '—' : v;
+    minEl.textContent = fmt(r.min_ts);
+    maxEl.textContent = fmt(r.max_ts);
+    lastGtid.textContent = fmt(r.last_gtid_set);
+  } catch(e) {
+    minEl.textContent = maxEl.textContent = lastGtid.textContent = 'error';
+  }
+}
+
+function renderSearchResults(data) {
+  const container = document.getElementById('search-result-container');
+  if (data.status === 'error') {
+    container.innerHTML = `<div class="error-msg">${data.message}</div>`;
+    return;
+  }
+  const files = data.result || [];
+  if (files.length === 0) {
+    container.innerHTML = '<div class="error-msg">No matching files found</div>';
+    return;
+  }
+  const cols = ['name', 'size', 'min_timestamp', 'max_timestamp', 'gtids'];
+  const headers = ['File', 'Size', 'From', 'To', 'GTIDs'];
+  let html = '<table class="data-table"><thead><tr>' + headers.map(h => `<th>${h}</th>`).join('') + '</tr></thead><tbody>';
+  html += files.map(row => '<tr>' + cols.map(c => `<td>${row[c] || ''}</td>`).join('') + '</tr>').join('');
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+async function doSearchTimestamp() {
+  const ch = document.getElementById('search-channel-select').value;
+  const tsFrom = document.getElementById('search-ts-from').value.trim();
+  const tsTo = document.getElementById('search-ts-to').value.trim();
+  if (!ch || !tsFrom || !tsTo) { alert('Select a channel and enter both From and To timestamps'); return; }
+  const container = document.getElementById('search-result-container');
+  container.innerHTML = '<div style="color:var(--fg2)">Searching...</div>';
+  try {
+    const r = await api('/api/v1/search/by-timestamp', {
+      method: 'POST',
+      body: JSON.stringify({ channel: ch, from: tsFrom, to: tsTo })
+    });
+    renderSearchResults(r);
+  } catch(e) { container.innerHTML = `<div class="error-msg">${e.message}</div>`; }
+}
+
+async function doSearchGtid() {
+  const ch = document.getElementById('search-channel-select').value;
+  const gtid = document.getElementById('search-gtid-input').value.trim();
+  if (!ch || !gtid) { alert('Select a channel and enter a GTID set'); return; }
+  const container = document.getElementById('search-result-container');
+  container.innerHTML = '<div style="color:var(--fg2)">Searching...</div>';
+  try {
+    const r = await api('/api/v1/search/by-gtid-set', {
+      method: 'POST',
+      body: JSON.stringify({ channel: ch, gtid_set: gtid })
+    });
+    renderSearchResults(r);
+  } catch(e) { container.innerHTML = `<div class="error-msg">${e.message}</div>`; }
 }
 
 // Main refresh loop
