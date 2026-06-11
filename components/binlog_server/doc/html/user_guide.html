@@ -858,9 +858,9 @@ a keyring or any special configuration.</p>
 <td>Removes archive files whose <code>max_event_timestamp</code> is below the given Unix timestamp (seconds).</td>
 </tr>
 <tr>
-<td><code>binlog_server_search_by_timestamp(channel, iso_timestamp)</code></td>
+<td><code>binlog_server_search_by_timestamp(channel, from, to)</code></td>
 <td>JSON string</td>
-<td>Finds binlog files spanning the given timestamp. The timestamp must be ISO-8601 format (<code>YYYY-MM-DDTHH:MM:SS</code> or <code>YYYY-MM-DD HH:MM:SS</code>, UTC). Returns <code>{"status":"success","result":[...]}</code> with file details, or <code>{"status":"error","message":"..."}</code> on failure.</td>
+<td>Finds binlog files overlapping the given time range. Timestamps must be in <code>YYYY-MM-DDTHH:MM:SS</code> or <code>YYYY-MM-DD HH:MM:SS</code> format (server local time). Fractional seconds are accepted and ignored. Returns <code>{"status":"success","result":[...]}</code> with file details, or <code>{"status":"error","message":"..."}</code> on failure.</td>
 </tr>
 <tr>
 <td><code>binlog_server_search_by_gtid_set(channel, gtid_set)</code></td>
@@ -886,9 +886,9 @@ a keyring or any special configuration.</p>
 <span class="k">SELECT</span><span class="w"> </span><span class="n">binlog_server_purge_before_gtid</span><span class="p">(</span><span class="s1">&#39;prod_primary&#39;</span><span class="p">,</span>
 <span class="w">    </span><span class="s1">&#39;aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-100&#39;</span><span class="p">);</span>
 
-<span class="c1">-- Search: find files containing events at or before a specific time (PITR).</span>
+<span class="c1">-- Search: find files overlapping a time range (PITR).</span>
 <span class="k">SELECT</span><span class="w"> </span><span class="n">binlog_server_search_by_timestamp</span><span class="p">(</span><span class="s1">&#39;prod_primary&#39;</span><span class="p">,</span>
-<span class="w">    </span><span class="s1">&#39;2026-06-10T14:30:00&#39;</span><span class="p">);</span>
+<span class="w">    </span><span class="s1">&#39;2026-06-10T14:00:00&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;2026-06-10T15:00:00&#39;</span><span class="p">);</span>
 
 <span class="c1">-- Search: find the minimal file set covering a GTID range.</span>
 <span class="k">SELECT</span><span class="w"> </span><span class="n">binlog_server_search_by_gtid_set</span><span class="p">(</span><span class="s1">&#39;prod_primary&#39;</span><span class="p">,</span>
@@ -1284,10 +1284,10 @@ curl<span class="w"> </span>-u<span class="w"> </span>admin:password<span class=
 <span class="c1"># Get available data range for a channel</span>
 curl<span class="w"> </span>-u<span class="w"> </span>admin:password<span class="w"> </span>http://127.0.0.1:8440/api/v1/range/prod
 
-<span class="c1"># Search by timestamp (ISO-8601 format, UTC)</span>
+<span class="c1"># Search by timestamp range (server local time)</span>
 curl<span class="w"> </span>-u<span class="w"> </span>admin:password<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;channel&quot;:&quot;prod&quot;,&quot;timestamp&quot;:&quot;2026-06-10T14:30:00&quot;}&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;channel&quot;:&quot;prod&quot;,&quot;from&quot;:&quot;2026-06-10T14:00:00&quot;,&quot;to&quot;:&quot;2026-06-10T15:00:00&quot;}&#39;</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>http://127.0.0.1:8440/api/v1/search/by-timestamp
 
 <span class="c1"># Search by GTID set</span>

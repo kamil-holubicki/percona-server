@@ -73,6 +73,109 @@ downstream replicas via standard MySQL replication protocol.</p>
 never creates a single row. From the upstream's point of view it is an
 ordinary asynchronous replica that only runs the IO thread. From a
 downstream replica's point of view it is a standard MySQL source.</p>
+<h2 id="implemented-features">Implemented features<a class="headerlink" href="#implemented-features" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Multi-source archive</strong></td>
+<td>Collect binlogs from multiple independent upstream clusters on one binlog server, each on its own replication channel.</td>
+</tr>
+<tr>
+<td><strong>Archive-only storage</strong></td>
+<td>Store upstream binlogs for relay and recovery; the binlog server does not apply transactions to its own data.</td>
+</tr>
+<tr>
+<td><strong>Per-channel storage</strong></td>
+<td>Give each upstream channel its own on-disk storage location.</td>
+</tr>
+<tr>
+<td><strong>Standard downstream replication</strong></td>
+<td>Downstream replicas connect with normal <code>CHANGE REPLICATION SOURCE</code> and <code>START REPLICA</code>; no special client or protocol is required.</td>
+</tr>
+<tr>
+<td><strong>GTID-based positioning</strong></td>
+<td>Use GTID auto-positioning for both collecting from upstream sources and serving downstream replicas.</td>
+</tr>
+<tr>
+<td><strong>User-channel map</strong></td>
+<td>Route each downstream replication user to a specific channel archive, via a configuration variable or a persisted table.</td>
+</tr>
+<tr>
+<td><strong>Routing reload</strong></td>
+<td>Refresh table-backed user-to-channel mappings without restarting the server.</td>
+</tr>
+<tr>
+<td><strong>Live tailing</strong></td>
+<td>New events from upstream appear in the archive and are relayed to downstream replicas in near real time.</td>
+</tr>
+<tr>
+<td><strong>Multiple downstream replicas</strong></td>
+<td>Several replicas can pull from the same channel archive at the same time.</td>
+</tr>
+<tr>
+<td><strong>Performance Schema monitoring</strong></td>
+<td>Inspect channel status, storage usage, and per-file archive details in Performance Schema.</td>
+</tr>
+<tr>
+<td><strong>Per-file metadata</strong></td>
+<td>Each archived binlog file records timestamp and GTID coverage for search, purge, and recovery planning.</td>
+</tr>
+<tr>
+<td><strong>Crash-safe archive</strong></td>
+<td>Survive server restarts; incomplete writes at the end of a file are recovered automatically.</td>
+</tr>
+<tr>
+<td><strong>Durable commits</strong></td>
+<td>Persist committed upstream work durably at transaction boundaries.</td>
+</tr>
+<tr>
+<td><strong>Purge by file name</strong></td>
+<td>Remove archived files up to a chosen binlog file.</td>
+</tr>
+<tr>
+<td><strong>Purge by GTID set</strong></td>
+<td>Remove archived files that are no longer needed based on GTID coverage.</td>
+</tr>
+<tr>
+<td><strong>Purge by timestamp</strong></td>
+<td>Remove archived files older than a given time.</td>
+</tr>
+<tr>
+<td><strong>Search by timestamp</strong></td>
+<td>Find which archived files cover a time range for point-in-time recovery.</td>
+</tr>
+<tr>
+<td><strong>Search by GTID set</strong></td>
+<td>Find the smallest set of files needed to cover a GTID range.</td>
+</tr>
+<tr>
+<td><strong>Archive index rebuild</strong></td>
+<td>Rebuild archive metadata after manual file changes or missing sidecar data.</td>
+</tr>
+<tr>
+<td><strong>Encryption at rest</strong></td>
+<td>Optionally encrypt archived binlog files using the keyring; decryption is transparent to downstream replicas.</td>
+</tr>
+<tr>
+<td><strong>Encryption key rotation</strong></td>
+<td>Rotate encryption keys online without stopping collection or serving.</td>
+</tr>
+<tr>
+<td><strong>REST API</strong></td>
+<td>Monitor and manage the binlog server over HTTP/HTTPS for automation and integration.</td>
+</tr>
+<tr>
+<td><strong>Web dashboard</strong></td>
+<td>Use a browser UI for topology, archive browsing, search, operations, and configuration.</td>
+</tr>
+</tbody>
+</table>
 <div class="diagram">
 <div class="mermaid">
 flowchart LR
@@ -292,6 +395,135 @@ flowchart LR
 <p><strong>Not yet implemented</strong> (planned for later phases):
 - S3-compatible object storage backend (stubs in place)
 - Local rotation / rewriting (stubs in place)</p>
+<h2 id="project-statistics">Project Statistics<a class="headerlink" href="#project-statistics" title="Permanent link">&#x00B6;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Count</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>New source files (C++, headers, CMake, HTML)</td>
+<td>55</td>
+</tr>
+<tr>
+<td>New MTR test files (.test, .result, .inc, .cnf)</td>
+<td>38</td>
+</tr>
+<tr>
+<td>Modified Percona Server core files (sql/, scripts/, share/)</td>
+<td>15</td>
+</tr>
+<tr>
+<td>Total lines added (excluding docs)</td>
+<td>26,459</td>
+</tr>
+<tr>
+<td>Lines deleted in existing PS code</td>
+<td>6</td>
+</tr>
+</tbody>
+</table>
+<h3 id="breakdown-by-area">Breakdown by area<a class="headerlink" href="#breakdown-by-area" title="Permanent link">&#x00B6;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Lines</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>components/binlog_server/</code></td>
+<td>7,835</td>
+<td>Core component: archive, sender, encryption, PFS, GTID, UDFs</td>
+</tr>
+<tr>
+<td><code>components/binlog_server_rest_api/</code> (C++)</td>
+<td>1,319</td>
+<td>REST API handlers, SQL executor, JSON helpers</td>
+</tr>
+<tr>
+<td><code>components/binlog_server_rest_api/</code> (dashboard)</td>
+<td>649</td>
+<td>Single-page web dashboard (HTML/CSS/JS)</td>
+</tr>
+<tr>
+<td><code>components/binlog_server_rest_api/</code> (cpp-httplib)</td>
+<td>10,356</td>
+<td>Vendored HTTP library (third-party)</td>
+</tr>
+<tr>
+<td><code>plugin/binlog_server_relay/</code></td>
+<td>192</td>
+<td>Relay plugin (IO-thread observer)</td>
+</tr>
+<tr>
+<td><code>sql/</code>, <code>scripts/</code>, <code>share/</code></td>
+<td>775</td>
+<td>Server core: parser, replication, services</td>
+</tr>
+<tr>
+<td><code>mysql-test/suite/binlog_server/</code></td>
+<td>5,108</td>
+<td>Integration tests (19 test cases)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="features-delivered">Features delivered<a class="headerlink" href="#features-delivered" title="Permanent link">&#x00B6;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Details</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>UDFs</td>
+<td>8 (reload, rebuild, purge ×3, search ×2, key rotation)</td>
+</tr>
+<tr>
+<td>Performance Schema tables</td>
+<td>3 (status, storage, archive)</td>
+</tr>
+<tr>
+<td>REST API endpoints</td>
+<td>20</td>
+</tr>
+<tr>
+<td>MTR test cases</td>
+<td>19</td>
+</tr>
+<tr>
+<td>Commits</td>
+<td>10</td>
+</tr>
+<tr>
+<td>Vendored dependencies</td>
+<td>1 (cpp-httplib)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="modified-percona-server-files">Modified Percona Server files<a class="headerlink" href="#modified-percona-server-files" title="Permanent link">&#x00B6;</a></h3>
+<p>These 15 files in the existing PS codebase required changes to support
+the binlog server plugin/component hooks:</p>
+<ul>
+<li><code>sql/sql_yacc.yy</code> — <code>BINLOG_SERVER</code> / <code>BINLOG_SERVER_STORAGE_URI</code> syntax</li>
+<li><code>sql/lex.h</code> — new keywords</li>
+<li><code>sql/sql_lex.cc</code>, <code>sql/sql_lex.h</code> — LEX fields for new options</li>
+<li><code>sql/rpl_mi.cc</code>, <code>sql/rpl_mi.h</code> — master-info storage for BS fields</li>
+<li><code>sql/rpl_replica.cc</code> — IO-thread logic to call BS component</li>
+<li><code>sql/rpl_source.cc</code> — dump-handler registration for downstream serving</li>
+<li><code>sql/CMakeLists.txt</code> — new source files</li>
+<li><code>sql/server_component/CMakeLists.txt</code>, <code>sql/server_component/server_component.cc</code> — service implementations</li>
+<li><code>scripts/mysql_system_tables.sql</code>, <code>scripts/mysql_system_tables_fix.sql</code> — system table schema for BS</li>
+<li><code>share/messages_to_error_log.txt</code> — new error messages</li>
+<li><code>mysql-test/include/plugin.defs</code> — MTR plugin registration</li>
+</ul>
 <h2 id="license">License<a class="headerlink" href="#license" title="Permanent link">&#x00B6;</a></h2>
 <p>GPLv2, matching the rest of Percona Server.</p>
     <footer class="docfoot">

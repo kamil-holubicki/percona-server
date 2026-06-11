@@ -11,6 +11,34 @@ never creates a single row. From the upstream's point of view it is an
 ordinary asynchronous replica that only runs the IO thread. From a
 downstream replica's point of view it is a standard MySQL source.
 
+## Implemented features
+
+| Feature | Description |
+| --- | --- |
+| **Multi-source archive** | Collect binlogs from multiple independent upstream clusters on one binlog server, each on its own replication channel. |
+| **Archive-only storage** | Store upstream binlogs for relay and recovery; the binlog server does not apply transactions to its own data. |
+| **Per-channel storage** | Give each upstream channel its own on-disk storage location. |
+| **Standard downstream replication** | Downstream replicas connect with normal `CHANGE REPLICATION SOURCE` and `START REPLICA`; no special client or protocol is required. |
+| **GTID-based positioning** | Use GTID auto-positioning for both collecting from upstream sources and serving downstream replicas. |
+| **User-channel map** | Route each downstream replication user to a specific channel archive, via a configuration variable or a persisted table. |
+| **Routing reload** | Refresh table-backed user-to-channel mappings without restarting the server. |
+| **Live tailing** | New events from upstream appear in the archive and are relayed to downstream replicas in near real time. |
+| **Multiple downstream replicas** | Several replicas can pull from the same channel archive at the same time. |
+| **Performance Schema monitoring** | Inspect channel status, storage usage, and per-file archive details in Performance Schema. |
+| **Per-file metadata** | Each archived binlog file records timestamp and GTID coverage for search, purge, and recovery planning. |
+| **Crash-safe archive** | Survive server restarts; incomplete writes at the end of a file are recovered automatically. |
+| **Durable commits** | Persist committed upstream work durably at transaction boundaries. |
+| **Purge by file name** | Remove archived files up to a chosen binlog file. |
+| **Purge by GTID set** | Remove archived files that are no longer needed based on GTID coverage. |
+| **Purge by timestamp** | Remove archived files older than a given time. |
+| **Search by timestamp** | Find which archived files cover a time range for point-in-time recovery. |
+| **Search by GTID set** | Find the smallest set of files needed to cover a GTID range. |
+| **Archive index rebuild** | Rebuild archive metadata after manual file changes or missing sidecar data. |
+| **Encryption at rest** | Optionally encrypt archived binlog files using the keyring; decryption is transparent to downstream replicas. |
+| **Encryption key rotation** | Rotate encryption keys online without stopping collection or serving. |
+| **REST API** | Monitor and manage the binlog server over HTTP/HTTPS for automation and integration. |
+| **Web dashboard** | Use a browser UI for topology, archive browsing, search, operations, and configuration. |
+
 ```mermaid
 flowchart LR
     classDef src fill:#e3f2fd,stroke:#1976d2,color:#0d47a1
@@ -179,6 +207,56 @@ SET GLOBAL binlog_server.default_serve_channel = 'src_a';
 **Not yet implemented** (planned for later phases):
 - S3-compatible object storage backend (stubs in place)
 - Local rotation / rewriting (stubs in place)
+
+## Project Statistics
+
+| Metric | Count |
+|--------|-------|
+| New source files (C++, headers, CMake, HTML) | 55 |
+| New MTR test files (.test, .result, .inc, .cnf) | 38 |
+| Modified Percona Server core files (sql/, scripts/, share/) | 15 |
+| Total lines added (excluding docs) | 26,459 |
+| Lines deleted in existing PS code | 6 |
+
+### Breakdown by area
+
+| Area | Lines | Description |
+|------|-------|-------------|
+| `components/binlog_server/` | 7,835 | Core component: archive, sender, encryption, PFS, GTID, UDFs |
+| `components/binlog_server_rest_api/` (C++) | 1,319 | REST API handlers, SQL executor, JSON helpers |
+| `components/binlog_server_rest_api/` (dashboard) | 649 | Single-page web dashboard (HTML/CSS/JS) |
+| `components/binlog_server_rest_api/` (cpp-httplib) | 10,356 | Vendored HTTP library (third-party) |
+| `plugin/binlog_server_relay/` | 192 | Relay plugin (IO-thread observer) |
+| `sql/`, `scripts/`, `share/` | 775 | Server core: parser, replication, services |
+| `mysql-test/suite/binlog_server/` | 5,108 | Integration tests (19 test cases) |
+
+### Features delivered
+
+| Feature | Details |
+|---------|---------|
+| UDFs | 8 (reload, rebuild, purge ×3, search ×2, key rotation) |
+| Performance Schema tables | 3 (status, storage, archive) |
+| REST API endpoints | 20 |
+| MTR test cases | 19 |
+| Commits | 10 |
+| Vendored dependencies | 1 (cpp-httplib) |
+
+### Modified Percona Server files
+
+These 15 files in the existing PS codebase required changes to support
+the binlog server plugin/component hooks:
+
+- `sql/sql_yacc.yy` — `BINLOG_SERVER` / `BINLOG_SERVER_STORAGE_URI` syntax
+- `sql/lex.h` — new keywords
+- `sql/sql_lex.cc`, `sql/sql_lex.h` — LEX fields for new options
+- `sql/rpl_mi.cc`, `sql/rpl_mi.h` — master-info storage for BS fields
+- `sql/rpl_replica.cc` — IO-thread logic to call BS component
+- `sql/rpl_source.cc` — dump-handler registration for downstream serving
+- `sql/CMakeLists.txt` — new source files
+- `sql/server_component/CMakeLists.txt`, `sql/server_component/server_component.cc` — service implementations
+- `scripts/mysql_system_tables.sql`, `scripts/mysql_system_tables_fix.sql` — system table schema for BS
+- `share/messages_to_error_log.txt` — new error messages
+- `mysql-test/include/plugin.defs` — MTR plugin registration
 
 ## License
 
